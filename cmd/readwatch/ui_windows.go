@@ -120,17 +120,23 @@ func (r *eventRing) Resize(capacity int) {
 }
 
 type uiTheme struct {
-	dark    bool
-	bg      uint32
-	surface uint32
-	text    uint32
-	muted   uint32
-	brush   HBRUSH
+	dark       bool
+	bg         uint32
+	surface    uint32
+	text       uint32
+	muted      uint32
+	listBg     uint32
+	headerBg   uint32
+	headerText uint32
+	line       uint32
+	brush      HBRUSH
 }
 
 type AppUI struct {
 	hwnd        HWND
 	list        HWND
+	header      HWND
+	columns     []string
 	status      HWND
 	startBtn    HWND
 	settingsBtn HWND
@@ -320,7 +326,11 @@ func (u *AppUI) createControls() {
 		col := LVCOLUMNW{Mask: LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM, Fmt: LVCFMT_LEFT, Cx: u.scale(c.w), PszText: &text[0], ISubItem: int32(i)}
 		sendMessage(u.list, LVM_INSERTCOLUMNW, uintptr(i), uintptr(unsafe.Pointer(&col)))
 		runtime.KeepAlive(text)
+		u.columns = append(u.columns, c.name)
 	}
+	// The header is its own control. Custom-drawing it needs the titles, and
+	// keeping them here avoids an HDITEMW round trip on every paint.
+	u.header = HWND(sendMessage(u.list, LVM_GETHEADER, 0, 0))
 	u.summary = createControl("STATIC", "0 folders · 0 events", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, u.hwnd, 0)
 	u.openBtn = createControl("BUTTON", "Open log", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idOpenLog)
 	u.clearBtn = createControl("BUTTON", "Clear", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idClear)
@@ -444,12 +454,24 @@ func (u *AppUI) applyTheme(force bool) {
 		deleteObject(uintptr(u.theme.brush))
 	}
 	if dark {
-		u.theme = uiTheme{dark: true, bg: rgb(32, 32, 32), surface: rgb(38, 38, 38), text: rgb(240, 240, 240), muted: rgb(185, 185, 185)}
+		// Three steps of depth so the list reads as a recessed panel under its
+		// own header, rather than one flat sheet: window 32, header 38, list 25.
+		u.theme = uiTheme{
+			dark: true,
+			bg:   rgb(32, 32, 32), surface: rgb(38, 38, 38),
+			text: rgb(240, 240, 240), muted: rgb(154, 154, 154),
+			listBg: rgb(25, 25, 25), headerBg: rgb(38, 38, 38),
+			headerText: rgb(200, 200, 200), line: rgb(56, 56, 56),
+		}
 	} else {
 		bg, _, _ := procGetSysColor.Call(COLOR_WINDOW)
 		text, _, _ := procGetSysColor.Call(COLOR_WINDOWTEXT)
 		surface, _, _ := procGetSysColor.Call(COLOR_BTNFACE)
-		u.theme = uiTheme{dark: false, bg: uint32(bg), surface: uint32(surface), text: uint32(text), muted: uint32(text)}
+		u.theme = uiTheme{
+			dark: false,
+			bg:   uint32(bg), surface: uint32(surface), text: uint32(text), muted: uint32(text),
+			listBg: uint32(bg), headerBg: uint32(surface), headerText: uint32(text), line: uint32(surface),
+		}
 	}
 	brush, _, _ := procCreateSolidBrush.Call(uintptr(u.theme.bg))
 	u.theme.brush = HBRUSH(brush)
@@ -464,16 +486,26 @@ func (u *AppUI) applyTheme(force bool) {
 	if dark {
 		themeName = "DarkMode_Explorer"
 	}
-	for _, h := range []HWND{u.list, u.startBtn, u.settingsBtn, u.openBtn, u.clearBtn} {
+	for _, h := range []HWND{u.list, u.startBtn, u.settingsBtn, u.openBtn, u.clearBtn, u.exitBtn} {
 		if h != 0 {
 			procSetWindowTheme.Call(uintptr(h), uintptr(unsafe.Pointer(utf16Ptr(themeName))), 0)
 		}
 	}
-	sendMessage(u.list, LVM_SETBKCOLOR, 0, uintptr(u.theme.bg))
-	sendMessage(u.list, LVM_SETTEXTBKCOLOR, 0, uintptr(u.theme.bg))
+	if u.header != 0 {
+		headerTheme := "ItemsView"
+		if dark {
+			headerTheme = "DarkMode_ItemsView"
+		}
+		procSetWindowTheme.Call(uintptr(u.header), uintptr(unsafe.Pointer(utf16Ptr(headerTheme))), 0)
+	}
+	sendMessage(u.list, LVM_SETBKCOLOR, 0, uintptr(u.theme.listBg))
+	sendMessage(u.list, LVM_SETTEXTBKCOLOR, 0, uintptr(u.theme.listBg))
 	sendMessage(u.list, LVM_SETTEXTCOLOR, 0, uintptr(u.theme.text))
 	procInvalidateRect.Call(uintptr(u.hwnd), 0, 1)
 	procInvalidateRect.Call(uintptr(u.list), 0, 1)
+	if u.header != 0 {
+		procInvalidateRect.Call(uintptr(u.header), 0, 1)
+	}
 }
 
 func (u *AppUI) activationLoop() {
@@ -861,6 +893,58 @@ func (u *AppUI) updateTrayTip() {
 // showRowMenu offers to suppress the reader on the row that was right-clicked.
 // Acting on the noise actually in front of you is the point: the measured
 // baseline for a real folder was background reads far outnumbering genuine ones.
+// drawHeader paints the list-view header. SysHeader32 ignores the dark theme on
+// current Windows builds and keeps painting itself light, including the blank
+// strip to the right of the last column, so the whole thing is drawn by hand.
+func (u *AppUI) drawHeader(cd *NMCUSTOMDRAW) uintptr {
+	switch cd.DwDrawStage {
+	case CDDS_PREPAINT:
+		// Fill the entire header first: this is what kills the light sliver past
+		// the final column, which per-item drawing never reaches.
+		var rc RECT
+		procGetClientRect.Call(uintptr(u.header), uintptr(unsafe.Pointer(&rc)))
+		u.fillRect(cd.Hdc, rc, u.theme.headerBg)
+		bottom := RECT{Left: rc.Left, Top: rc.Bottom - 1, Right: rc.Right, Bottom: rc.Bottom}
+		u.fillRect(cd.Hdc, bottom, u.theme.line)
+		return CDRF_NOTIFYITEMDRAW
+	case CDDS_ITEMPREPAINT:
+		index := int(cd.DwItemSpec)
+		if index < 0 || index >= len(u.columns) {
+			return CDRF_DODEFAULT
+		}
+		rc := cd.Rc
+		u.fillRect(cd.Hdc, RECT{Left: rc.Left, Top: rc.Top, Right: rc.Right, Bottom: rc.Bottom - 1}, u.theme.headerBg)
+		// Column separator, inset vertically so it reads as a hairline rather
+		// than a hard grid.
+		if index > 0 {
+			sep := RECT{Left: rc.Left, Top: rc.Top + u.scale(6), Right: rc.Left + 1, Bottom: rc.Bottom - u.scale(7)}
+			u.fillRect(cd.Hdc, sep, u.theme.line)
+		}
+		procSetBkMode.Call(uintptr(cd.Hdc), TRANSPARENT)
+		procSetTextColor.Call(uintptr(cd.Hdc), uintptr(u.theme.headerText))
+		old, _, _ := procSelectObject.Call(uintptr(cd.Hdc), uintptr(u.font))
+		text := RECT{Left: rc.Left + u.scale(8), Top: rc.Top, Right: rc.Right - u.scale(6), Bottom: rc.Bottom - 1}
+		label := syscall.StringToUTF16(u.columns[index])
+		procDrawTextW.Call(uintptr(cd.Hdc), uintptr(unsafe.Pointer(&label[0])), ^uintptr(0),
+			uintptr(unsafe.Pointer(&text)), DT_LEFT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS)
+		runtime.KeepAlive(label)
+		if old != 0 {
+			procSelectObject.Call(uintptr(cd.Hdc), old)
+		}
+		return CDRF_SKIPDEFAULT
+	}
+	return CDRF_DODEFAULT
+}
+
+func (u *AppUI) fillRect(hdc HDC, rc RECT, color uint32) {
+	brush, _, _ := procCreateSolidBrush.Call(uintptr(color))
+	if brush == 0 {
+		return
+	}
+	procFillRect.Call(uintptr(hdc), uintptr(unsafe.Pointer(&rc)), brush)
+	deleteObject(brush)
+}
+
 func (u *AppUI) showRowMenu(row int) {
 	if row < 0 {
 		return
@@ -1049,6 +1133,9 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 		return 0
 	case WM_NOTIFY:
 		hdr := (*NMHDR)(lParam)
+		if u.header != 0 && hdr.HwndFrom == u.header && hdr.Code == NM_CUSTOMDRAW {
+			return u.drawHeader((*NMCUSTOMDRAW)(lParam))
+		}
 		if hdr.HwndFrom == u.list && hdr.Code == NM_RCLICK {
 			u.showRowMenu(int((*NMITEMACTIVATE)(lParam).IItem))
 			return 1

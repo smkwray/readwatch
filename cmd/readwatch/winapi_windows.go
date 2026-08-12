@@ -98,6 +98,19 @@ type NMLVDISPINFOW struct {
 	Item LVITEMW
 }
 
+// NMCUSTOMDRAW is the header's draw callback. The list-view header is a
+// separate SysHeader32 control that ignores DarkMode_Explorer and keeps
+// painting itself light, so it has to be drawn by hand.
+type NMCUSTOMDRAW struct {
+	Hdr         NMHDR
+	DwDrawStage uint32
+	Hdc         HDC
+	Rc          RECT
+	DwItemSpec  uintptr
+	UItemState  int32
+	LItemlParam uintptr
+}
+
 // NMITEMACTIVATE carries the row under the cursor for NM_RCLICK, which is how
 // the event list offers "exclude this process" on the row you actually clicked.
 type NMITEMACTIVATE struct {
@@ -399,10 +412,18 @@ const (
 	LVN_FIRST                = -100
 	LVN_GETDISPINFOW         = LVN_FIRST - 77
 	NM_RCLICK                = -5
+	NM_CUSTOMDRAW            = -12
 	EM_SETCUEBANNER          = 0x1501
-	LVN_ITEMCHANGED          = LVN_FIRST - 1
-	LVSICF_NOINVALIDATEALL   = 0x00000001
-	LVSICF_NOSCROLL          = 0x00000002
+	LVM_GETHEADER            = LVM_FIRST + 31
+
+	CDDS_PREPAINT          = 0x00000001
+	CDDS_ITEMPREPAINT      = 0x00010001
+	CDRF_DODEFAULT         = 0x00000000
+	CDRF_SKIPDEFAULT       = 0x00000004
+	CDRF_NOTIFYITEMDRAW    = 0x00000020
+	LVN_ITEMCHANGED        = LVN_FIRST - 1
+	LVSICF_NOINVALIDATEALL = 0x00000001
+	LVSICF_NOSCROLL        = 0x00000002
 
 	LB_ADDSTRING    = 0x0180
 	LB_DELETESTRING = 0x0182

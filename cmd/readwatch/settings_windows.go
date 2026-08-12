@@ -195,9 +195,11 @@ func (s *SettingsUI) createControls() {
 	s.browseBtn = createControl("BUTTON", "Browse…", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idBrowseLog)
 	s.formatLabel = createControl("STATIC", "Format", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, s.hwnd, 0)
 	s.formatCombo = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_VSCROLL|CBS_DROPDOWNLIST, 0, s.hwnd, idLogFormat)
-	s.includeDirs = createControl("BUTTON", "Include folder-listing events", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idIncludeFolders)
-	s.startLogin = createControl("BUTTON", "Show tray icon at sign-in", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idStartAtLogin)
-	s.openLogin = createControl("BUTTON", "Open window at sign-in", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idOpenAtLogin)
+	// The old labels described the visible symptom rather than what the setting
+	// does, and both were misread on first use.
+	s.includeDirs = createControl("BUTTON", "Also log reads of the folder itself, not just files", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idIncludeFolders)
+	s.startLogin = createControl("BUTTON", "Start ReadWatch at sign-in (runs in the tray)", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idStartAtLogin)
+	s.openLogin = createControl("BUTTON", "…and open the window too", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idOpenAtLogin)
 	s.saveBtn = createControl("BUTTON", "Save", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 0, s.hwnd, IDOK)
 	s.cancelBtn = createControl("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, IDCANCEL)
 
