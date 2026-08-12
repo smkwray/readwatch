@@ -31,6 +31,7 @@ const (
 	idSettings = 102
 	idOpenLog  = 103
 	idClear    = 104
+	idExit     = 105
 
 	trayShow     = 201
 	trayToggle   = 202
@@ -132,6 +133,7 @@ type AppUI struct {
 	summary     HWND
 	openBtn     HWND
 	clearBtn    HWND
+	exitBtn     HWND
 	font        HFONT
 	icon        HICON
 	iconSmall   HICON
@@ -262,7 +264,7 @@ func (u *AppUI) createWindow() error {
 	}
 	atom, _, e := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 	if atom == 0 {
-		if errno, ok := e.(syscall.Errno); !ok || errno != ERROR_ALREADY_EXISTS {
+		if errno, ok := e.(syscall.Errno); !ok || errno != ERROR_CLASS_ALREADY_EXISTS {
 			return winErr("RegisterClassEx", e)
 		}
 	}
@@ -318,7 +320,10 @@ func (u *AppUI) createControls() {
 	u.summary = createControl("STATIC", "0 folders · 0 events", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, u.hwnd, 0)
 	u.openBtn = createControl("BUTTON", "Open log", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idOpenLog)
 	u.clearBtn = createControl("BUTTON", "Clear", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idClear)
-	for _, h := range []HWND{u.status, u.startBtn, u.settingsBtn, u.list, u.summary, u.openBtn, u.clearBtn} {
+	// Closing the window only hides it to the tray, so without this the only way
+	// out of the app is the tray menu.
+	u.exitBtn = createControl("BUTTON", "Exit", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idExit)
+	for _, h := range []HWND{u.status, u.startBtn, u.settingsBtn, u.list, u.summary, u.openBtn, u.clearBtn, u.exitBtn} {
 		sendMessage(h, WM_SETFONT, uintptr(u.font), 1)
 	}
 }
@@ -375,6 +380,7 @@ func (u *AppUI) layout() {
 	settingsW := u.scale(72)
 	openW := u.scale(70)
 	clearW := u.scale(54)
+	exitW := u.scale(54)
 	procMoveWindow.Call(uintptr(u.status), uintptr(m), uintptr(m), uintptr(w-m*3-startW-settingsW-gap), uintptr(buttonH), 1)
 	procMoveWindow.Call(uintptr(u.startBtn), uintptr(w-m-settingsW-gap-startW), uintptr(m), uintptr(startW), uintptr(buttonH), 1)
 	procMoveWindow.Call(uintptr(u.settingsBtn), uintptr(w-m-settingsW), uintptr(m), uintptr(settingsW), uintptr(buttonH), 1)
@@ -385,9 +391,11 @@ func (u *AppUI) layout() {
 	}
 	procMoveWindow.Call(uintptr(u.list), uintptr(m), uintptr(listTop), uintptr(w-2*m), uintptr(listH), 1)
 	bottomY := listTop + listH + u.scale(4)
-	procMoveWindow.Call(uintptr(u.summary), uintptr(m), uintptr(bottomY), uintptr(w-3*m-openW-clearW-gap), uintptr(buttonH), 1)
-	procMoveWindow.Call(uintptr(u.openBtn), uintptr(w-m-clearW-gap-openW), uintptr(bottomY), uintptr(openW), uintptr(buttonH), 1)
-	procMoveWindow.Call(uintptr(u.clearBtn), uintptr(w-m-clearW), uintptr(bottomY), uintptr(clearW), uintptr(buttonH), 1)
+	rightRow := openW + gap + clearW + gap + exitW
+	procMoveWindow.Call(uintptr(u.summary), uintptr(m), uintptr(bottomY), uintptr(w-2*m-rightRow-gap), uintptr(buttonH), 1)
+	procMoveWindow.Call(uintptr(u.openBtn), uintptr(w-m-rightRow), uintptr(bottomY), uintptr(openW), uintptr(buttonH), 1)
+	procMoveWindow.Call(uintptr(u.clearBtn), uintptr(w-m-clearW-gap-exitW), uintptr(bottomY), uintptr(clearW), uintptr(buttonH), 1)
+	procMoveWindow.Call(uintptr(u.exitBtn), uintptr(w-m-exitW), uintptr(bottomY), uintptr(exitW), uintptr(buttonH), 1)
 
 	pathWidth := w - 2*m - u.scale(88+126+54) - u.scale(20)
 	if pathWidth < u.scale(120) {
@@ -972,6 +980,9 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 				u.openLog()
 			case idClear:
 				u.clearView()
+			case idExit:
+				u.exiting.Store(true)
+				procDestroyWindow.Call(uintptr(u.hwnd))
 			}
 		}
 		return 0

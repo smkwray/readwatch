@@ -106,7 +106,7 @@ func (s *SettingsUI) create() error {
 	}
 	atom, _, e := procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 	if atom == 0 {
-		if errno, ok := e.(syscall.Errno); !ok || errno != ERROR_ALREADY_EXISTS {
+		if errno, ok := e.(syscall.Errno); !ok || errno != ERROR_CLASS_ALREADY_EXISTS {
 			return winErr("RegisterClassEx(settings)", e)
 		}
 	}
