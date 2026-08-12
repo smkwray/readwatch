@@ -42,4 +42,10 @@ __pycache__/
 .vscode/
 .idea/
 
-# .githooks/ is INTENTIONALLY NOT IGNORED — it ships the pre-commit hook
+
+# Local orchestration scaffolding from the project template. Kept on disk so the
+# pre-commit hook keeps working; never part of the public surface.
+/scripts/control_check.py
+/scripts/hygiene_check.sh
+/.githooks/
+/.claude/
