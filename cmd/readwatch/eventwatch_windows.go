@@ -143,8 +143,7 @@ func (w *EventWatcher) worker(writer *logsink.Writer) {
 				continue
 			}
 			// Filtered here, in the service, before the event reaches the log or
-			// the pipe: the background readers that dominate this signal
-			// (Explorer re-thumbnailing Recent, a third-party file manager, the indexer)
+			// the pipe: routine background readers can dominate this signal and
 			// should cost neither IPC nor UI work.
 			if settings.Excludes(w.cfg.ExcludedProcesses, event.ProcessPath, event.Process) {
 				w.suppressed.Add(1)

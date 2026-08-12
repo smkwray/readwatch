@@ -53,11 +53,12 @@ type PublicConfig struct {
 	ExcludedProcesses  []string `json:"excluded_processes"`
 }
 
-// DefaultExcludedProcesses are the readers that drown the signal on a normal
-// Windows desktop. // a representative sample showed background readers vastly outnumbering the genuine ones, because
-// Explorer's Home/Recent list re-thumbnails with no window open and Directory
-// Opus thumbnails independently. All of these are legitimate, so the noise is
-// suppressed here rather than by changing the desktop.
+// DefaultExcludedProcesses are the routine background readers that tend to
+// drown the signal on a Windows desktop: the shell re-thumbnails recently used
+// files even with no window open, and the indexer and antivirus sweep folders
+// on their own schedule. All are legitimate, so the noise is suppressed here
+// rather than by changing the machine's settings. viewer.exe is a common
+// third-party file manager that thumbnails independently; harmless if absent.
 var DefaultExcludedProcesses = []string{
 	"explorer.exe",
 	"SearchIndexer.exe",
