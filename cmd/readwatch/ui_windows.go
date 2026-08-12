@@ -917,8 +917,8 @@ func (u *AppUI) updateTrayTip() {
 }
 
 // showRowMenu offers to suppress the reader on the row that was right-clicked.
-// Acting on the noise actually in front of you is the point: the measured
-// baseline for a real folder was background reads far outnumbering genuine ones.
+// Acting on the noise actually in front of you beats hunting for the process
+// name in Settings, which is where most of these exclusions come from.
 // drawHeader paints the list-view header. SysHeader32 ignores the dark theme on
 // current Windows builds and keeps painting itself light, including the blank
 // strip to the right of the last column, so the whole thing is drawn by hand.
@@ -1068,7 +1068,7 @@ func (u *AppUI) shutdown() {
 		u.client = nil
 	}
 	u.clientMu.Unlock()
-	// exiting the app leaves nothing privileged running. Stop
+	// Exiting the app leaves nothing privileged running. Stop
 	// the service here, after the pipe is released so it is not torn down under
 	// a live client. This is synchronous because the process is about to exit -
 	// a goroutine would be killed before SCM finished. The configured Enabled

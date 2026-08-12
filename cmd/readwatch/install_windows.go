@@ -247,8 +247,7 @@ func directAuditCleanup(cfg *settings.Config) error {
 // The OWNER RIGHTS ACE is load-bearing, not decoration. Whoever owns the object
 // otherwise gets implicit READ_CONTROL|WRITE_DAC, which would let the owning
 // account hand itself the rights withheld above. Capping OWNER RIGHTS at RC
-// closes that path. This mirrors the four-ACE shape verified on a Windows host
-// against an earlier design, where exactly this bridge was found.
+// closes that path.
 func serviceSDDL(ownerSID string) string {
 	const full = "CCDCLCSWRPWPDTLOCRSDRCWDWO"
 	sddl := "D:P(A;;" + full + ";;;SY)(A;;" + full + ";;;BA)"

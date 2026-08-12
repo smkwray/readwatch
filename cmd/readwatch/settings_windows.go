@@ -178,8 +178,7 @@ func (s *SettingsUI) createControls() {
 	s.addBtn = createControl("BUTTON", "Browse…", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddFolder)
 	s.removeBtn = createControl("BUTTON", "Remove", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idRemoveFolder)
 	// Typing or pasting a path is the primary way to add a folder; the picker is
-	// the fallback. Hunting for a folder in a tree is what got an earlier implementation
-	// abandoned.
+	// the fallback. Most target folders are already on the clipboard.
 	s.folderPath = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL, 0, s.hwnd, idFolderPath)
 	s.addPathBtn = createControl("BUTTON", "Add", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddFolderPath)
 	sendMessage(s.folderPath, EM_SETCUEBANNER, 1, uintptr(unsafe.Pointer(utf16Ptr(`Paste a folder path, e.g. D:\Renders\output`))))

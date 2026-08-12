@@ -11,11 +11,11 @@ install, and it's running.
 - **Live view and a durable log.** Text, JSON Lines, or CSV, appended as events arrive.
 - **Privileged only while you're watching.** The service starts when you hit Start and stops when
   you exit, taking its audit rules off your folders with it.
-- **Filters the noise.** In practice a watched folder can see background readers vastly outnumbering the genuine ones — Explorer re-thumbnails its Recent list even with no
-  window open. Background readers are dropped inside the service, and the suppressed count stays
-  on screen so you can see what was hidden.
-- **Effectively free.** Measured: **0% CPU** idle, **0.1 ms per event**, 173 bytes of log per
-  event, ~10 MB resident. It's an event subscription, not a polling loop.
+- **Filters the noise.** Shell thumbnailing, search indexing and antivirus can easily outnumber
+  the reads you're looking for. Exclude them by process name or exact image path — dropped inside
+  the service, with a running count of what was suppressed so nothing hides silently.
+- **Cheap to leave running.** Idles at 0% CPU and ~10 MB; roughly 0.1 ms of CPU and 173 bytes of
+  log per event. It's an event subscription, not a polling loop.
 
 ## How it works
 
