@@ -98,6 +98,20 @@ type NMLVDISPINFOW struct {
 	Item LVITEMW
 }
 
+// NMITEMACTIVATE carries the row under the cursor for NM_RCLICK, which is how
+// the event list offers "exclude this process" on the row you actually clicked.
+type NMITEMACTIVATE struct {
+	Hdr      NMHDR
+	IItem    int32
+	ISubItem int32
+	NewState uint32
+	OldState uint32
+	Changed  uint32
+	PtAction POINT
+	LParam   uintptr
+	KeyFlags uint32
+}
+
 type INITCOMMONCONTROLSEX struct {
 	DwSize uint32
 	DwICC  uint32
@@ -384,6 +398,7 @@ const (
 	LVSCW_AUTOSIZE_USEHEADER = -2
 	LVN_FIRST                = -100
 	LVN_GETDISPINFOW         = LVN_FIRST - 77
+	NM_RCLICK                = -5
 	LVN_ITEMCHANGED          = LVN_FIRST - 1
 	LVSICF_NOINVALIDATEALL   = 0x00000001
 	LVSICF_NOSCROLL          = 0x00000002
@@ -502,18 +517,18 @@ const (
 	TokenElevation          = 20
 	SE_PRIVILEGE_ENABLED    = 0x00000002
 
-	ERROR_SUCCESS                 = 0
-	ERROR_FILE_NOT_FOUND          = 2
-	ERROR_PATH_NOT_FOUND          = 3
-	ERROR_ACCESS_DENIED           = 5
-	ERROR_INVALID_HANDLE          = 6
-	ERROR_BROKEN_PIPE             = 109
-	ERROR_INSUFFICIENT_BUFFER     = 122
-	ERROR_ALREADY_EXISTS          = 183
+	ERROR_SUCCESS             = 0
+	ERROR_FILE_NOT_FOUND      = 2
+	ERROR_PATH_NOT_FOUND      = 3
+	ERROR_ACCESS_DENIED       = 5
+	ERROR_INVALID_HANDLE      = 6
+	ERROR_BROKEN_PIPE         = 109
+	ERROR_INSUFFICIENT_BUFFER = 122
+	ERROR_ALREADY_EXISTS      = 183
 	// RegisterClassEx reports a duplicate class as 1410, NOT 183. Guarding on
 	// ERROR_ALREADY_EXISTS meant reopening Settings failed with
 	// "RegisterClassEx(settings): Class already exists."
-	ERROR_CLASS_ALREADY_EXISTS = 1410
+	ERROR_CLASS_ALREADY_EXISTS    = 1410
 	ERROR_PIPE_BUSY               = 231
 	ERROR_NO_DATA                 = 232
 	ERROR_PIPE_CONNECTED          = 535

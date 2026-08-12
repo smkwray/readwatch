@@ -31,16 +31,17 @@ var (
 )
 
 type EventWatcher struct {
-	mu      sync.Mutex
-	sub     uintptr
-	raw     chan string
-	stop    chan struct{}
-	done    chan struct{}
-	cfg     settings.Config
-	selfPID uint32
-	onEvent func(model.Event)
-	onError func(error)
-	dropped atomic.Uint64
+	mu         sync.Mutex
+	sub        uintptr
+	raw        chan string
+	stop       chan struct{}
+	done       chan struct{}
+	cfg        settings.Config
+	selfPID    uint32
+	onEvent    func(model.Event)
+	onError    func(error)
+	dropped    atomic.Uint64
+	suppressed atomic.Uint64
 }
 
 func NewEventWatcher(onEvent func(model.Event), onError func(error)) *EventWatcher {
@@ -55,6 +56,11 @@ func (w *EventWatcher) Running() bool {
 }
 
 func (w *EventWatcher) Dropped() uint64 { return w.dropped.Load() }
+
+// Suppressed counts reads that matched a folder but were filtered out by the
+// exclusion list. Surfaced in the UI so a hidden reader is always visible as a
+// number - silently dropping them would defeat the point of the tool.
+func (w *EventWatcher) Suppressed() uint64 { return w.suppressed.Load() }
 
 func (w *EventWatcher) Start(cfg settings.Config) error {
 	w.mu.Lock()
@@ -76,6 +82,7 @@ func (w *EventWatcher) Start(cfg settings.Config) error {
 	w.done = make(chan struct{})
 	w.cfg = cfg
 	w.dropped.Store(0)
+	w.suppressed.Store(0)
 	activeEventWatcher.Store(w)
 
 	channel := utf16Ptr("Security")
@@ -133,6 +140,14 @@ func (w *EventWatcher) worker(writer *logsink.Writer) {
 		case raw := <-w.raw:
 			event, ok := eventparse.Parse4663(raw)
 			if !ok || event.PID == w.selfPID || !matchesAnyFolder(event.Path, w.cfg.Folders) {
+				continue
+			}
+			// Filtered here, in the service, before the event reaches the log or
+			// the pipe: the background readers that dominate this signal
+			// (Explorer re-thumbnailing Recent, a third-party file manager, the indexer)
+			// should cost neither IPC nor UI work.
+			if settings.Excludes(w.cfg.ExcludedProcesses, event.ProcessPath, event.Process) {
+				w.suppressed.Add(1)
 				continue
 			}
 			attrs, _, _ := procGetFileAttributesW.Call(uintptr(unsafe.Pointer(utf16Ptr(event.Path))))

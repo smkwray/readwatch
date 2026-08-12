@@ -122,6 +122,7 @@ func (e *ServiceEngine) CurrentState() protocol.State {
 		LastError:    last,
 		LogDropped:   e.watcher.Dropped(),
 		LiveDropped:  e.ipc.Dropped(),
+		Suppressed:   e.watcher.Suppressed(),
 		ServiceReady: ready,
 	}
 }

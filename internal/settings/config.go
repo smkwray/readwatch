@@ -33,6 +33,7 @@ type Config struct {
 	LogFormat           string                   `json:"log_format"`
 	MaxRows             int                      `json:"max_rows"`
 	Folders             []string                 `json:"folders"`
+	ExcludedProcesses   []string                 `json:"excluded_processes"`
 	Snapshots           map[string]AuditSnapshot `json:"audit_snapshots,omitempty"`
 	AuditPolicyOwned    bool                     `json:"audit_policy_owned,omitempty"`
 	AuditPolicyOriginal uint32                   `json:"audit_policy_original,omitempty"`
@@ -49,19 +50,69 @@ type PublicConfig struct {
 	LogFormat          string   `json:"log_format"`
 	MaxRows            int      `json:"max_rows"`
 	Folders            []string `json:"folders"`
+	ExcludedProcesses  []string `json:"excluded_processes"`
+}
+
+// DefaultExcludedProcesses are the readers that drown the signal on a normal
+// Windows desktop. // a representative sample showed background readers vastly outnumbering the genuine ones, because
+// Explorer's Home/Recent list re-thumbnails with no window open and Directory
+// Opus thumbnails independently. All of these are legitimate, so the noise is
+// suppressed here rather than by changing the desktop.
+var DefaultExcludedProcesses = []string{
+	"explorer.exe",
+	"SearchIndexer.exe",
+	"MsMpEng.exe",
+	"viewer.exe",
+}
+
+// Excludes reports whether a reader matches the suppression list.
+//
+// An entry containing a path separator is matched against the full image path;
+// anything else is matched against the image name. Image-name matching is what
+// people expect and what the right-click action produces, but it is trivially
+// spoofable - any binary can be called explorer.exe - and noticing unexpected
+// readers is this tool's whole purpose. So the full-path form is offered as the
+// stronger option, and suppressed events are counted rather than discarded
+// silently so a hidden reader is always visible as a number.
+func Excludes(list []string, imagePath, imageName string) bool {
+	if len(list) == 0 {
+		return false
+	}
+	path := strings.ToLower(strings.TrimSpace(imagePath))
+	name := strings.ToLower(strings.TrimSpace(imageName))
+	if name == "" && path != "" {
+		name = strings.ToLower(filepath.Base(path))
+	}
+	for _, raw := range list {
+		entry := strings.ToLower(strings.TrimSpace(raw))
+		if entry == "" {
+			continue
+		}
+		if strings.ContainsAny(entry, `\/`) {
+			if path != "" && filepath.Clean(entry) == filepath.Clean(path) {
+				return true
+			}
+			continue
+		}
+		if entry == name {
+			return true
+		}
+	}
+	return false
 }
 
 func Default(logPath, ownerSID, ownerName string) Config {
 	return Config{
-		Version:     Version,
-		OwnerSID:    ownerSID,
-		OwnerName:   ownerName,
-		LogPath:     logPath,
-		LogFormat:   "text",
-		MaxRows:     1000,
-		Folders:     []string{},
-		Snapshots:   make(map[string]AuditSnapshot),
-		OpenAtLogin: false,
+		Version:           Version,
+		OwnerSID:          ownerSID,
+		OwnerName:         ownerName,
+		LogPath:           logPath,
+		LogFormat:         "text",
+		MaxRows:           1000,
+		Folders:           []string{},
+		ExcludedProcesses: append([]string(nil), DefaultExcludedProcesses...),
+		Snapshots:         make(map[string]AuditSnapshot),
+		OpenAtLogin:       false,
 	}
 }
 
@@ -89,7 +140,9 @@ func Load(path, defaultLogPath, ownerSID, ownerName string) (Config, error) {
 
 func (c Config) Public() PublicConfig {
 	folders := append([]string(nil), c.Folders...)
+	excluded := append([]string(nil), c.ExcludedProcesses...)
 	return PublicConfig{
+		ExcludedProcesses:  excluded,
 		Enabled:            c.Enabled,
 		StartAtLogin:       c.StartAtLogin,
 		OpenAtLogin:        c.OpenAtLogin,
@@ -109,6 +162,7 @@ func (c *Config) ApplyPublic(p PublicConfig) {
 	c.LogFormat = p.LogFormat
 	c.MaxRows = p.MaxRows
 	c.Folders = append(c.Folders[:0], p.Folders...)
+	c.ExcludedProcesses = append(c.ExcludedProcesses[:0], p.ExcludedProcesses...)
 	c.Normalize()
 }
 
@@ -149,6 +203,29 @@ func (c *Config) Normalize() {
 	c.Folders = c.Folders[:0]
 	for _, k := range keys {
 		c.Folders = append(c.Folders, seen[k])
+	}
+
+	// Case-insensitive dedupe, original spelling kept for display. An empty list
+	// is a deliberate choice ("show me everything"), so it is never refilled
+	// with the defaults - those are seeded once, in Default().
+	exSeen := make(map[string]string)
+	exOrder := make([]string, 0, len(c.ExcludedProcesses))
+	for _, raw := range c.ExcludedProcesses {
+		e := strings.TrimSpace(raw)
+		if e == "" {
+			continue
+		}
+		key := strings.ToLower(e)
+		if _, dup := exSeen[key]; dup {
+			continue
+		}
+		exSeen[key] = e
+		exOrder = append(exOrder, key)
+	}
+	sort.Strings(exOrder)
+	c.ExcludedProcesses = c.ExcludedProcesses[:0]
+	for _, k := range exOrder {
+		c.ExcludedProcesses = append(c.ExcludedProcesses, exSeen[k])
 	}
 }
 

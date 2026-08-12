@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,6 +33,9 @@ const (
 	idOpenLog  = 103
 	idClear    = 104
 	idExit     = 105
+
+	rowExcludeName = 301
+	rowExcludePath = 302
 
 	trayShow     = 201
 	trayToggle   = 202
@@ -693,6 +697,11 @@ func (u *AppUI) updateSummary() {
 	if liveDropped > 0 {
 		text += fmt.Sprintf(" · %d live updates dropped", liveDropped)
 	}
+	// Suppressed reads are never silently hidden: the count is the user's
+	// evidence that filtering is not concealing a reader they care about.
+	if u.state.Suppressed > 0 {
+		text += fmt.Sprintf(" · %d excluded", u.state.Suppressed)
+	}
 	setWindowText(u.summary, text)
 }
 
@@ -849,6 +858,58 @@ func (u *AppUI) updateTrayTip() {
 	procShellNotifyIconW.Call(NIM_MODIFY, uintptr(unsafe.Pointer(&nid)))
 }
 
+// showRowMenu offers to suppress the reader on the row that was right-clicked.
+// Acting on the noise actually in front of you is the point: the measured
+// baseline for a real folder was background reads far outnumbering genuine ones.
+func (u *AppUI) showRowMenu(row int) {
+	if row < 0 {
+		return
+	}
+	e, ok := u.ring.Newest(row)
+	if !ok || e.Process == "" {
+		return
+	}
+	if !u.state.ServiceReady {
+		return
+	}
+	menu, _, _ := procCreatePopupMenu.Call()
+	if menu == 0 {
+		return
+	}
+	defer procDestroyMenu.Call(menu)
+	appendMenu(menu, MF_STRING, rowExcludeName, "Exclude "+e.Process)
+	if e.ProcessPath != "" {
+		appendMenu(menu, MF_STRING, rowExcludePath, "Exclude only this exact path")
+	}
+	var pt POINT
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procSetForegroundWindow.Call(uintptr(u.hwnd))
+	cmd, _, _ := procTrackPopupMenu.Call(menu, TPM_RIGHTBUTTON|TPM_RETURNCMD, uintptr(pt.X), uintptr(pt.Y), 0, uintptr(u.hwnd), 0)
+	switch int(cmd) {
+	case rowExcludeName:
+		u.addExclusion(e.Process)
+	case rowExcludePath:
+		u.addExclusion(e.ProcessPath)
+	}
+}
+
+// addExclusion sends the whole config back through the normal apply path, so
+// the service stays the single owner of configuration state.
+func (u *AppUI) addExclusion(entry string) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return
+	}
+	cfg := u.state.Config
+	for _, existing := range cfg.ExcludedProcesses {
+		if strings.EqualFold(strings.TrimSpace(existing), entry) {
+			return
+		}
+	}
+	cfg.ExcludedProcesses = append(append([]string(nil), cfg.ExcludedProcesses...), entry)
+	u.runCommand(protocol.CmdApply, &cfg)
+}
+
 func (u *AppUI) showTrayMenu() {
 	menu, _, _ := procCreatePopupMenu.Call()
 	if menu == 0 {
@@ -988,6 +1049,10 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 		return 0
 	case WM_NOTIFY:
 		hdr := (*NMHDR)(lParam)
+		if hdr.HwndFrom == u.list && hdr.Code == NM_RCLICK {
+			u.showRowMenu(int((*NMITEMACTIVATE)(lParam).IItem))
+			return 1
+		}
 		if hdr.HwndFrom == u.list && hdr.Code == LVN_GETDISPINFOW {
 			di := (*NMLVDISPINFOW)(lParam)
 			if di.Item.Mask&LVIF_TEXT != 0 {
