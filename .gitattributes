@@ -1,0 +1,12 @@
+# The upstream tree is LF and gofmt treats CRLF as unformatted, so a plain
+# Windows checkout made `gofmt -l` flag every Go file. Pin line endings in the
+# working tree rather than relying on each clone's core.autocrlf.
+* text=auto eol=lf
+
+# Batch files keep CRLF: cmd.exe is the one consumer that still cares.
+*.cmd text eol=crlf
+
+*.png  binary
+*.ico  binary
+*.syso binary
+*.exe  binary

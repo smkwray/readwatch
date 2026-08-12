@@ -83,6 +83,23 @@ func (e *ServiceEngine) Shutdown() {
 	e.ipc.Stop()
 	e.opMu.Lock()
 	e.watcher.Stop()
+	// Stopping the service must leave nothing of ReadWatch's behind. The SACLs
+	// and the audit-policy change are ours, and Windows keeps writing 4663 events
+	// into the Security log for as long as they are applied - with no service
+	// running to consume them. Enabled is deliberately left as-is so the next
+	// start resumes monitoring; only the machine-visible state is withdrawn.
+	e.mu.RLock()
+	cfg := cloneConfig(e.cfg)
+	e.mu.RUnlock()
+	if err := cleanupAuditState(&cfg); err != nil {
+		writeServiceDiagnostic(err)
+	} else if err := settings.Save(paths().Config, cfg); err != nil {
+		writeServiceDiagnostic(err)
+	} else {
+		e.mu.Lock()
+		e.cfg.Snapshots = cfg.Snapshots
+		e.mu.Unlock()
+	}
 	e.opMu.Unlock()
 }
 
