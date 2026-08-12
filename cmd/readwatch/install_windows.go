@@ -86,7 +86,7 @@ func installApp() error {
 	if err := prepareDefaultLogDirectory(ownerSID); err != nil {
 		return err
 	}
-	if err := createOrUpdateService(); err != nil {
+	if err := createOrUpdateService(ownerSID); err != nil {
 		return err
 	}
 	if err := createShellLink(p.StartMenu, p.Exe, p.Icon); err != nil {
@@ -98,11 +98,17 @@ func installApp() error {
 	if err := setStartup(cfg.StartAtLogin); err != nil {
 		return err
 	}
-	if err := startInstalledService(); err != nil {
-		return err
-	}
-	if err := waitForServiceState(SERVICE_RUNNING, 10*time.Second); err != nil {
-		return err
+	// Installing no longer starts LocalSystem. The service comes up only when
+	// monitoring is on, so a fresh install leaves nothing privileged running and
+	// the viewer starts it on demand. An upgrade over a configuration that was
+	// already monitoring resumes it here.
+	if cfg.Enabled {
+		if err := startInstalledService(); err != nil {
+			return err
+		}
+		if err := waitForServiceState(SERVICE_RUNNING, 10*time.Second); err != nil {
+			return err
+		}
 	}
 	if err := launch(p.Exe, "--installed"); err != nil {
 		return err
@@ -226,7 +232,41 @@ func directAuditCleanup(cfg *settings.Config) error {
 	return settings.Save(paths().Config, *cfg)
 }
 
-func createOrUpdateService() error {
+// serviceSDDL grants the interactive owner exactly enough to run the service on
+// demand and no more. Start (RP), stop (WP), query status (LC), query config
+// (CC), interrogate (LO) and read the descriptor (RC) are granted; change config
+// (DC), delete (SD), WRITE_DAC (WD) and WRITE_OWNER (WO) are withheld, because a
+// medium-integrity process that could rewrite the service's ImagePath would have
+// arbitrary code execution as LocalSystem.
+//
+// The OWNER RIGHTS ACE is load-bearing, not decoration. Whoever owns the object
+// otherwise gets implicit READ_CONTROL|WRITE_DAC, which would let the owning
+// account hand itself the rights withheld above. Capping OWNER RIGHTS at RC
+// closes that path. This mirrors the four-ACE shape verified on a Windows host
+// against an earlier design, where exactly this bridge was found.
+func serviceSDDL(ownerSID string) string {
+	const full = "CCDCLCSWRPWPDTLOCRSDRCWDWO"
+	sddl := "D:P(A;;" + full + ";;;SY)(A;;" + full + ";;;BA)"
+	if ownerSID != "" {
+		sddl += "(A;;CCLCSWRPWPLORC;;;" + ownerSID + ")"
+	}
+	return sddl + "(A;;RC;;;OW)"
+}
+
+func applyServiceSecurity(svc uintptr, ownerSID string) error {
+	_, sd, err := securityAttributesFromSDDL(serviceSDDL(ownerSID))
+	if err != nil {
+		return err
+	}
+	defer procLocalFree.Call(sd)
+	r, _, e := procSetServiceObjectSecurity.Call(svc, DACL_SECURITY_INFORMATION, sd)
+	if r == 0 {
+		return winErr("SetServiceObjectSecurity", e)
+	}
+	return nil
+}
+
+func createOrUpdateService(ownerSID string) error {
 	scm, _, e := procOpenSCManagerW.Call(0, 0, SC_MANAGER_ALL_ACCESS)
 	if scm == 0 {
 		return winErr("OpenSCManager", e)
@@ -240,7 +280,7 @@ func createOrUpdateService() error {
 		uintptr(unsafe.Pointer(utf16Ptr(serviceDisplay))),
 		SERVICE_ALL_ACCESS,
 		SERVICE_WIN32_OWN_PROCESS,
-		SERVICE_AUTO_START,
+		SERVICE_DEMAND_START,
 		SERVICE_ERROR_NORMAL,
 		uintptr(unsafe.Pointer(utf16Ptr(binaryPath))),
 		0, 0, 0, 0, 0,
@@ -258,7 +298,7 @@ func createOrUpdateService() error {
 	r, _, e := procChangeServiceConfigW.Call(
 		svc,
 		SERVICE_WIN32_OWN_PROCESS,
-		SERVICE_AUTO_START,
+		SERVICE_DEMAND_START,
 		SERVICE_ERROR_NORMAL,
 		uintptr(unsafe.Pointer(utf16Ptr(binaryPath))),
 		0, 0, 0, 0, 0,
@@ -272,12 +312,10 @@ func createOrUpdateService() error {
 	if r == 0 {
 		return winErr("ChangeServiceConfig2(description)", e)
 	}
-	delayed := SERVICE_DELAYED_AUTO_START_INFO{DelayedAutostart: 1}
-	r, _, e = procChangeServiceConfig2W.Call(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, uintptr(unsafe.Pointer(&delayed)))
-	if r == 0 {
-		return winErr("ChangeServiceConfig2(delayed start)", e)
-	}
-	return nil
+	// Demand-start has no autostart to delay, so the delayed-autostart setting is
+	// gone. The DACL replaces it as the thing that makes on-demand control work:
+	// without it a medium-integrity UI cannot start or stop the service at all.
+	return applyServiceSecurity(svc, ownerSID)
 }
 
 func openInstalledService(access uint32) (SC_HANDLE, SC_HANDLE, error) {

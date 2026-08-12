@@ -238,8 +238,6 @@ type SERVICE_TABLE_ENTRYW struct {
 }
 
 type SERVICE_DESCRIPTIONW struct{ Description *uint16 }
-type SERVICE_DELAYED_AUTO_START_INFO struct{ DelayedAutostart int32 }
-
 type WIN32_FIND_DATAW struct {
 	FileAttributes     uint32
 	CreationTimeLow    uint32
@@ -571,33 +569,34 @@ const (
 	OBJECT_INHERIT_ACE                  = 0x00000001
 	CONTAINER_INHERIT_ACE               = 0x00000002
 
-	SC_MANAGER_CONNECT                     = 0x0001
-	SC_MANAGER_CREATE_SERVICE              = 0x0002
-	SC_MANAGER_ALL_ACCESS                  = 0xF003F
-	SERVICE_QUERY_CONFIG                   = 0x0001
-	SERVICE_CHANGE_CONFIG                  = 0x0002
-	SERVICE_QUERY_STATUS                   = 0x0004
-	SERVICE_ENUMERATE_DEPENDENTS           = 0x0008
-	SERVICE_START                          = 0x0010
-	SERVICE_STOP                           = 0x0020
-	SERVICE_DELETE                         = 0x00010000
-	SERVICE_ALL_ACCESS                     = 0xF01FF
-	SERVICE_WIN32_OWN_PROCESS              = 0x00000010
-	SERVICE_AUTO_START                     = 0x00000002
-	SERVICE_ERROR_NORMAL                   = 0x00000001
-	SERVICE_CONTROL_STOP                   = 0x00000001
-	SERVICE_CONTROL_SHUTDOWN               = 0x00000005
-	SERVICE_CONTROL_PRESHUTDOWN            = 0x0000000F
-	SERVICE_STOPPED                        = 0x00000001
-	SERVICE_START_PENDING                  = 0x00000002
-	SERVICE_STOP_PENDING                   = 0x00000003
-	SERVICE_RUNNING                        = 0x00000004
-	SERVICE_ACCEPT_STOP                    = 0x00000001
-	SERVICE_ACCEPT_SHUTDOWN                = 0x00000004
-	SERVICE_ACCEPT_PRESHUTDOWN             = 0x00000100
-	SERVICE_CONFIG_DESCRIPTION             = 1
-	SERVICE_CONFIG_DELAYED_AUTO_START_INFO = 3
-	SC_STATUS_PROCESS_INFO                 = 0
+	SC_MANAGER_CONNECT           = 0x0001
+	SC_MANAGER_CREATE_SERVICE    = 0x0002
+	SC_MANAGER_ALL_ACCESS        = 0xF003F
+	SERVICE_QUERY_CONFIG         = 0x0001
+	SERVICE_CHANGE_CONFIG        = 0x0002
+	SERVICE_QUERY_STATUS         = 0x0004
+	SERVICE_ENUMERATE_DEPENDENTS = 0x0008
+	SERVICE_START                = 0x0010
+	SERVICE_STOP                 = 0x0020
+	SERVICE_DELETE               = 0x00010000
+	SERVICE_ALL_ACCESS           = 0xF01FF
+	SERVICE_WIN32_OWN_PROCESS    = 0x00000010
+	SERVICE_AUTO_START           = 0x00000002
+	SERVICE_DEMAND_START         = 0x00000003
+	SERVICE_INTERROGATE          = 0x0080
+	SERVICE_ERROR_NORMAL         = 0x00000001
+	SERVICE_CONTROL_STOP         = 0x00000001
+	SERVICE_CONTROL_SHUTDOWN     = 0x00000005
+	SERVICE_CONTROL_PRESHUTDOWN  = 0x0000000F
+	SERVICE_STOPPED              = 0x00000001
+	SERVICE_START_PENDING        = 0x00000002
+	SERVICE_STOP_PENDING         = 0x00000003
+	SERVICE_RUNNING              = 0x00000004
+	SERVICE_ACCEPT_STOP          = 0x00000001
+	SERVICE_ACCEPT_SHUTDOWN      = 0x00000004
+	SERVICE_ACCEPT_PRESHUTDOWN   = 0x00000100
+	SERVICE_CONFIG_DESCRIPTION   = 1
+	SC_STATUS_PROCESS_INFO       = 0
 
 	DELETE = 0x00010000
 )
@@ -734,6 +733,7 @@ var (
 	procQueryServiceStatusEx                                 = advapi32.NewProc("QueryServiceStatusEx")
 	procChangeServiceConfigW                                 = advapi32.NewProc("ChangeServiceConfigW")
 	procChangeServiceConfig2W                                = advapi32.NewProc("ChangeServiceConfig2W")
+	procSetServiceObjectSecurity                             = advapi32.NewProc("SetServiceObjectSecurity")
 	procCloseServiceHandle                                   = advapi32.NewProc("CloseServiceHandle")
 	procStartServiceCtrlDispatcherW                          = advapi32.NewProc("StartServiceCtrlDispatcherW")
 	procRegisterServiceCtrlHandlerExW                        = advapi32.NewProc("RegisterServiceCtrlHandlerExW")

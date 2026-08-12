@@ -691,8 +691,18 @@ func (u *AppUI) runCommand(command string, cfg *settings.PublicConfig) {
 		client := u.client
 		u.clientMu.RUnlock()
 		if client == nil {
-			u.queueError(fmt.Errorf("ReadWatch service is not connected"))
-			return
+			// The service is demand-start, so nothing is listening until
+			// monitoring is wanted. Only Start may bring it up; every other
+			// command needs a service that is already running.
+			if command != protocol.CmdStart {
+				u.queueError(fmt.Errorf("ReadWatch service is not connected"))
+				return
+			}
+			var err error
+			if client, err = u.startServiceAndAttach(20 * time.Second); err != nil {
+				u.queueError(err)
+				return
+			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		err := client.Command(ctx, command, cfg)
@@ -701,6 +711,29 @@ func (u *AppUI) runCommand(command string, cfg *settings.PublicConfig) {
 			u.queueError(err)
 		}
 	}()
+}
+
+// startServiceAndAttach starts the demand-start service and waits for the
+// existing reconnect loop to establish the pipe. It needs no elevation: the
+// service DACL applied at install grants the installing account SERVICE_START.
+func (u *AppUI) startServiceAndAttach(timeout time.Duration) (*IPCClient, error) {
+	if err := startInstalledService(); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if u.exiting.Load() {
+			return nil, fmt.Errorf("ReadWatch is exiting")
+		}
+		u.clientMu.RLock()
+		client := u.client
+		u.clientMu.RUnlock()
+		if client != nil {
+			return client, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("the ReadWatch service started but did not accept a connection")
 }
 
 func (u *AppUI) toggleMonitoring() {
@@ -840,6 +873,14 @@ func (u *AppUI) shutdown() {
 		u.client = nil
 	}
 	u.clientMu.Unlock()
+	// exiting the app leaves nothing privileged running. Stop
+	// the service here, after the pipe is released so it is not torn down under
+	// a live client. This is synchronous because the process is about to exit -
+	// a goroutine would be killed before SCM finished. The configured Enabled
+	// flag is untouched, so relaunching resumes monitoring.
+	if err := stopInstalledService(5 * time.Second); err != nil {
+		writeServiceDiagnostic(err)
+	}
 	// Wake the wait goroutines and let process teardown close these handles.
 	// Closing a handle while another thread is inside WaitForSingleObject has
 	// undefined behavior on Windows.
