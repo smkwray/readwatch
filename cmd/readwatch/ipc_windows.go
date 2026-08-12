@@ -41,6 +41,9 @@ type IPCServer struct {
 	done     chan struct{}
 	stopped  atomic.Bool
 	dropped  atomic.Uint64
+
+	connectEvent HANDLE
+	stopEvent    HANDLE
 }
 
 type serverPipeClient struct {
@@ -53,13 +56,19 @@ type serverPipeClient struct {
 }
 
 func NewIPCServer(ownerSID string, handler serviceCommandHandler) *IPCServer {
+	// Manual-reset, unnamed: connectEvent carries the overlapped connect,
+	// stopEvent breaks the wait so Stop() can interrupt it.
+	connectEvent, _, _ := procCreateEventW.Call(0, 1, 0, 0)
+	stopEvent, _, _ := procCreateEventW.Call(0, 1, 0, 0)
 	return &IPCServer{
-		name:     pipeName(ownerSID),
-		ownerSID: ownerSID,
-		handler:  handler,
-		clients:  make(map[*serverPipeClient]struct{}),
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		name:         pipeName(ownerSID),
+		ownerSID:     ownerSID,
+		handler:      handler,
+		clients:      make(map[*serverPipeClient]struct{}),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		connectEvent: HANDLE(connectEvent),
+		stopEvent:    HANDLE(stopEvent),
 	}
 }
 
@@ -71,7 +80,6 @@ func (s *IPCServer) Stop() {
 	}
 	close(s.stop)
 	s.mu.Lock()
-	pending := s.pending
 	clients := make([]*serverPipeClient, 0, len(s.clients))
 	for c := range s.clients {
 		clients = append(clients, c)
@@ -80,15 +88,13 @@ func (s *IPCServer) Stop() {
 	for _, c := range clients {
 		c.close()
 	}
-	// The accept loop is parked in a synchronous ConnectNamedPipe. On Windows
-	// CloseHandle does NOT cancel that wait, so closing the pending handle here
-	// left the goroutine blocked forever, close(s.done) never ran, and the
-	// service sat in STOP_PENDING until it was killed - observed on a Windows host
-	// as a permanent hang on the first real `sc stop`. Connecting to our own
-	// pipe satisfies the pending connect; the loop then sees s.stop closed and
-	// returns, closing the handle itself.
-	if pending != 0 {
-		wakeNamedPipeListener(s.name)
+	// Release the accept loop. It is parked in an overlapped ConnectNamedPipe
+	// waiting on {connectEvent, stopEvent}; signalling stopEvent breaks that
+	// wait and the loop cancels its pending connect and returns. CloseHandle
+	// cannot do this - it does not cancel a pending pipe connect, which is why
+	// the service used to sit in STOP_PENDING until it was killed.
+	if s.stopEvent != 0 {
+		procSetEvent.Call(uintptr(s.stopEvent))
 	}
 	select {
 	case <-s.done:
@@ -96,17 +102,36 @@ func (s *IPCServer) Stop() {
 		// Never let cleanup wedge the SCM. Losing the accept goroutine at
 		// process exit is survivable; an unstoppable service is not.
 	}
+	for _, h := range []HANDLE{s.connectEvent, s.stopEvent} {
+		if h != 0 {
+			closeHandle(h)
+		}
+	}
 }
 
-func wakeNamedPipeListener(name string) {
-	h, _, _ := procCreateFileW.Call(
-		uintptr(unsafe.Pointer(utf16Ptr(name))),
-		GENERIC_READ|GENERIC_WRITE,
-		0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0,
-	)
-	if h != INVALID_HANDLE_VALUE && h != 0 {
-		closeHandle(HANDLE(h))
+// awaitClient blocks until a client connects or Stop() signals. Overlapped so
+// the wait is cancellable; a synchronous ConnectNamedPipe cannot be interrupted.
+func (s *IPCServer) awaitClient(h HANDLE) (uintptr, error) {
+	procResetEvent.Call(uintptr(s.connectEvent))
+	ov := OVERLAPPED{HEvent: s.connectEvent}
+	r, _, e := procConnectNamedPipe.Call(uintptr(h), uintptr(unsafe.Pointer(&ov)))
+	if r != 0 {
+		return 1, nil
 	}
+	errno, _ := e.(syscall.Errno)
+	switch errno {
+	case ERROR_PIPE_CONNECTED:
+		return 1, nil
+	case ERROR_IO_PENDING:
+		handles := [2]HANDLE{s.connectEvent, s.stopEvent}
+		w, _, _ := procWaitForMultipleObjects.Call(2, uintptr(unsafe.Pointer(&handles[0])), 0, INFINITE)
+		if w == WAIT_OBJECT_0 {
+			return 1, nil
+		}
+		procCancelIoEx.Call(uintptr(h), uintptr(unsafe.Pointer(&ov)))
+		return 0, syscall.Errno(ERROR_OPERATION_ABORTED)
+	}
+	return 0, e
 }
 
 func (s *IPCServer) BroadcastEvent(event model.Event) {
@@ -166,7 +191,7 @@ func (s *IPCServer) acceptLoop() {
 		s.mu.Lock()
 		s.pending = h
 		s.mu.Unlock()
-		r, _, callErr := procConnectNamedPipe.Call(uintptr(h), 0)
+		r, callErr := s.awaitClient(h)
 		if r == 0 {
 			last := syscall.Errno(0)
 			if errno, ok := callErr.(syscall.Errno); ok {
@@ -216,7 +241,12 @@ func (s *IPCServer) createPipe() (HANDLE, error) {
 	defer procLocalFree.Call(sd)
 	r, _, e := procCreateNamedPipeW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(s.name))),
-		PIPE_ACCESS_DUPLEX,
+		// FILE_FLAG_OVERLAPPED is mandatory, not an optimisation. Both ends run a
+		// reader goroutine and write to the SAME handle; on a synchronous handle
+		// Windows serialises I/O per handle, so each side's write parked behind
+		// its own pending read and the connection deadlocked on the first
+		// message. Measured: sync handle hangs, overlapped completes.
+		PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED,
 		PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,
 		PIPE_UNLIMITED_INSTANCES,
 		64*1024, 64*1024, 0,
@@ -434,7 +464,10 @@ func ConnectIPC(ownerSID string, timeout time.Duration, onState func(protocol.St
 	r, _, e := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(name))),
 		GENERIC_READ|GENERIC_WRITE,
-		0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0,
+		// Overlapped for the same reason as the server end: this handle carries a
+		// reader goroutine and concurrent writes, and a synchronous handle
+		// serialises them into a deadlock on the first message.
+		0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OVERLAPPED, 0,
 	)
 	if r == INVALID_HANDLE_VALUE || r == 0 {
 		return nil, winErr("CreateFile(named pipe)", e)

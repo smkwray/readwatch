@@ -237,6 +237,14 @@ type SERVICE_TABLE_ENTRYW struct {
 	ServiceProc uintptr
 }
 
+type OVERLAPPED struct {
+	Internal     uintptr
+	InternalHigh uintptr
+	Offset       uint32
+	OffsetHigh   uint32
+	HEvent       HANDLE
+}
+
 type SERVICE_DESCRIPTIONW struct{ Description *uint16 }
 type WIN32_FIND_DATAW struct {
 	FileAttributes     uint32
@@ -505,6 +513,9 @@ const (
 	ERROR_PIPE_BUSY               = 231
 	ERROR_NO_DATA                 = 232
 	ERROR_PIPE_CONNECTED          = 535
+	ERROR_IO_PENDING              = 997
+	ERROR_OPERATION_ABORTED       = 995
+	FILE_FLAG_OVERLAPPED          = 0x40000000
 	ERROR_CANCELLED               = 1223
 	ERROR_NOT_ALL_ASSIGNED        = 1300
 	ERROR_SERVICE_EXISTS          = 1073
@@ -626,6 +637,8 @@ var (
 	procSetEvent                = kernel32.NewProc("SetEvent")
 	procResetEvent              = kernel32.NewProc("ResetEvent")
 	procWaitForSingleObject     = kernel32.NewProc("WaitForSingleObject")
+	procWaitForMultipleObjects  = kernel32.NewProc("WaitForMultipleObjects")
+	procCancelIoEx              = kernel32.NewProc("CancelIoEx")
 	procCloseHandle             = kernel32.NewProc("CloseHandle")
 	procGetFileAttributesW      = kernel32.NewProc("GetFileAttributesW")
 	procMoveFileExW             = kernel32.NewProc("MoveFileExW")
