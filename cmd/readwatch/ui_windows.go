@@ -491,6 +491,18 @@ func (u *AppUI) startConnectionLoop() {
 	go func() {
 		delay := 250 * time.Millisecond
 		for !u.exiting.Load() {
+			// The service is demand-start, so at viewer launch there is nothing
+			// to connect to. Everything the window displays - configuration,
+			// folders, status - arrives over this pipe, so a viewer with no
+			// service is inert: it cannot even reach Settings to add a folder.
+			// The service's lifetime is therefore the viewer's lifetime; exiting
+			// stops it again in shutdown(). Idempotent, so retrying on each
+			// reconnect attempt also recovers a service that died.
+			if !u.exiting.Load() {
+				if err := startInstalledService(); err != nil {
+					u.queueError(err)
+				}
+			}
 			client, err := ConnectIPC(u.ownerSID, 2*time.Second, u.queueState, u.queueEvent, func(err error) {
 				if err != nil && !u.exiting.Load() {
 					u.queueDisconnected()
@@ -631,9 +643,13 @@ func (u *AppUI) drainError() {
 func (u *AppUI) updateStatus() {
 	state := u.state
 	if !state.ServiceReady {
-		setWindowText(u.status, "Service unavailable")
+		// Not connected is an ordinary state now, not a fault: with a
+		// demand-start service the viewer briefly has no peer at launch, and
+		// after a failed start this button is the only way back. Disabling it
+		// here left the window permanently inert - no Start, no Settings.
+		setWindowText(u.status, "○  Connecting…")
 		setWindowText(u.startBtn, "Start")
-		procEnableWindow.Call(uintptr(u.startBtn), 0)
+		procEnableWindow.Call(uintptr(u.startBtn), 1)
 	} else if state.Running {
 		setWindowText(u.status, "●  Monitoring")
 		setWindowText(u.startBtn, "Stop")
