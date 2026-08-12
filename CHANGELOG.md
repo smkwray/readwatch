@@ -34,8 +34,8 @@ First revision after the preview was actually run on Windows. Several paths had 
 
 - Process exclusion filtering, applied in the service before the log and before the pipe. An entry
   containing a path separator matches the full image path; otherwise it matches the image name.
-  Defaults: `explorer.exe`, `SearchIndexer.exe`, `MsMpEng.exe`, `viewer.exe`. Suppressed reads are
-  counted and shown rather than silently dropped.
+  Nothing is excluded by default. Suppressed reads are counted and shown rather than silently
+  dropped.
 - Right-click a row to exclude that process by name or by exact path.
 - Settings takes a typed or pasted folder path, validated, with quotes stripped; the exclusion
   list is editable there too.

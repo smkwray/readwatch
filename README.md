@@ -63,8 +63,7 @@ Right-click any row to silence that process:
 
 Prefer the exact path for anything you have several copies of; a machine typically has multiple
 `python.exe` installs, and a filename is easy to imitate, which matters for a tool whose job is
-noticing an unexpected reader. `explorer.exe`, `SearchIndexer.exe`, `MsMpEng.exe` and `viewer.exe`
-ship excluded by name — edit the list in Settings.
+noticing an unexpected reader. Nothing is excluded until you say so — the list lives in Settings.
 
 Closing the window hides it to the tray; **Exit** quits and stops the service. **Start ReadWatch
 at sign-in** launches it hidden in the tray on login.

@@ -47,8 +47,10 @@ func TestNormalizeDedupesExclusionsAndKeepsEmptyEmpty(t *testing.T) {
 
 func TestPublicRoundTripCarriesExclusions(t *testing.T) {
 	c := Default(`C:\logs\r.log`, "S-1-5-21-1", "u")
-	if len(c.ExcludedProcesses) == 0 {
-		t.Fatal("defaults should seed the noisy readers")
+	// Nothing is excluded until the user says so: which readers count as noise
+	// depends on the machine, not on the tool.
+	if len(c.ExcludedProcesses) != 0 {
+		t.Fatalf("a fresh config must exclude nothing, got %v", c.ExcludedProcesses)
 	}
 	pub := c.Public()
 	pub.ExcludedProcesses = append(pub.ExcludedProcesses, "notepad.exe")
@@ -57,7 +59,7 @@ func TestPublicRoundTripCarriesExclusions(t *testing.T) {
 	if !Excludes(target.ExcludedProcesses, `C:\W\notepad.exe`, "notepad.exe") {
 		t.Fatal("exclusion added through PublicConfig did not survive ApplyPublic")
 	}
-	if !Excludes(target.ExcludedProcesses, `C:\Windows\explorer.exe`, "explorer.exe") {
-		t.Fatal("default exclusion lost through the public round trip")
+	if Excludes(target.ExcludedProcesses, `C:\Windows\explorer.exe`, "explorer.exe") {
+		t.Fatal("nothing beyond the added entry should be excluded")
 	}
 }

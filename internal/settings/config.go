@@ -53,19 +53,6 @@ type PublicConfig struct {
 	ExcludedProcesses  []string `json:"excluded_processes"`
 }
 
-// DefaultExcludedProcesses are the routine background readers that tend to
-// drown the signal on a Windows desktop: the shell re-thumbnails recently used
-// files even with no window open, and the indexer and antivirus sweep folders
-// on their own schedule. All are legitimate, so the noise is suppressed here
-// rather than by changing the machine's settings. viewer.exe is a common
-// third-party file manager that thumbnails independently; harmless if absent.
-var DefaultExcludedProcesses = []string{
-	"explorer.exe",
-	"SearchIndexer.exe",
-	"MsMpEng.exe",
-	"viewer.exe",
-}
-
 // Excludes reports whether a reader matches the suppression list.
 //
 // An entry containing a path separator is matched against the full image path;
@@ -104,14 +91,17 @@ func Excludes(list []string, imagePath, imageName string) bool {
 
 func Default(logPath, ownerSID, ownerName string) Config {
 	return Config{
-		Version:           Version,
-		OwnerSID:          ownerSID,
-		OwnerName:         ownerName,
-		LogPath:           logPath,
-		LogFormat:         "text",
-		MaxRows:           1000,
-		Folders:           []string{},
-		ExcludedProcesses: append([]string(nil), DefaultExcludedProcesses...),
+		Version:   Version,
+		OwnerSID:  ownerSID,
+		OwnerName: ownerName,
+		LogPath:   logPath,
+		LogFormat: "text",
+		MaxRows:   1000,
+		Folders:   []string{},
+		// No processes are excluded out of the box. Which readers are noise is a
+		// property of the machine, not of the tool, so the list starts empty and
+		// is filled by right-clicking the readers you actually see.
+		ExcludedProcesses: []string{},
 		Snapshots:         make(map[string]AuditSnapshot),
 		OpenAtLogin:       false,
 	}
@@ -207,8 +197,7 @@ func (c *Config) Normalize() {
 	}
 
 	// Case-insensitive dedupe, original spelling kept for display. An empty list
-	// is a deliberate choice ("show me everything"), so it is never refilled
-	// with the defaults - those are seeded once, in Default().
+	// means "show me everything" and stays empty.
 	exSeen := make(map[string]string)
 	exOrder := make([]string, 0, len(c.ExcludedProcesses))
 	for _, raw := range c.ExcludedProcesses {
