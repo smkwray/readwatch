@@ -47,10 +47,29 @@ const (
 )
 
 var (
-	mainWindowClass = "ReadWatch.MainWindow"
-	mainWndProcPtr  = syscall.NewCallback(mainWindowProc)
-	mainUI          *AppUI
+	mainWindowClass     = "ReadWatch.MainWindow"
+	mainWndProcPtr      = syscall.NewCallback(mainWindowProc)
+	listSubclassProcPtr = syscall.NewCallback(listSubclassProc)
+	mainUI              *AppUI
 )
+
+// listSubclassProc exists only to catch the header's NM_CUSTOMDRAW, which the
+// list view receives as the header's parent and never forwards.
+func listSubclassProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Pointer) uintptr {
+	u := mainUI
+	if u != nil && msg == WM_NOTIFY && u.header != 0 {
+		hdr := (*NMHDR)(lParam)
+		if hdr.HwndFrom == u.header && hdr.Code == NM_CUSTOMDRAW {
+			return u.drawHeader((*NMCUSTOMDRAW)(lParam))
+		}
+	}
+	if u != nil && u.origListProc != 0 {
+		r, _, _ := procCallWindowProcW.Call(u.origListProc, hwnd, uintptr(msg), wParam, uintptr(lParam))
+		return r
+	}
+	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, uintptr(lParam))
+	return r
+}
 
 type eventRing struct {
 	buf   []model.Event
@@ -133,22 +152,23 @@ type uiTheme struct {
 }
 
 type AppUI struct {
-	hwnd        HWND
-	list        HWND
-	header      HWND
-	columns     []string
-	status      HWND
-	startBtn    HWND
-	settingsBtn HWND
-	summary     HWND
-	openBtn     HWND
-	clearBtn    HWND
-	exitBtn     HWND
-	font        HFONT
-	icon        HICON
-	iconSmall   HICON
-	theme       uiTheme
-	dpi         uint32
+	hwnd         HWND
+	list         HWND
+	header       HWND
+	origListProc uintptr
+	columns      []string
+	status       HWND
+	startBtn     HWND
+	settingsBtn  HWND
+	summary      HWND
+	openBtn      HWND
+	clearBtn     HWND
+	exitBtn      HWND
+	font         HFONT
+	icon         HICON
+	iconSmall    HICON
+	theme        uiTheme
+	dpi          uint32
 
 	ownerSID string
 	startup  bool
@@ -331,6 +351,12 @@ func (u *AppUI) createControls() {
 	// The header is its own control. Custom-drawing it needs the titles, and
 	// keeping them here avoids an HDITEMW round trip on every paint.
 	u.header = HWND(sendMessage(u.list, LVM_GETHEADER, 0, 0))
+	// The header's parent is the list view, not this window, so its
+	// NM_CUSTOMDRAW never reaches mainWindowProc. Subclass the list to intercept
+	// it - without this the header keeps the theme's own (dark-on-dark) text.
+	if prev, _, _ := procSetWindowLongPtrW.Call(uintptr(u.list), GWLP_WNDPROC, listSubclassProcPtr); prev != 0 {
+		u.origListProc = prev
+	}
 	u.summary = createControl("STATIC", "0 folders · 0 events", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, u.hwnd, 0)
 	u.openBtn = createControl("BUTTON", "Open log", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idOpenLog)
 	u.clearBtn = createControl("BUTTON", "Clear", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idClear)
@@ -1133,9 +1159,6 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 		return 0
 	case WM_NOTIFY:
 		hdr := (*NMHDR)(lParam)
-		if u.header != 0 && hdr.HwndFrom == u.header && hdr.Code == NM_CUSTOMDRAW {
-			return u.drawHeader((*NMCUSTOMDRAW)(lParam))
-		}
 		if hdr.HwndFrom == u.list && hdr.Code == NM_RCLICK {
 			u.showRowMenu(int((*NMITEMACTIVATE)(lParam).IItem))
 			return 1
