@@ -39,8 +39,13 @@ func installApp() error {
 	// before updating it, but never signal the installer process itself.
 	if !executableIsInstalled() {
 		if existing, loadErr := loadServiceConfig(p.Config, p.DefaultLog); loadErr == nil && existing.OwnerSID != "" {
-			if signalExit(existing.OwnerSID) && !waitForUIExit(existing.OwnerSID, 4*time.Second) {
-				return errors.New("close the existing ReadWatch viewer, then retry installation")
+			// 15s, not 4s: exiting the viewer now also stops the service, so a
+			// normal shutdown takes about a second and a slow one can take
+			// several. The old budget made upgrading over a running viewer fail
+			// with a message telling you to close a viewer that was already
+			// closing.
+			if signalExit(existing.OwnerSID) && !waitForUIExit(existing.OwnerSID, 15*time.Second) {
+				return errors.New("ReadWatch is still shutting down; wait a moment and retry installation")
 			}
 		}
 	}
@@ -170,7 +175,7 @@ func uninstallElevated(quiet bool) error {
 		}
 		if cfg.OwnerSID != "" {
 			_ = signalExit(cfg.OwnerSID)
-			if !waitForUIExit(cfg.OwnerSID, 5*time.Second) {
+			if !waitForUIExit(cfg.OwnerSID, 15*time.Second) {
 				return errors.New("ReadWatch is still running; exit it from the tray and retry uninstall")
 			}
 		}

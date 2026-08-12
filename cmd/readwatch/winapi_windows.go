@@ -416,11 +416,14 @@ const (
 	EM_SETCUEBANNER          = 0x1501
 	LVM_GETHEADER            = LVM_FIRST + 31
 
-	CDDS_PREPAINT          = 0x00000001
-	CDDS_ITEMPREPAINT      = 0x00010001
-	CDRF_DODEFAULT         = 0x00000000
-	CDRF_SKIPDEFAULT       = 0x00000004
-	CDRF_NOTIFYITEMDRAW    = 0x00000020
+	CDDS_PREPAINT       = 0x00000001
+	CDDS_ITEMPREPAINT   = 0x00010001
+	CDRF_DODEFAULT      = 0x00000000
+	CDRF_SKIPDEFAULT    = 0x00000004
+	CDRF_NOTIFYITEMDRAW = 0x00000020
+	// -4, written this way so it converts to uintptr without tripping Go's
+	// negative-constant conversion rule.
+	GWLP_WNDPROC           = ^uintptr(3)
 	LVN_ITEMCHANGED        = LVN_FIRST - 1
 	LVSICF_NOINVALIDATEALL = 0x00000001
 	LVSICF_NOSCROLL        = 0x00000002
@@ -725,6 +728,7 @@ var (
 	procSetFocus                      = user32.NewProc("SetFocus")
 	procGetWindowLongPtrW             = user32.NewProc("GetWindowLongPtrW")
 	procSetWindowLongPtrW             = user32.NewProc("SetWindowLongPtrW")
+	procCallWindowProcW               = user32.NewProc("CallWindowProcW")
 	procGetDlgCtrlID                  = user32.NewProc("GetDlgCtrlID")
 	procCreatePopupMenu               = user32.NewProc("CreatePopupMenu")
 	procAppendMenuW                   = user32.NewProc("AppendMenuW")
