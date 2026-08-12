@@ -510,6 +510,10 @@ const (
 	ERROR_BROKEN_PIPE             = 109
 	ERROR_INSUFFICIENT_BUFFER     = 122
 	ERROR_ALREADY_EXISTS          = 183
+	// RegisterClassEx reports a duplicate class as 1410, NOT 183. Guarding on
+	// ERROR_ALREADY_EXISTS meant reopening Settings failed with
+	// "RegisterClassEx(settings): Class already exists."
+	ERROR_CLASS_ALREADY_EXISTS = 1410
 	ERROR_PIPE_BUSY               = 231
 	ERROR_NO_DATA                 = 232
 	ERROR_PIPE_CONNECTED          = 535
