@@ -26,15 +26,15 @@ func queryFileSystemAuditPolicy() (AUDITPOLICYINFORMATION, error) {
 	if err := enablePrivilege("SeSecurityPrivilege"); err != nil {
 		return AUDITPOLICYINFORMATION{}, err
 	}
-	var infoPtr uintptr
+	var infoPtr *AUDITPOLICYINFORMATION
 	r, _, e := procAuditQuerySystemPolicy.Call(
 		uintptr(unsafe.Pointer(&fileSystemAuditSubcategory)), 1, uintptr(unsafe.Pointer(&infoPtr)),
 	)
 	if r == 0 {
 		return AUDITPOLICYINFORMATION{}, winErr("AuditQuerySystemPolicy", e)
 	}
-	defer procAuditFree.Call(infoPtr)
-	return *(*AUDITPOLICYINFORMATION)(unsafe.Pointer(infoPtr)), nil
+	defer procAuditFree.Call(uintptr(unsafe.Pointer(infoPtr)))
+	return *infoPtr, nil
 }
 
 func setFileSystemAuditPolicy(info AUDITPOLICYINFORMATION) error {

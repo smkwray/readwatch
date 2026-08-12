@@ -27,18 +27,18 @@ func hrError(label string, hr uintptr) error {
 	return fmt.Errorf("%s failed: HRESULT 0x%08x", label, uint32(hr))
 }
 
-func comMethod(obj uintptr, index uintptr, args ...uintptr) (uintptr, uintptr, syscall.Errno) {
-	vtbl := *(*uintptr)(unsafe.Pointer(obj))
-	fn := *(*uintptr)(unsafe.Pointer(vtbl + index*unsafe.Sizeof(uintptr(0))))
+func comMethod(obj unsafe.Pointer, index uintptr, args ...uintptr) (uintptr, uintptr, syscall.Errno) {
+	vtbl := *(*unsafe.Pointer)(obj)
+	fn := *(*uintptr)(unsafe.Add(vtbl, index*unsafe.Sizeof(uintptr(0))))
 	all := make([]uintptr, 0, len(args)+1)
-	all = append(all, obj)
+	all = append(all, uintptr(obj))
 	all = append(all, args...)
 	r1, r2, err := syscall.SyscallN(fn, all...)
 	return r1, r2, err
 }
 
-func comRelease(obj uintptr) {
-	if obj != 0 {
+func comRelease(obj unsafe.Pointer) {
+	if obj != nil {
 		comMethod(obj, 2)
 	}
 }
@@ -51,23 +51,23 @@ func coInit() (bool, error) {
 	return true, nil
 }
 
-func coCreate(clsid, iid *GUID) (uintptr, error) {
-	var obj uintptr
+func coCreate(clsid, iid *GUID) (unsafe.Pointer, error) {
+	var obj unsafe.Pointer
 	hr, _, _ := procCoCreateInstance.Call(
 		uintptr(unsafe.Pointer(clsid)), 0, CLSCTX_INPROC_SERVER,
 		uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(&obj)),
 	)
 	if failed(hr) {
-		return 0, hrError("CoCreateInstance", hr)
+		return nil, hrError("CoCreateInstance", hr)
 	}
 	return obj, nil
 }
 
-func comQueryInterface(obj uintptr, iid *GUID) (uintptr, error) {
-	var out uintptr
+func comQueryInterface(obj unsafe.Pointer, iid *GUID) (unsafe.Pointer, error) {
+	var out unsafe.Pointer
 	hr, _, _ := comMethod(obj, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(&out)))
 	if failed(hr) {
-		return 0, hrError("QueryInterface", hr)
+		return nil, hrError("QueryInterface", hr)
 	}
 	return out, nil
 }
@@ -195,8 +195,8 @@ func pickLogFile(owner HWND, current, format string) (string, bool, error) {
 	return path, ok, err
 }
 
-func fileDialogResult(dlg uintptr) (string, bool, error) {
-	var item uintptr
+func fileDialogResult(dlg unsafe.Pointer) (string, bool, error) {
+	var item unsafe.Pointer
 	if hr, _, _ := comMethod(dlg, 20, uintptr(unsafe.Pointer(&item))); failed(hr) {
 		return "", false, hrError("IFileDialog.GetResult", hr)
 	}
