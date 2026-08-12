@@ -77,13 +77,36 @@ func (s *IPCServer) Stop() {
 		clients = append(clients, c)
 	}
 	s.mu.Unlock()
-	if pending != 0 {
-		closeHandle(pending)
-	}
 	for _, c := range clients {
 		c.close()
 	}
-	<-s.done
+	// The accept loop is parked in a synchronous ConnectNamedPipe. On Windows
+	// CloseHandle does NOT cancel that wait, so closing the pending handle here
+	// left the goroutine blocked forever, close(s.done) never ran, and the
+	// service sat in STOP_PENDING until it was killed - observed on a Windows host
+	// as a permanent hang on the first real `sc stop`. Connecting to our own
+	// pipe satisfies the pending connect; the loop then sees s.stop closed and
+	// returns, closing the handle itself.
+	if pending != 0 {
+		wakeNamedPipeListener(s.name)
+	}
+	select {
+	case <-s.done:
+	case <-time.After(5 * time.Second):
+		// Never let cleanup wedge the SCM. Losing the accept goroutine at
+		// process exit is survivable; an unstoppable service is not.
+	}
+}
+
+func wakeNamedPipeListener(name string) {
+	h, _, _ := procCreateFileW.Call(
+		uintptr(unsafe.Pointer(utf16Ptr(name))),
+		GENERIC_READ|GENERIC_WRITE,
+		0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0,
+	)
+	if h != INVALID_HANDLE_VALUE && h != 0 {
+		closeHandle(HANDLE(h))
+	}
 }
 
 func (s *IPCServer) BroadcastEvent(event model.Event) {
