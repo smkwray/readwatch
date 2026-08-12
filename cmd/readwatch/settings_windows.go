@@ -464,10 +464,10 @@ func (u *AppUI) applySettings(cfg settings.PublicConfig) bool {
 	return true
 }
 
-func settingsWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+func settingsWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	s := settingsUI
 	if s == nil {
-		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, uintptr(lParam))
 		return r
 	}
 	switch msg {
@@ -511,7 +511,7 @@ func settingsWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintpt
 		return 0
 	case WM_DPICHANGED:
 		newDPI := uint32(loword(wParam))
-		s.dpiChanged(newDPI, (*RECT)(unsafe.Pointer(lParam)))
+		s.dpiChanged(newDPI, (*RECT)(lParam))
 		return 0
 	case WM_CLOSE:
 		s.close()
@@ -528,6 +528,6 @@ func settingsWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintpt
 		procSetForegroundWindow.Call(uintptr(owner))
 		return 0
 	}
-	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, uintptr(lParam))
 	return r
 }

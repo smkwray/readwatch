@@ -769,7 +769,7 @@ func utf16FromPtr(p *uint16) string {
 		return ""
 	}
 	var n int
-	for q := uintptr(unsafe.Pointer(p)); *(*uint16)(unsafe.Pointer(q)) != 0; q += 2 {
+	for *(*uint16)(unsafe.Add(unsafe.Pointer(p), n*int(unsafe.Sizeof(*p)))) != 0 {
 		n++
 	}
 	return syscall.UTF16ToString(unsafe.Slice(p, n))

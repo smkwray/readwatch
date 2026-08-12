@@ -865,10 +865,10 @@ func (u *AppUI) shutdown() {
 	}
 }
 
-func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	u := mainUI
 	if u == nil {
-		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+		r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, uintptr(lParam))
 		return r
 	}
 	if u.taskbarCreatedMsg != 0 && msg == u.taskbarCreatedMsg {
@@ -885,7 +885,7 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		u.layout()
 		return 0
 	case WM_GETMINMAXINFO:
-		mmi := (*MINMAXINFO)(unsafe.Pointer(lParam))
+		mmi := (*MINMAXINFO)(lParam)
 		mmi.PtMinTrackSize = POINT{X: u.scale(480), Y: u.scale(260)}
 		return 0
 	case WM_ERASEBKGND:
@@ -919,9 +919,9 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	case WM_NOTIFY:
-		hdr := (*NMHDR)(unsafe.Pointer(lParam))
+		hdr := (*NMHDR)(lParam)
 		if hdr.HwndFrom == u.list && hdr.Code == LVN_GETDISPINFOW {
-			di := (*NMLVDISPINFOW)(unsafe.Pointer(lParam))
+			di := (*NMLVDISPINFOW)(lParam)
 			if di.Item.Mask&LVIF_TEXT != 0 {
 				e, ok := u.ring.Newest(int(di.Item.IItem))
 				text := ""
@@ -943,7 +943,7 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 			return 0
 		}
 	case WM_DPICHANGED:
-		u.dpiChanged(uint32(loword(wParam)), (*RECT)(unsafe.Pointer(lParam)))
+		u.dpiChanged(uint32(loword(wParam)), (*RECT)(lParam))
 		return 0
 	case WM_SETTINGCHANGE, WM_THEMECHANGED:
 		u.applyTheme(false)
@@ -975,7 +975,7 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		procDestroyWindow.Call(uintptr(u.hwnd))
 		return 0
 	case wmAppTray:
-		switch uint32(loword(lParam)) {
+		switch uint32(loword(uintptr(lParam))) {
 		case WM_LBUTTONUP, WM_LBUTTONDBLCLK, NIN_SELECT, NIN_KEYSELECT:
 			u.show()
 		case WM_RBUTTONUP, WM_CONTEXTMENU:
@@ -983,6 +983,6 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	}
-	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
+	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, uintptr(lParam))
 	return r
 }
