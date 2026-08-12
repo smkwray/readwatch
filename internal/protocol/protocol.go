@@ -42,5 +42,6 @@ type State struct {
 	LastError    string                `json:"last_error,omitempty"`
 	LogDropped   uint64                `json:"log_dropped,omitempty"`
 	LiveDropped  uint64                `json:"live_dropped,omitempty"`
+	Suppressed   uint64                `json:"suppressed,omitempty"`
 	ServiceReady bool                  `json:"service_ready"`
 }
