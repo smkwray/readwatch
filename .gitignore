@@ -1,0 +1,45 @@
+# Agent orchestration (contract, state, delegates) — private, never tracked
+do/
+CLAUDE.md
+AGENTS.md
+
+# Internal docs not for the repo
+docs/
+
+# Environment
+.env
+
+# Plans
+*.plan.md
+plan.md
+plans/
+
+# Data and generated outputs (project-local working state)
+/data/
+/var/
+/outputs/
+/tmp/
+
+# Go build output
+/dist/
+*.exe
+*.test
+
+# Delegate worktrees (device-local, ephemeral)
+.worktrees/
+
+# Python artifacts (tools/ only; defense in depth)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# .githooks/ is INTENTIONALLY NOT IGNORED — it ships the pre-commit hook

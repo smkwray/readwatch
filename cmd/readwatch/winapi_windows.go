@@ -1,0 +1,854 @@
+//go:build windows
+
+package main
+
+import (
+	"errors"
+	"fmt"
+	"syscall"
+	"unsafe"
+)
+
+type (
+	HWND                  uintptr
+	HINSTANCE             uintptr
+	HICON                 uintptr
+	HCURSOR               uintptr
+	HBRUSH                uintptr
+	HMENU                 uintptr
+	HDC                   uintptr
+	HFONT                 uintptr
+	HPEN                  uintptr
+	HGDIOBJ               uintptr
+	HANDLE                uintptr
+	SC_HANDLE             uintptr
+	SERVICE_STATUS_HANDLE uintptr
+)
+
+type POINT struct{ X, Y int32 }
+type RECT struct{ Left, Top, Right, Bottom int32 }
+type GUID struct {
+	Data1 uint32
+	Data2 uint16
+	Data3 uint16
+	Data4 [8]byte
+}
+
+type WNDCLASSEXW struct {
+	CbSize        uint32
+	Style         uint32
+	LpfnWndProc   uintptr
+	CbClsExtra    int32
+	CbWndExtra    int32
+	HInstance     HINSTANCE
+	HIcon         HICON
+	HCursor       HCURSOR
+	HbrBackground HBRUSH
+	LpszMenuName  *uint16
+	LpszClassName *uint16
+	HIconSm       HICON
+}
+
+type MSG struct {
+	HWnd     HWND
+	Message  uint32
+	WParam   uintptr
+	LParam   uintptr
+	Time     uint32
+	Pt       POINT
+	LPrivate uint32
+}
+
+type PAINTSTRUCT struct {
+	Hdc         HDC
+	Erase       int32
+	RcPaint     RECT
+	Restore     int32
+	IncUpdate   int32
+	RGBReserved [32]byte
+}
+
+type MINMAXINFO struct {
+	PtReserved     POINT
+	PtMaxSize      POINT
+	PtMaxPosition  POINT
+	PtMinTrackSize POINT
+	PtMaxTrackSize POINT
+}
+
+type NMHDR struct {
+	HwndFrom HWND
+	IDFrom   uintptr
+	Code     int32
+}
+
+type NMLISTVIEW struct {
+	Hdr       NMHDR
+	IItem     int32
+	ISubItem  int32
+	UNewState uint32
+	UOldState uint32
+	UChanged  uint32
+	PtAction  POINT
+	LParam    uintptr
+}
+
+type NMLVDISPINFOW struct {
+	Hdr  NMHDR
+	Item LVITEMW
+}
+
+type INITCOMMONCONTROLSEX struct {
+	DwSize uint32
+	DwICC  uint32
+}
+
+type LVITEMW struct {
+	Mask       uint32
+	IItem      int32
+	ISubItem   int32
+	State      uint32
+	StateMask  uint32
+	PszText    *uint16
+	CchTextMax int32
+	IImage     int32
+	LParam     uintptr
+	IIndent    int32
+	IGroupID   int32
+	CColumns   uint32
+	PuColumns  *uint32
+	PiColFmt   *int32
+	IGroup     int32
+}
+
+type LVCOLUMNW struct {
+	Mask       uint32
+	Fmt        int32
+	Cx         int32
+	PszText    *uint16
+	CchTextMax int32
+	ISubItem   int32
+	IImage     int32
+	IOrder     int32
+	CxMin      int32
+	CxDefault  int32
+	CxIdeal    int32
+}
+
+type NOTIFYICONDATAW struct {
+	CbSize           uint32
+	HWnd             HWND
+	UID              uint32
+	UFlags           uint32
+	UCallbackMessage uint32
+	HIcon            HICON
+	SzTip            [128]uint16
+	DwState          uint32
+	DwStateMask      uint32
+	SzInfo           [256]uint16
+	UVersion         uint32
+	SzInfoTitle      [64]uint16
+	DwInfoFlags      uint32
+	GuidItem         GUID
+	HBalloonIcon     HICON
+}
+
+type SECURITY_ATTRIBUTES struct {
+	Length             uint32
+	SecurityDescriptor uintptr
+	InheritHandle      int32
+}
+
+type LUID struct {
+	LowPart  uint32
+	HighPart int32
+}
+
+type LUIDAndAttributes struct {
+	Luid       LUID
+	Attributes uint32
+}
+
+type TOKEN_PRIVILEGES struct {
+	PrivilegeCount uint32
+	Privileges     [1]LUIDAndAttributes
+}
+
+type TOKEN_ELEVATION struct{ TokenIsElevated uint32 }
+type SIDAndAttributes struct {
+	Sid        uintptr
+	Attributes uint32
+}
+type TOKEN_USER struct{ User SIDAndAttributes }
+
+type TRUSTEEW struct {
+	PMultipleTrustee         uintptr
+	MultipleTrusteeOperation uint32
+	TrusteeForm              uint32
+	TrusteeType              uint32
+	_                        uint32
+	Name                     uintptr
+}
+
+type EXPLICITACCESSW struct {
+	AccessPermissions uint32
+	AccessMode        uint32
+	Inheritance       uint32
+	_                 uint32
+	Trustee           TRUSTEEW
+}
+
+type AUDITPOLICYINFORMATION struct {
+	AuditSubCategoryGUID GUID
+	AuditingInformation  uint32
+	AuditCategoryGUID    GUID
+}
+
+type HIGHCONTRASTW struct {
+	CbSize            uint32
+	DwFlags           uint32
+	LpszDefaultScheme *uint16
+}
+
+type SERVICE_STATUS struct {
+	ServiceType             uint32
+	CurrentState            uint32
+	ControlsAccepted        uint32
+	Win32ExitCode           uint32
+	ServiceSpecificExitCode uint32
+	CheckPoint              uint32
+	WaitHint                uint32
+}
+
+type SERVICE_STATUS_PROCESS struct {
+	ServiceType             uint32
+	CurrentState            uint32
+	ControlsAccepted        uint32
+	Win32ExitCode           uint32
+	ServiceSpecificExitCode uint32
+	CheckPoint              uint32
+	WaitHint                uint32
+	ProcessID               uint32
+	ServiceFlags            uint32
+}
+
+type SERVICE_TABLE_ENTRYW struct {
+	ServiceName *uint16
+	ServiceProc uintptr
+}
+
+type SERVICE_DESCRIPTIONW struct{ Description *uint16 }
+type SERVICE_DELAYED_AUTO_START_INFO struct{ DelayedAutostart int32 }
+
+type WIN32_FIND_DATAW struct {
+	FileAttributes     uint32
+	CreationTimeLow    uint32
+	CreationTimeHigh   uint32
+	LastAccessTimeLow  uint32
+	LastAccessTimeHigh uint32
+	LastWriteTimeLow   uint32
+	LastWriteTimeHigh  uint32
+	FileSizeHigh       uint32
+	FileSizeLow        uint32
+	Reserved0          uint32
+	Reserved1          uint32
+	FileName           [260]uint16
+	AlternateFileName  [14]uint16
+	FileType           uint32
+	CreatorType        uint32
+	FinderFlags        uint16
+}
+
+const (
+	CW_USEDEFAULT = int32(-2147483648)
+
+	WM_CREATE          = 0x0001
+	WM_DESTROY         = 0x0002
+	WM_SIZE            = 0x0005
+	WM_SETFOCUS        = 0x0007
+	WM_PAINT           = 0x000F
+	WM_CLOSE           = 0x0010
+	WM_QUERYENDSESSION = 0x0011
+	WM_ENDSESSION      = 0x0016
+	WM_ERASEBKGND      = 0x0014
+	WM_SETFONT         = 0x0030
+	WM_GETFONT         = 0x0031
+	WM_DRAWITEM        = 0x002B
+	WM_COMMAND         = 0x0111
+	WM_TIMER           = 0x0113
+	WM_NOTIFY          = 0x004E
+	WM_CONTEXTMENU     = 0x007B
+	WM_GETMINMAXINFO   = 0x0024
+	WM_DPICHANGED      = 0x02E0
+	WM_SETTINGCHANGE   = 0x001A
+	WM_THEMECHANGED    = 0x031A
+	WM_USER            = 0x0400
+	WM_APP             = 0x8000
+	WM_LBUTTONUP       = 0x0202
+	WM_LBUTTONDBLCLK   = 0x0203
+	WM_RBUTTONUP       = 0x0205
+	WM_KEYDOWN         = 0x0100
+	WM_SYSCOMMAND      = 0x0112
+	WM_CTLCOLOREDIT    = 0x0133
+	WM_CTLCOLORLISTBOX = 0x0134
+	WM_CTLCOLORBTN     = 0x0135
+	WM_CTLCOLORSTATIC  = 0x0138
+
+	SC_MINIMIZE = 0xF020
+
+	SW_HIDE        = 0
+	SW_SHOWNORMAL  = 1
+	SW_SHOW        = 5
+	SW_MINIMIZE    = 6
+	SW_RESTORE     = 9
+	SW_SHOWDEFAULT = 10
+
+	SIZE_MINIMIZED = 1
+
+	WS_OVERLAPPED       = 0x00000000
+	WS_CAPTION          = 0x00C00000
+	WS_SYSMENU          = 0x00080000
+	WS_THICKFRAME       = 0x00040000
+	WS_MINIMIZEBOX      = 0x00020000
+	WS_VISIBLE          = 0x10000000
+	WS_CHILD            = 0x40000000
+	WS_TABSTOP          = 0x00010000
+	WS_CLIPCHILDREN     = 0x02000000
+	WS_VSCROLL          = 0x00200000
+	WS_HSCROLL          = 0x00100000
+	WS_BORDER           = 0x00800000
+	WS_DISABLED         = 0x08000000
+	WS_GROUP            = 0x00020000
+	WS_EX_DLGMODALFRAME = 0x00000001
+	WS_EX_APPWINDOW     = 0x00040000
+	WS_EX_CLIENTEDGE    = 0x00000200
+	WS_EX_CONTROLPARENT = 0x00010000
+	WS_EX_TOOLWINDOW    = 0x00000080
+
+	BS_PUSHBUTTON    = 0x00000000
+	BS_DEFPUSHBUTTON = 0x00000001
+	BS_AUTOCHECKBOX  = 0x00000003
+	BS_FLAT          = 0x00008000
+
+	SS_LEFT        = 0x00000000
+	SS_CENTER      = 0x00000001
+	SS_CENTERIMAGE = 0x00000200
+	SS_NOTIFY      = 0x00000100
+
+	ES_AUTOHSCROLL = 0x0080
+	ES_READONLY    = 0x0800
+
+	LBS_NOTIFY           = 0x0001
+	LBS_NOINTEGRALHEIGHT = 0x0100
+	LBS_EXTENDEDSEL      = 0x0800
+
+	CBS_DROPDOWNLIST = 0x0003
+
+	LVS_REPORT           = 0x0001
+	LVS_SINGLESEL        = 0x0004
+	LVS_SHOWSELALWAYS    = 0x0008
+	LVS_OWNERDATA        = 0x1000
+	LVS_NOSORTHEADER     = 0x8000
+	LVS_EX_FULLROWSELECT = 0x00000020
+	LVS_EX_DOUBLEBUFFER  = 0x00010000
+	LVS_EX_LABELTIP      = 0x00004000
+
+	LVM_FIRST                    = 0x1000
+	LVM_INSERTITEMW              = LVM_FIRST + 77
+	LVM_SETITEMTEXTW             = LVM_FIRST + 116
+	LVM_INSERTCOLUMNW            = LVM_FIRST + 97
+	LVM_DELETEITEM               = LVM_FIRST + 8
+	LVM_DELETEALLITEMS           = LVM_FIRST + 9
+	LVM_GETITEMCOUNT             = LVM_FIRST + 4
+	LVM_SETITEMCOUNT             = LVM_FIRST + 47
+	LVM_SETEXTENDEDLISTVIEWSTYLE = LVM_FIRST + 54
+	LVM_SETBKCOLOR               = LVM_FIRST + 1
+	LVM_SETTEXTCOLOR             = LVM_FIRST + 36
+	LVM_SETTEXTBKCOLOR           = LVM_FIRST + 38
+	LVM_SETCOLUMNWIDTH           = LVM_FIRST + 30
+	LVM_ENSUREVISIBLE            = LVM_FIRST + 19
+	LVM_REDRAWITEMS              = LVM_FIRST + 21
+
+	LVIF_TEXT                = 0x0001
+	LVCF_FMT                 = 0x0001
+	LVCF_WIDTH               = 0x0002
+	LVCF_TEXT                = 0x0004
+	LVCF_SUBITEM             = 0x0008
+	LVCFMT_LEFT              = 0x0000
+	LVSCW_AUTOSIZE_USEHEADER = -2
+	LVN_FIRST                = -100
+	LVN_GETDISPINFOW         = LVN_FIRST - 77
+	LVN_ITEMCHANGED          = LVN_FIRST - 1
+	LVSICF_NOINVALIDATEALL   = 0x00000001
+	LVSICF_NOSCROLL          = 0x00000002
+
+	LB_ADDSTRING    = 0x0180
+	LB_DELETESTRING = 0x0182
+	LB_GETCOUNT     = 0x018B
+	LB_GETCURSEL    = 0x0188
+	LB_GETTEXT      = 0x0189
+	LB_GETTEXTLEN   = 0x018A
+	LB_RESETCONTENT = 0x0184
+	LB_SETCURSEL    = 0x0186
+	LB_ERR          = -1
+
+	CB_ADDSTRING = 0x0143
+	CB_GETCURSEL = 0x0147
+	CB_SETCURSEL = 0x014E
+
+	BM_GETCHECK   = 0x00F0
+	BM_SETCHECK   = 0x00F1
+	BST_UNCHECKED = 0
+	BST_CHECKED   = 1
+
+	BN_CLICKED    = 0
+	LBN_DBLCLK    = 2
+	LBN_SELCHANGE = 1
+	CBN_SELCHANGE = 1
+
+	EN_CHANGE = 0x0300
+
+	DT_LEFT         = 0x00000000
+	DT_CENTER       = 0x00000001
+	DT_RIGHT        = 0x00000002
+	DT_VCENTER      = 0x00000004
+	DT_SINGLELINE   = 0x00000020
+	DT_END_ELLIPSIS = 0x00008000
+	DT_NOPREFIX     = 0x00000800
+
+	TRANSPARENT = 1
+
+	COLOR_WINDOW     = 5
+	COLOR_WINDOWTEXT = 8
+	COLOR_BTNFACE    = 15
+	COLOR_BTNTEXT    = 18
+
+	HKEY_CURRENT_USER       = 0x80000001
+	HKEY_LOCAL_MACHINE      = 0x80000002
+	KEY_READ                = 0x20019
+	KEY_WRITE               = 0x20006
+	KEY_WOW64_64KEY         = 0x0100
+	KEY_ALL_ACCESS          = 0xF003F
+	REG_SZ                  = 1
+	REG_DWORD               = 4
+	REG_OPTION_NON_VOLATILE = 0
+
+	IDC_ARROW       = 32512
+	IDI_APPLICATION = 32512
+
+	CS_HREDRAW = 0x0002
+	CS_VREDRAW = 0x0001
+	CS_DBLCLKS = 0x0008
+
+	SWP_NOZORDER   = 0x0004
+	SWP_NOACTIVATE = 0x0010
+
+	GWLP_USERDATA  = -21
+	GWLP_HINSTANCE = -6
+
+	MF_STRING       = 0x0000
+	MF_SEPARATOR    = 0x0800
+	MF_GRAYED       = 0x0001
+	MF_CHECKED      = 0x0008
+	TPM_RIGHTBUTTON = 0x0002
+	TPM_RETURNCMD   = 0x0100
+
+	NIM_ADD              = 0x00000000
+	NIM_MODIFY           = 0x00000001
+	NIM_DELETE           = 0x00000002
+	NIM_SETVERSION       = 0x00000004
+	NOTIFYICON_VERSION_4 = 4
+	NIN_SELECT           = WM_USER
+	NIN_KEYSELECT        = WM_USER + 1
+	NIF_MESSAGE          = 0x00000001
+	NIF_ICON             = 0x00000002
+	NIF_TIP              = 0x00000004
+
+	IMAGE_ICON      = 1
+	LR_LOADFROMFILE = 0x00000010
+	LR_DEFAULTSIZE  = 0x00000040
+
+	MB_OK              = 0x00000000
+	MB_ICONERROR       = 0x00000010
+	MB_ICONINFORMATION = 0x00000040
+	MB_ICONWARNING     = 0x00000030
+	MB_YESNO           = 0x00000004
+	MB_OKCANCEL        = 0x00000001
+	IDOK               = 1
+	IDCANCEL           = 2
+	IDYES              = 6
+
+	ICC_LISTVIEW_CLASSES = 0x00000001
+	ICC_STANDARD_CLASSES = 0x00004000
+
+	DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ^uintptr(3)
+	DWMWA_USE_IMMERSIVE_DARK_MODE              = 20
+	DWMWA_WINDOW_CORNER_PREFERENCE             = 33
+	DWMWCP_ROUND                               = 2
+
+	SPI_GETHIGHCONTRAST     = 0x0042
+	SPI_GETNONCLIENTMETRICS = 0x0029
+	HCF_HIGHCONTRASTON      = 0x00000001
+
+	TOKEN_QUERY             = 0x0008
+	TOKEN_ADJUST_PRIVILEGES = 0x0020
+	TokenUser               = 1
+	TokenElevation          = 20
+	SE_PRIVILEGE_ENABLED    = 0x00000002
+
+	ERROR_SUCCESS                 = 0
+	ERROR_FILE_NOT_FOUND          = 2
+	ERROR_PATH_NOT_FOUND          = 3
+	ERROR_ACCESS_DENIED           = 5
+	ERROR_INVALID_HANDLE          = 6
+	ERROR_BROKEN_PIPE             = 109
+	ERROR_INSUFFICIENT_BUFFER     = 122
+	ERROR_ALREADY_EXISTS          = 183
+	ERROR_PIPE_BUSY               = 231
+	ERROR_NO_DATA                 = 232
+	ERROR_PIPE_CONNECTED          = 535
+	ERROR_CANCELLED               = 1223
+	ERROR_NOT_ALL_ASSIGNED        = 1300
+	ERROR_SERVICE_EXISTS          = 1073
+	ERROR_SERVICE_ALREADY_RUNNING = 1056
+	ERROR_SERVICE_NOT_ACTIVE      = 1062
+	ERROR_SERVICE_DOES_NOT_EXIST  = 1060
+
+	EVENT_MODIFY_STATE = 0x0002
+	SYNCHRONIZE        = 0x00100000
+	INFINITE           = 0xFFFFFFFF
+	WAIT_OBJECT_0      = 0
+	WAIT_TIMEOUT       = 258
+	WAIT_FAILED        = 0xFFFFFFFF
+
+	CREATE_NO_WINDOW = 0x08000000
+
+	GENERIC_READ               = 0x80000000
+	GENERIC_WRITE              = 0x40000000
+	FILE_READ_DATA             = 0x0001
+	FILE_LIST_DIRECTORY        = 0x0001
+	FILE_APPEND_DATA           = 0x0004
+	READ_CONTROL               = 0x00020000
+	FILE_SHARE_READ            = 0x00000001
+	FILE_SHARE_WRITE           = 0x00000002
+	FILE_SHARE_DELETE          = 0x00000004
+	CREATE_NEW                 = 1
+	CREATE_ALWAYS              = 2
+	OPEN_EXISTING              = 3
+	OPEN_ALWAYS                = 4
+	FILE_ATTRIBUTE_NORMAL      = 0x00000080
+	FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+	FILE_ATTRIBUTE_DIRECTORY   = 0x10
+	INVALID_FILE_ATTRIBUTES    = 0xFFFFFFFF
+	INVALID_HANDLE_VALUE       = ^uintptr(0)
+
+	PIPE_ACCESS_DUPLEX         = 0x00000003
+	PIPE_TYPE_BYTE             = 0x00000000
+	PIPE_READMODE_BYTE         = 0x00000000
+	PIPE_WAIT                  = 0x00000000
+	PIPE_UNLIMITED_INSTANCES   = 255
+	PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
+	NMPWAIT_WAIT_FOREVER       = 0xFFFFFFFF
+
+	SEE_MASK_NOCLOSEPROCESS = 0x00000040
+
+	COINIT_APARTMENTTHREADED = 0x2
+	CLSCTX_INPROC_SERVER     = 0x1
+	FOS_PICKFOLDERS          = 0x00000020
+	FOS_FORCEFILESYSTEM      = 0x00000040
+	FOS_PATHMUSTEXIST        = 0x00000800
+	FOS_OVERWRITEPROMPT      = 0x00000002
+	FOS_NOREADONLYRETURN     = 0x00008000
+	SIGDN_FILESYSPATH        = 0x80058000
+
+	SACL_SECURITY_INFORMATION           = 0x00000008
+	DACL_SECURITY_INFORMATION           = 0x00000004
+	PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+	SE_FILE_OBJECT                      = 1
+	POLICY_AUDIT_EVENT_SUCCESS          = 0x00000001
+	POLICY_AUDIT_EVENT_NONE             = 0x00000004
+	SET_AUDIT_SUCCESS                   = 5
+	OBJECT_INHERIT_ACE                  = 0x00000001
+	CONTAINER_INHERIT_ACE               = 0x00000002
+
+	SC_MANAGER_CONNECT                     = 0x0001
+	SC_MANAGER_CREATE_SERVICE              = 0x0002
+	SC_MANAGER_ALL_ACCESS                  = 0xF003F
+	SERVICE_QUERY_CONFIG                   = 0x0001
+	SERVICE_CHANGE_CONFIG                  = 0x0002
+	SERVICE_QUERY_STATUS                   = 0x0004
+	SERVICE_ENUMERATE_DEPENDENTS           = 0x0008
+	SERVICE_START                          = 0x0010
+	SERVICE_STOP                           = 0x0020
+	SERVICE_DELETE                         = 0x00010000
+	SERVICE_ALL_ACCESS                     = 0xF01FF
+	SERVICE_WIN32_OWN_PROCESS              = 0x00000010
+	SERVICE_AUTO_START                     = 0x00000002
+	SERVICE_ERROR_NORMAL                   = 0x00000001
+	SERVICE_CONTROL_STOP                   = 0x00000001
+	SERVICE_CONTROL_SHUTDOWN               = 0x00000005
+	SERVICE_CONTROL_PRESHUTDOWN            = 0x0000000F
+	SERVICE_STOPPED                        = 0x00000001
+	SERVICE_START_PENDING                  = 0x00000002
+	SERVICE_STOP_PENDING                   = 0x00000003
+	SERVICE_RUNNING                        = 0x00000004
+	SERVICE_ACCEPT_STOP                    = 0x00000001
+	SERVICE_ACCEPT_SHUTDOWN                = 0x00000004
+	SERVICE_ACCEPT_PRESHUTDOWN             = 0x00000100
+	SERVICE_CONFIG_DESCRIPTION             = 1
+	SERVICE_CONFIG_DELAYED_AUTO_START_INFO = 3
+	SC_STATUS_PROCESS_INFO                 = 0
+
+	DELETE = 0x00010000
+)
+
+var (
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	user32   = syscall.NewLazyDLL("user32.dll")
+	gdi32    = syscall.NewLazyDLL("gdi32.dll")
+	advapi32 = syscall.NewLazyDLL("advapi32.dll")
+	shell32  = syscall.NewLazyDLL("shell32.dll")
+	comctl32 = syscall.NewLazyDLL("comctl32.dll")
+	dwmapi   = syscall.NewLazyDLL("dwmapi.dll")
+	uxtheme  = syscall.NewLazyDLL("uxtheme.dll")
+	ole32    = syscall.NewLazyDLL("ole32.dll")
+	wevtapi  = syscall.NewLazyDLL("wevtapi.dll")
+
+	procGetModuleHandleW        = kernel32.NewProc("GetModuleHandleW")
+	procGetCurrentProcess       = kernel32.NewProc("GetCurrentProcess")
+	procGetCurrentProcessId     = kernel32.NewProc("GetCurrentProcessId")
+	procGetLastError            = kernel32.NewProc("GetLastError")
+	procLocalFree               = kernel32.NewProc("LocalFree")
+	procCreateMutexW            = kernel32.NewProc("CreateMutexW")
+	procOpenMutexW              = kernel32.NewProc("OpenMutexW")
+	procReleaseMutex            = kernel32.NewProc("ReleaseMutex")
+	procCreateEventW            = kernel32.NewProc("CreateEventW")
+	procOpenEventW              = kernel32.NewProc("OpenEventW")
+	procSetEvent                = kernel32.NewProc("SetEvent")
+	procResetEvent              = kernel32.NewProc("ResetEvent")
+	procWaitForSingleObject     = kernel32.NewProc("WaitForSingleObject")
+	procCloseHandle             = kernel32.NewProc("CloseHandle")
+	procGetFileAttributesW      = kernel32.NewProc("GetFileAttributesW")
+	procMoveFileExW             = kernel32.NewProc("MoveFileExW")
+	procCreateFileW             = kernel32.NewProc("CreateFileW")
+	procCreateNamedPipeW        = kernel32.NewProc("CreateNamedPipeW")
+	procConnectNamedPipe        = kernel32.NewProc("ConnectNamedPipe")
+	procDisconnectNamedPipe     = kernel32.NewProc("DisconnectNamedPipe")
+	procWaitNamedPipeW          = kernel32.NewProc("WaitNamedPipeW")
+	procSetNamedPipeHandleState = kernel32.NewProc("SetNamedPipeHandleState")
+	procFlushFileBuffers        = kernel32.NewProc("FlushFileBuffers")
+	procGetFullPathNameW        = kernel32.NewProc("GetFullPathNameW")
+
+	procRegisterClassExW              = user32.NewProc("RegisterClassExW")
+	procRegisterWindowMessageW        = user32.NewProc("RegisterWindowMessageW")
+	procCreateWindowExW               = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW                = user32.NewProc("DefWindowProcW")
+	procShowWindow                    = user32.NewProc("ShowWindow")
+	procUpdateWindow                  = user32.NewProc("UpdateWindow")
+	procGetMessageW                   = user32.NewProc("GetMessageW")
+	procIsDialogMessageW              = user32.NewProc("IsDialogMessageW")
+	procTranslateMessage              = user32.NewProc("TranslateMessage")
+	procDispatchMessageW              = user32.NewProc("DispatchMessageW")
+	procPostQuitMessage               = user32.NewProc("PostQuitMessage")
+	procPostMessageW                  = user32.NewProc("PostMessageW")
+	procSendMessageW                  = user32.NewProc("SendMessageW")
+	procGetClientRect                 = user32.NewProc("GetClientRect")
+	procGetWindowRect                 = user32.NewProc("GetWindowRect")
+	procMoveWindow                    = user32.NewProc("MoveWindow")
+	procSetWindowPos                  = user32.NewProc("SetWindowPos")
+	procBeginPaint                    = user32.NewProc("BeginPaint")
+	procEndPaint                      = user32.NewProc("EndPaint")
+	procInvalidateRect                = user32.NewProc("InvalidateRect")
+	procLoadCursorW                   = user32.NewProc("LoadCursorW")
+	procLoadIconW                     = user32.NewProc("LoadIconW")
+	procLoadImageW                    = user32.NewProc("LoadImageW")
+	procSetWindowTextW                = user32.NewProc("SetWindowTextW")
+	procGetWindowTextLengthW          = user32.NewProc("GetWindowTextLengthW")
+	procGetWindowTextW                = user32.NewProc("GetWindowTextW")
+	procEnableWindow                  = user32.NewProc("EnableWindow")
+	procDestroyWindow                 = user32.NewProc("DestroyWindow")
+	procIsWindowVisible               = user32.NewProc("IsWindowVisible")
+	procSetForegroundWindow           = user32.NewProc("SetForegroundWindow")
+	procSetFocus                      = user32.NewProc("SetFocus")
+	procGetWindowLongPtrW             = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtrW             = user32.NewProc("SetWindowLongPtrW")
+	procGetDlgCtrlID                  = user32.NewProc("GetDlgCtrlID")
+	procCreatePopupMenu               = user32.NewProc("CreatePopupMenu")
+	procAppendMenuW                   = user32.NewProc("AppendMenuW")
+	procTrackPopupMenu                = user32.NewProc("TrackPopupMenu")
+	procDestroyMenu                   = user32.NewProc("DestroyMenu")
+	procGetCursorPos                  = user32.NewProc("GetCursorPos")
+	procMessageBoxW                   = user32.NewProc("MessageBoxW")
+	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
+	procGetDpiForWindow               = user32.NewProc("GetDpiForWindow")
+	procGetDpiForSystem               = user32.NewProc("GetDpiForSystem")
+	procSystemParametersInfoW         = user32.NewProc("SystemParametersInfoW")
+	procFillRect                      = user32.NewProc("FillRect")
+	procDrawTextW                     = user32.NewProc("DrawTextW")
+	procSetActiveWindow               = user32.NewProc("SetActiveWindow")
+	procIsIconic                      = user32.NewProc("IsIconic")
+	procGetSystemMetrics              = user32.NewProc("GetSystemMetrics")
+	procGetSysColor                   = user32.NewProc("GetSysColor")
+
+	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
+	procDeleteObject     = gdi32.NewProc("DeleteObject")
+	procCreateFontW      = gdi32.NewProc("CreateFontW")
+	procSetBkMode        = gdi32.NewProc("SetBkMode")
+	procSetTextColor     = gdi32.NewProc("SetTextColor")
+	procSetBkColor       = gdi32.NewProc("SetBkColor")
+	procSelectObject     = gdi32.NewProc("SelectObject")
+	procGetStockObject   = gdi32.NewProc("GetStockObject")
+
+	procOpenProcessToken                                     = advapi32.NewProc("OpenProcessToken")
+	procGetTokenInformation                                  = advapi32.NewProc("GetTokenInformation")
+	procLookupPrivilegeValueW                                = advapi32.NewProc("LookupPrivilegeValueW")
+	procAdjustTokenPrivileges                                = advapi32.NewProc("AdjustTokenPrivileges")
+	procConvertSidToStringSidW                               = advapi32.NewProc("ConvertSidToStringSidW")
+	procConvertStringSidToSidW                               = advapi32.NewProc("ConvertStringSidToSidW")
+	procConvertStringSecurityDescriptorToSecurityDescriptorW = advapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
+	procConvertSecurityDescriptorToStringSecurityDescriptorW = advapi32.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW")
+	procGetSecurityDescriptorDacl                            = advapi32.NewProc("GetSecurityDescriptorDacl")
+	procSetNamedSecurityInfoW                                = advapi32.NewProc("SetNamedSecurityInfoW")
+	procGetNamedSecurityInfoW                                = advapi32.NewProc("GetNamedSecurityInfoW")
+	procSetFileSecurityW                                     = advapi32.NewProc("SetFileSecurityW")
+	procBuildTrusteeWithSidW                                 = advapi32.NewProc("BuildTrusteeWithSidW")
+	procSetEntriesInAclW                                     = advapi32.NewProc("SetEntriesInAclW")
+	procAuditQuerySystemPolicy                               = advapi32.NewProc("AuditQuerySystemPolicy")
+	procAuditSetSystemPolicy                                 = advapi32.NewProc("AuditSetSystemPolicy")
+	procAuditFree                                            = advapi32.NewProc("AuditFree")
+	procRegOpenKeyExW                                        = advapi32.NewProc("RegOpenKeyExW")
+	procRegCreateKeyExW                                      = advapi32.NewProc("RegCreateKeyExW")
+	procRegQueryValueExW                                     = advapi32.NewProc("RegQueryValueExW")
+	procRegSetValueExW                                       = advapi32.NewProc("RegSetValueExW")
+	procRegDeleteValueW                                      = advapi32.NewProc("RegDeleteValueW")
+	procRegDeleteTreeW                                       = advapi32.NewProc("RegDeleteTreeW")
+	procRegCloseKey                                          = advapi32.NewProc("RegCloseKey")
+	procImpersonateNamedPipeClient                           = advapi32.NewProc("ImpersonateNamedPipeClient")
+	procRevertToSelf                                         = advapi32.NewProc("RevertToSelf")
+	procOpenSCManagerW                                       = advapi32.NewProc("OpenSCManagerW")
+	procCreateServiceW                                       = advapi32.NewProc("CreateServiceW")
+	procOpenServiceW                                         = advapi32.NewProc("OpenServiceW")
+	procStartServiceW                                        = advapi32.NewProc("StartServiceW")
+	procControlService                                       = advapi32.NewProc("ControlService")
+	procDeleteService                                        = advapi32.NewProc("DeleteService")
+	procQueryServiceStatusEx                                 = advapi32.NewProc("QueryServiceStatusEx")
+	procChangeServiceConfigW                                 = advapi32.NewProc("ChangeServiceConfigW")
+	procChangeServiceConfig2W                                = advapi32.NewProc("ChangeServiceConfig2W")
+	procCloseServiceHandle                                   = advapi32.NewProc("CloseServiceHandle")
+	procStartServiceCtrlDispatcherW                          = advapi32.NewProc("StartServiceCtrlDispatcherW")
+	procRegisterServiceCtrlHandlerExW                        = advapi32.NewProc("RegisterServiceCtrlHandlerExW")
+	procSetServiceStatus                                     = advapi32.NewProc("SetServiceStatus")
+
+	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
+	procShellExecuteW    = shell32.NewProc("ShellExecuteW")
+
+	procInitCommonControlsEx  = comctl32.NewProc("InitCommonControlsEx")
+	procDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
+	procSetWindowTheme        = uxtheme.NewProc("SetWindowTheme")
+
+	procCoInitializeEx   = ole32.NewProc("CoInitializeEx")
+	procCoUninitialize   = ole32.NewProc("CoUninitialize")
+	procCoCreateInstance = ole32.NewProc("CoCreateInstance")
+	procCoTaskMemFree    = ole32.NewProc("CoTaskMemFree")
+
+	procEvtSubscribe = wevtapi.NewProc("EvtSubscribe")
+	procEvtRender    = wevtapi.NewProc("EvtRender")
+	procEvtClose     = wevtapi.NewProc("EvtClose")
+)
+
+func utf16Ptr(s string) *uint16 {
+	p, err := syscall.UTF16PtrFromString(s)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
+func utf16FromPtr(p *uint16) string {
+	if p == nil {
+		return ""
+	}
+	var n int
+	for q := uintptr(unsafe.Pointer(p)); *(*uint16)(unsafe.Pointer(q)) != 0; q += 2 {
+		n++
+	}
+	return syscall.UTF16ToString(unsafe.Slice(p, n))
+}
+
+func copyUTF16(dst []uint16, s string) {
+	u := syscall.StringToUTF16(s)
+	if len(u) > len(dst) {
+		u = u[:len(dst)]
+	}
+	copy(dst, u)
+	if len(dst) > 0 {
+		dst[len(dst)-1] = 0
+	}
+}
+
+func loword(v uintptr) uint16         { return uint16(v & 0xffff) }
+func hiword(v uintptr) uint16         { return uint16((v >> 16) & 0xffff) }
+func makelparam(lo, hi int32) uintptr { return uintptr(uint32(lo)&0xffff | (uint32(hi)&0xffff)<<16) }
+func rgb(r, g, b byte) uint32         { return uint32(r) | uint32(g)<<8 | uint32(b)<<16 }
+
+func winErr(label string, err error) error {
+	if err == nil || errors.Is(err, syscall.Errno(0)) {
+		return errors.New(label)
+	}
+	return fmt.Errorf("%s: %w", label, err)
+}
+
+func lastErr(label string) error {
+	r, _, _ := procGetLastError.Call()
+	if r == 0 {
+		return errors.New(label)
+	}
+	return fmt.Errorf("%s: %w", label, syscall.Errno(r))
+}
+
+func messageBox(owner HWND, text, title string, flags uint32) int32 {
+	r, _, _ := procMessageBoxW.Call(uintptr(owner), uintptr(unsafe.Pointer(utf16Ptr(text))), uintptr(unsafe.Pointer(utf16Ptr(title))), uintptr(flags))
+	return int32(r)
+}
+
+func sendMessage(hwnd HWND, msg uint32, w, l uintptr) uintptr {
+	r, _, _ := procSendMessageW.Call(uintptr(hwnd), uintptr(msg), w, l)
+	return r
+}
+
+func postMessage(hwnd HWND, msg uint32, w, l uintptr) bool {
+	r, _, _ := procPostMessageW.Call(uintptr(hwnd), uintptr(msg), w, l)
+	return r != 0
+}
+
+func closeHandle(h HANDLE) {
+	if h != 0 && uintptr(h) != INVALID_HANDLE_VALUE {
+		procCloseHandle.Call(uintptr(h))
+	}
+}
+
+func closeServiceHandle(h SC_HANDLE) {
+	if h != 0 {
+		procCloseServiceHandle.Call(uintptr(h))
+	}
+}
+
+func deleteObject(h uintptr) {
+	if h != 0 {
+		procDeleteObject.Call(h)
+	}
+}
+
+func windowText(hwnd HWND) string {
+	n, _, _ := procGetWindowTextLengthW.Call(uintptr(hwnd))
+	buf := make([]uint16, n+1)
+	if len(buf) == 0 {
+		return ""
+	}
+	procGetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return syscall.UTF16ToString(buf)
+}
+
+func setWindowText(hwnd HWND, text string) {
+	procSetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(utf16Ptr(text))))
+}
