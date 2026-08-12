@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-08-12
 
 First revision after the preview was actually run on Windows. Several paths had never executed.
+
+> The embedded PE version resource still reports `0.1.0.0`; only the value shown by **--version**
+> tracks the release. Regenerating `rsrc_windows_amd64.syso` needs Clang, which was not available
+> when this build was cut.
 
 ### Privilege lifetime
 

@@ -43,12 +43,12 @@ build.cmd
 which is `go test ./...`, `go vet ./...`, then:
 
 ```bat
-go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.1.0" -o dist\ReadWatch.exe .\cmd\readwatch
+go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.2.0" -o dist\ReadWatch.exe .\cmd\readwatch
 ```
 
 `cmd/readwatch/rsrc_windows_amd64.syso` is checked in with the icon, version info and manifest, so
 a plain `go build` needs only Go. Regenerating it wants Python 3 + Clang:
-`python tools/make_resources.py --version 0.1.0.0`.
+`python tools/make_resources.py --version 0.2.0.0`.
 
 ## Use
 
