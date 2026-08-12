@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -25,6 +27,12 @@ const (
 	idIncludeFolders   = 307
 	idStartAtLogin     = 308
 	idOpenAtLogin      = 309
+	idFolderPath       = 310
+	idAddFolderPath    = 311
+	idExcludeList      = 312
+	idExcludeText      = 313
+	idAddExclude       = 314
+	idRemoveExclude    = 315
 	settingsWindowBase = 520
 )
 
@@ -45,16 +53,25 @@ type SettingsUI struct {
 	folderList   HWND
 	addBtn       HWND
 	removeBtn    HWND
-	logLabel     HWND
-	logPath      HWND
-	browseBtn    HWND
-	formatLabel  HWND
-	formatCombo  HWND
-	includeDirs  HWND
-	startLogin   HWND
-	openLogin    HWND
-	saveBtn      HWND
-	cancelBtn    HWND
+	folderPath   HWND
+	addPathBtn   HWND
+
+	excludeLabel     HWND
+	excludeList      HWND
+	excludeText      HWND
+	excludeAddBtn    HWND
+	excludeRemoveBtn HWND
+
+	logLabel    HWND
+	logPath     HWND
+	browseBtn   HWND
+	formatLabel HWND
+	formatCombo HWND
+	includeDirs HWND
+	startLogin  HWND
+	openLogin   HWND
+	saveBtn     HWND
+	cancelBtn   HWND
 
 	closing atomic.Bool
 }
@@ -114,7 +131,7 @@ func (s *SettingsUI) create() error {
 		s.dpi = 96
 	}
 	width := s.scale(520)
-	height := s.scale(360)
+	height := s.scale(540)
 	x, y := centeredWindowPosition(s.app.hwnd, width, height)
 	style := uintptr(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN)
 	hwnd, _, e := procCreateWindowExW.Call(
@@ -158,8 +175,21 @@ func (s *SettingsUI) createControls() {
 	s.font = createUIFont(s.dpi)
 	s.foldersLabel = createControl("STATIC", "Folders to watch", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, s.hwnd, 0)
 	s.folderList = createControl("LISTBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT, 0, s.hwnd, idFolderList)
-	s.addBtn = createControl("BUTTON", "Add…", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddFolder)
+	s.addBtn = createControl("BUTTON", "Browse…", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddFolder)
 	s.removeBtn = createControl("BUTTON", "Remove", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idRemoveFolder)
+	// Typing or pasting a path is the primary way to add a folder; the picker is
+	// the fallback. Hunting for a folder in a tree is what got an earlier implementation
+	// abandoned.
+	s.folderPath = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL, 0, s.hwnd, idFolderPath)
+	s.addPathBtn = createControl("BUTTON", "Add", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddFolderPath)
+	sendMessage(s.folderPath, EM_SETCUEBANNER, 1, uintptr(unsafe.Pointer(utf16Ptr(`Paste a folder path, e.g. D:\Renders\output`))))
+
+	s.excludeLabel = createControl("STATIC", "Ignore reads by these processes", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, s.hwnd, 0)
+	s.excludeList = createControl("LISTBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT, 0, s.hwnd, idExcludeList)
+	s.excludeText = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL, 0, s.hwnd, idExcludeText)
+	s.excludeAddBtn = createControl("BUTTON", "Add", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddExclude)
+	s.excludeRemoveBtn = createControl("BUTTON", "Remove", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idRemoveExclude)
+	sendMessage(s.excludeText, EM_SETCUEBANNER, 1, uintptr(unsafe.Pointer(utf16Ptr("Image name, or a full path to match only that binary"))))
 	s.logLabel = createControl("STATIC", "Log file", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, s.hwnd, 0)
 	s.logPath = createControl("EDIT", s.cfg.LogPath, WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL, 0, s.hwnd, idLogPath)
 	s.browseBtn = createControl("BUTTON", "Browse…", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idBrowseLog)
@@ -193,12 +223,19 @@ func (s *SettingsUI) createControls() {
 	if len(s.cfg.Folders) > 0 {
 		sendMessage(s.folderList, LB_SETCURSEL, 0, 0)
 	}
+	for _, entry := range s.cfg.ExcludedProcesses {
+		sendMessage(s.excludeList, LB_ADDSTRING, 0, uintptr(unsafe.Pointer(utf16Ptr(entry))))
+	}
+	if len(s.cfg.ExcludedProcesses) > 0 {
+		sendMessage(s.excludeList, LB_SETCURSEL, 0, 0)
+	}
 	s.updateOpenAtLoginEnabled()
 }
 
 func (s *SettingsUI) controls() []HWND {
 	return []HWND{
-		s.foldersLabel, s.folderList, s.addBtn, s.removeBtn,
+		s.foldersLabel, s.folderList, s.addBtn, s.removeBtn, s.folderPath, s.addPathBtn,
+		s.excludeLabel, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn,
 		s.logLabel, s.logPath, s.browseBtn, s.formatLabel, s.formatCombo,
 		s.includeDirs, s.startLogin, s.openLogin, s.saveBtn, s.cancelBtn,
 	}
@@ -219,29 +256,51 @@ func (s *SettingsUI) layout() {
 	labelH := s.scale(20)
 	fieldH := s.scale(24)
 
-	procMoveWindow.Call(uintptr(s.foldersLabel), uintptr(m), uintptr(s.scale(8)), uintptr(w-m*3-buttonW), uintptr(labelH), 1)
-	procMoveWindow.Call(uintptr(s.addBtn), uintptr(w-m-buttonW), uintptr(s.scale(7)), uintptr(buttonW), uintptr(buttonH), 1)
-	listTop := s.scale(35)
-	listH := s.scale(82)
-	procMoveWindow.Call(uintptr(s.folderList), uintptr(m), uintptr(listTop), uintptr(w-m*3-buttonW), uintptr(listH), 1)
-	procMoveWindow.Call(uintptr(s.removeBtn), uintptr(w-m-buttonW), uintptr(listTop), uintptr(buttonW), uintptr(buttonH), 1)
+	// A running cursor rather than fixed offsets: the window gained two sections
+	// and hand-maintained magic numbers had already made it fragile.
+	fieldW := w - m*3 - buttonW
+	rightX := w - m - buttonW
+	y := s.scale(8)
+	place := func(h HWND, x, top, cw, ch int32) {
+		procMoveWindow.Call(uintptr(h), uintptr(x), uintptr(top), uintptr(cw), uintptr(ch), 1)
+	}
 
-	logLabelY := s.scale(127)
-	procMoveWindow.Call(uintptr(s.logLabel), uintptr(m), uintptr(logLabelY), uintptr(w-m*3-buttonW), uintptr(labelH), 1)
-	procMoveWindow.Call(uintptr(s.browseBtn), uintptr(w-m-buttonW), uintptr(logLabelY-s.scale(1)), uintptr(buttonW), uintptr(buttonH), 1)
-	logY := s.scale(151)
-	procMoveWindow.Call(uintptr(s.logPath), uintptr(m), uintptr(logY), uintptr(w-2*m), uintptr(fieldH), 1)
+	place(s.foldersLabel, m, y, fieldW, labelH)
+	place(s.addBtn, rightX, y-s.scale(1), buttonW, buttonH)
+	y += labelH + s.scale(4)
+	place(s.folderList, m, y, fieldW, s.scale(74))
+	place(s.removeBtn, rightX, y, buttonW, buttonH)
+	y += s.scale(74) + s.scale(6)
+	place(s.folderPath, m, y, fieldW, fieldH)
+	place(s.addPathBtn, rightX, y, buttonW, buttonH)
+	y += fieldH + s.scale(14)
 
-	formatY := s.scale(187)
+	place(s.excludeLabel, m, y, w-2*m, labelH)
+	y += labelH + s.scale(4)
+	place(s.excludeList, m, y, fieldW, s.scale(64))
+	place(s.excludeRemoveBtn, rightX, y, buttonW, buttonH)
+	y += s.scale(64) + s.scale(6)
+	place(s.excludeText, m, y, fieldW, fieldH)
+	place(s.excludeAddBtn, rightX, y, buttonW, buttonH)
+	y += fieldH + s.scale(14)
+
+	place(s.logLabel, m, y, fieldW, labelH)
+	place(s.browseBtn, rightX, y-s.scale(1), buttonW, buttonH)
+	y += labelH + s.scale(4)
+	place(s.logPath, m, y, w-2*m, fieldH)
+	y += fieldH + s.scale(12)
+
 	formatLabelW := s.scale(46)
 	comboW := s.scale(148)
-	procMoveWindow.Call(uintptr(s.formatLabel), uintptr(m), uintptr(formatY), uintptr(formatLabelW), uintptr(fieldH), 1)
-	procMoveWindow.Call(uintptr(s.formatCombo), uintptr(m+formatLabelW+gap), uintptr(formatY), uintptr(comboW), uintptr(s.scale(180)), 1)
+	place(s.formatLabel, m, y, formatLabelW, fieldH)
+	place(s.formatCombo, m+formatLabelW+gap, y, comboW, s.scale(180))
 	includeX := m + formatLabelW + gap + comboW + s.scale(15)
-	procMoveWindow.Call(uintptr(s.includeDirs), uintptr(includeX), uintptr(formatY), uintptr(w-includeX-m), uintptr(fieldH), 1)
+	place(s.includeDirs, includeX, y, w-includeX-m, fieldH)
+	y += fieldH + s.scale(10)
 
-	procMoveWindow.Call(uintptr(s.startLogin), uintptr(m), uintptr(s.scale(222)), uintptr(w-2*m), uintptr(fieldH), 1)
-	procMoveWindow.Call(uintptr(s.openLogin), uintptr(m+s.scale(20)), uintptr(s.scale(248)), uintptr(w-2*m-s.scale(20)), uintptr(fieldH), 1)
+	place(s.startLogin, m, y, w-2*m, fieldH)
+	y += fieldH + s.scale(2)
+	place(s.openLogin, m+s.scale(20), y, w-2*m-s.scale(20), fieldH)
 
 	bottomY := h - m - buttonH
 	procMoveWindow.Call(uintptr(s.cancelBtn), uintptr(w-m-buttonW*2-gap), uintptr(bottomY), uintptr(buttonW), uintptr(buttonH), 1)
@@ -264,7 +323,7 @@ func (s *SettingsUI) applyTheme() {
 	if dark {
 		themeName = "DarkMode_Explorer"
 	}
-	for _, h := range []HWND{s.folderList, s.logPath, s.formatCombo, s.addBtn, s.removeBtn, s.browseBtn, s.includeDirs, s.startLogin, s.openLogin, s.saveBtn, s.cancelBtn} {
+	for _, h := range []HWND{s.folderList, s.folderPath, s.addPathBtn, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn, s.logPath, s.formatCombo, s.addBtn, s.removeBtn, s.browseBtn, s.includeDirs, s.startLogin, s.openLogin, s.saveBtn, s.cancelBtn} {
 		procSetWindowTheme.Call(uintptr(h), uintptr(unsafe.Pointer(utf16Ptr(themeName))), 0)
 	}
 	procInvalidateRect.Call(uintptr(s.hwnd), 0, 1)
@@ -311,6 +370,69 @@ func (s *SettingsUI) addFolder() {
 	if idx >= 0 {
 		sendMessage(s.folderList, LB_SETCURSEL, uintptr(idx), 0)
 	}
+}
+
+// addToList appends a trimmed, case-insensitively unique entry and clears the
+// source field. Shared by the folder path box and the exclusion box.
+func addToList(list HWND, source HWND, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	count := int(sendMessage(list, LB_GETCOUNT, 0, 0))
+	for i := 0; i < count; i++ {
+		if existing, ok := listBoxText(list, i); ok && strings.EqualFold(strings.TrimSpace(existing), value) {
+			sendMessage(list, LB_SETCURSEL, uintptr(i), 0)
+			if source != 0 {
+				setWindowText(source, "")
+			}
+			return
+		}
+	}
+	if idx := int(sendMessage(list, LB_ADDSTRING, 0, uintptr(unsafe.Pointer(utf16Ptr(value))))); idx >= 0 {
+		sendMessage(list, LB_SETCURSEL, uintptr(idx), 0)
+	}
+	if source != 0 {
+		setWindowText(source, "")
+	}
+}
+
+func removeSelected(list HWND) {
+	idx := int(int32(sendMessage(list, LB_GETCURSEL, 0, 0)))
+	if idx == LB_ERR {
+		return
+	}
+	sendMessage(list, LB_DELETESTRING, uintptr(idx), 0)
+	count := int(sendMessage(list, LB_GETCOUNT, 0, 0))
+	if count > 0 {
+		if idx >= count {
+			idx = count - 1
+		}
+		sendMessage(list, LB_SETCURSEL, uintptr(idx), 0)
+	}
+}
+
+// addTypedFolder takes whatever was pasted or typed and validates it before it
+// reaches the list, so a typo surfaces here rather than as a silent no-match
+// once monitoring starts.
+func (s *SettingsUI) addTypedFolder() {
+	raw := strings.TrimSpace(windowText(s.folderPath))
+	if raw == "" {
+		return
+	}
+	// Explorer's "Copy as path" wraps the path in quotes, which is a very likely
+	// way for one to arrive here.
+	raw = strings.Trim(raw, `"`)
+	full, err := filepath.Abs(raw)
+	if err != nil || full == "" {
+		messageBox(s.hwnd, "That does not look like a usable folder path:\r\n\r\n"+raw, appName, MB_OK|MB_ICONWARNING)
+		return
+	}
+	if fi, statErr := os.Stat(full); statErr != nil || !fi.IsDir() {
+		messageBox(s.hwnd, "That folder does not exist:\r\n\r\n"+full, appName, MB_OK|MB_ICONWARNING)
+		return
+	}
+	addToList(s.folderList, s.folderPath, full)
 }
 
 func (s *SettingsUI) removeFolder() {
@@ -372,6 +494,13 @@ func (s *SettingsUI) collect() (settings.PublicConfig, error) {
 		folder, ok := listBoxText(s.folderList, i)
 		if ok && strings.TrimSpace(folder) != "" {
 			cfg.Folders = append(cfg.Folders, folder)
+		}
+	}
+	cfg.ExcludedProcesses = cfg.ExcludedProcesses[:0]
+	exCount := int(sendMessage(s.excludeList, LB_GETCOUNT, 0, 0))
+	for i := 0; i < exCount; i++ {
+		if entry, ok := listBoxText(s.excludeList, i); ok && strings.TrimSpace(entry) != "" {
+			cfg.ExcludedProcesses = append(cfg.ExcludedProcesses, entry)
 		}
 	}
 	cfg.LogPath = strings.TrimSpace(windowText(s.logPath))
@@ -494,6 +623,12 @@ func settingsWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.
 				s.addFolder()
 			case idRemoveFolder:
 				s.removeFolder()
+			case idAddFolderPath:
+				s.addTypedFolder()
+			case idAddExclude:
+				addToList(s.excludeList, s.excludeText, windowText(s.excludeText))
+			case idRemoveExclude:
+				removeSelected(s.excludeList)
 			case idBrowseLog:
 				s.browseLog()
 			case idStartAtLogin:

@@ -399,6 +399,7 @@ const (
 	LVN_FIRST                = -100
 	LVN_GETDISPINFOW         = LVN_FIRST - 77
 	NM_RCLICK                = -5
+	EM_SETCUEBANNER          = 0x1501
 	LVN_ITEMCHANGED          = LVN_FIRST - 1
 	LVSICF_NOINVALIDATEALL   = 0x00000001
 	LVSICF_NOSCROLL          = 0x00000002
