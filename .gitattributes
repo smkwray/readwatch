@@ -10,3 +10,9 @@
 *.ico  binary
 *.syso binary
 *.exe  binary
+
+# tools/make_resources.py writes this: a quarter of a megabyte of .long/.short
+# data emitting the Win32 resource section. Left unmarked it is the largest file
+# in the tree, so GitHub calls the project half Assembly and diffs of it are
+# noise.
+tools/readwatch_resources_amd64.s linguist-generated=true

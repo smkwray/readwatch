@@ -15,6 +15,10 @@ const (
 	personalizeKey = `Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`
 	runKey         = `Software\Microsoft\Windows\CurrentVersion\Run`
 	uninstallKey   = `Software\Microsoft\Windows\CurrentVersion\Uninstall\ReadWatch`
+	// Preferences about the window rather than about what is watched. The
+	// service config is machine state and needs a running service to change;
+	// these need neither, so they live in the user's own hive.
+	viewerKey = `Software\ReadWatch`
 )
 
 func regReadDWORD(root uintptr, subkey, name string) (uint32, bool) {
@@ -56,6 +60,39 @@ func regSetString(root uintptr, subkey, name, value string, wow64 bool) error {
 	return nil
 }
 
+func regSetDWORD(root uintptr, subkey, name string, value uint32) error {
+	var key uintptr
+	var disposition uint32
+	r, _, _ := procRegCreateKeyExW.Call(
+		root,
+		uintptr(unsafe.Pointer(utf16Ptr(subkey))),
+		0, 0, REG_OPTION_NON_VOLATILE, KEY_WRITE, 0,
+		uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&disposition)),
+	)
+	if r != ERROR_SUCCESS {
+		return fmt.Errorf("create registry key: %w", syscall.Errno(r))
+	}
+	defer procRegCloseKey.Call(key)
+	r, _, _ = procRegSetValueExW.Call(key, uintptr(unsafe.Pointer(utf16Ptr(name))), 0, REG_DWORD, uintptr(unsafe.Pointer(&value)), 4)
+	if r != ERROR_SUCCESS {
+		return fmt.Errorf("set registry value: %w", syscall.Errno(r))
+	}
+	return nil
+}
+
+func alwaysOnTopPreference() bool {
+	v, ok := regReadDWORD(HKEY_CURRENT_USER, viewerKey, "AlwaysOnTop")
+	return ok && v != 0
+}
+
+func setAlwaysOnTopPreference(on bool) error {
+	value := uint32(0)
+	if on {
+		value = 1
+	}
+	return regSetDWORD(HKEY_CURRENT_USER, viewerKey, "AlwaysOnTop", value)
+}
+
 func regDeleteValue(root uintptr, subkey, name string, wow64 bool) error {
 	var key uintptr
 	access := uintptr(KEY_WRITE)
@@ -74,18 +111,18 @@ func regDeleteValue(root uintptr, subkey, name string, wow64 bool) error {
 	return nil
 }
 
-func regDeleteTree(root uintptr, subkey string, wow64 bool) error {
+func regDeleteTree(root uintptr, parent, child string, wow64 bool) error {
 	var key uintptr
 	access := uintptr(KEY_ALL_ACCESS)
 	if wow64 {
 		access |= KEY_WOW64_64KEY
 	}
-	r, _, _ := procRegOpenKeyExW.Call(root, uintptr(unsafe.Pointer(utf16Ptr(`Software\Microsoft\Windows\CurrentVersion\Uninstall`))), 0, access, uintptr(unsafe.Pointer(&key)))
+	r, _, _ := procRegOpenKeyExW.Call(root, uintptr(unsafe.Pointer(utf16Ptr(parent))), 0, access, uintptr(unsafe.Pointer(&key)))
 	if r != ERROR_SUCCESS {
 		return nil
 	}
 	defer procRegCloseKey.Call(key)
-	r, _, _ = procRegDeleteTreeW.Call(key, uintptr(unsafe.Pointer(utf16Ptr(filepath.Base(subkey)))))
+	r, _, _ = procRegDeleteTreeW.Call(key, uintptr(unsafe.Pointer(utf16Ptr(child))))
 	if r != ERROR_SUCCESS && r != 2 {
 		return fmt.Errorf("delete registry tree: %w", syscall.Errno(r))
 	}
@@ -134,7 +171,14 @@ func registerUninstaller(version string) error {
 }
 
 func unregisterUninstaller() error {
-	return regDeleteTree(HKEY_LOCAL_MACHINE, uninstallKey, true)
+	return regDeleteTree(HKEY_LOCAL_MACHINE, filepath.Dir(uninstallKey), filepath.Base(uninstallKey), true)
+}
+
+// removeViewerPreferences leaves no key of ours behind after an uninstall. Like
+// setStartup(false) beside it, this reaches the hive of whoever ran the
+// uninstall, which is the same account that installed in the ordinary case.
+func removeViewerPreferences() error {
+	return regDeleteTree(HKEY_CURRENT_USER, filepath.Dir(viewerKey), filepath.Base(viewerKey), false)
 }
 
 func executableIsInstalled() bool {

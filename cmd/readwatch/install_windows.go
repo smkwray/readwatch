@@ -208,6 +208,7 @@ func uninstallElevated(quiet bool) error {
 	if err := setStartup(false); err != nil {
 		return err
 	}
+	_ = removeViewerPreferences()
 	_ = os.Remove(p.StartMenu)
 	if err := unregisterUninstaller(); err != nil {
 		return err
