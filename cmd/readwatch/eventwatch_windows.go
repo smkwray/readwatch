@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -62,18 +63,30 @@ func (w *EventWatcher) Dropped() uint64 { return w.dropped.Load() }
 // number - silently dropping them would defeat the point of the tool.
 func (w *EventWatcher) Suppressed() uint64 { return w.suppressed.Load() }
 
-func (w *EventWatcher) Start(cfg settings.Config) error {
+// Start takes the log file rather than its path: the handle was opened under
+// the owner's token and duplicated for this watcher, so nothing here resolves a
+// name that could have been repointed since it was authorised.
+func (w *EventWatcher) Start(cfg settings.Config, logFile *os.File) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.sub != 0 {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return nil
 	}
 	if len(cfg.Folders) == 0 {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return fmt.Errorf("add at least one folder before starting")
 	}
 
-	writer, err := logsink.Open(cfg.LogPath, logsink.Format(cfg.LogFormat))
+	writer, err := logsink.New(logFile, logsink.Format(cfg.LogFormat))
 	if err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return fmt.Errorf("open log: %w", err)
 	}
 

@@ -27,7 +27,11 @@ func sampleEvent() model.Event {
 
 func TestTextWriterProducesOneSanitizedLine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "readwatch.log")
-	w, err := Open(path, Text)
+	f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	w, err := New(f, Text)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +62,11 @@ func TestTextWriterProducesOneSanitizedLine(t *testing.T) {
 
 func TestJSONLWriterProducesValidEvent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "readwatch.jsonl")
-	w, err := Open(path, JSONL)
+	f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if ferr != nil {
+		t.Fatal(ferr)
+	}
+	w, err := New(f, JSONL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +96,11 @@ func TestJSONLWriterProducesValidEvent(t *testing.T) {
 func TestCSVHeaderIsWrittenOnlyOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "readwatch.csv")
 	for i := 0; i < 2; i++ {
-		w, err := Open(path, CSV)
+		f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if ferr != nil {
+			t.Fatal(ferr)
+		}
+		w, err := New(f, CSV)
 		if err != nil {
 			t.Fatal(err)
 		}

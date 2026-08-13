@@ -8,9 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -493,97 +490,6 @@ func (c *serverPipeClient) send(msg protocol.Message) {
 	case c.out <- msg:
 	case <-c.done:
 	}
-}
-
-func validatePublicConfigAsPipeClient(pipe HANDLE, cfg settings.PublicConfig) (settings.PublicConfig, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	r, _, e := procImpersonateNamedPipeClient.Call(uintptr(pipe))
-	if r == 0 {
-		return cfg, winErr("ImpersonateNamedPipeClient", e)
-	}
-	defer procRevertToSelf.Call()
-
-	if len(cfg.Folders) > 32 {
-		return cfg, errors.New("a maximum of 32 watched folders is supported")
-	}
-	validatedFolders := make([]string, 0, len(cfg.Folders))
-	for _, raw := range cfg.Folders {
-		folder, err := validateWatchFolder(raw)
-		if err != nil {
-			return cfg, fmt.Errorf("%s: %w", raw, err)
-		}
-		h, err := openFolderForValidation(folder)
-		if err != nil {
-			return cfg, fmt.Errorf("%s: your account cannot open this folder: %w", folder, err)
-		}
-		closeHandle(h)
-		validatedFolders = append(validatedFolders, folder)
-	}
-
-	logPath, err := validateLogPathForClient(cfg.LogPath)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.Folders = validatedFolders
-	cfg.LogPath = logPath
-	if cfg.LogFormat != "text" && cfg.LogFormat != "jsonl" && cfg.LogFormat != "csv" {
-		return cfg, errors.New("unsupported log format")
-	}
-	if cfg.MaxRows < 200 || cfg.MaxRows > 5000 {
-		cfg.MaxRows = 1000
-	}
-	return cfg, nil
-}
-
-func openFolderForValidation(path string) (HANDLE, error) {
-	r, _, e := procCreateFileW.Call(
-		uintptr(unsafe.Pointer(utf16Ptr(path))),
-		FILE_LIST_DIRECTORY,
-		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-		0, OPEN_EXISTING,
-		FILE_FLAG_BACKUP_SEMANTICS,
-		0,
-	)
-	if r == INVALID_HANDLE_VALUE || r == 0 {
-		return 0, winErr("CreateFile(folder)", e)
-	}
-	return HANDLE(r), nil
-}
-
-func validateLogPathForClient(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", errors.New("choose a log file")
-	}
-	if strings.HasPrefix(raw, `\\`) || strings.HasPrefix(raw, `//`) {
-		return "", errors.New("the log file must be on a local drive")
-	}
-	abs, err := filepath.Abs(raw)
-	if err != nil {
-		return "", err
-	}
-	abs = filepath.Clean(abs)
-	if info, statErr := os.Stat(abs); statErr == nil && info.IsDir() {
-		return "", errors.New("the log path points to a folder")
-	}
-	parent := filepath.Dir(abs)
-	if info, statErr := os.Stat(parent); statErr != nil || !info.IsDir() {
-		return "", errors.New("the log folder does not exist or is not accessible")
-	}
-	r, _, e := procCreateFileW.Call(
-		uintptr(unsafe.Pointer(utf16Ptr(abs))),
-		FILE_APPEND_DATA,
-		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-		0, OPEN_ALWAYS,
-		FILE_ATTRIBUTE_NORMAL,
-		0,
-	)
-	if r == INVALID_HANDLE_VALUE || r == 0 {
-		return "", fmt.Errorf("your account cannot append to the selected log: %w", e)
-	}
-	closeHandle(HANDLE(r))
-	return abs, nil
 }
 
 // IPCClient is used only by the non-elevated UI.

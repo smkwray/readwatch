@@ -312,6 +312,49 @@ type OVERLAPPED struct {
 	HEvent       HANDLE
 }
 
+// FILE_ID_INFO is the identity that outlives a pathname: the volume plus a
+// 128-bit file identifier. Renaming a folder does not change it; substituting a
+// different folder at the same path does.
+type FILE_ID_INFO struct {
+	VolumeSerialNumber uint64
+	FileID             [16]byte
+}
+
+type FILE_ATTRIBUTE_TAG_INFO struct {
+	FileAttributes uint32
+	ReparseTag     uint32
+}
+
+type BY_HANDLE_FILE_INFORMATION struct {
+	FileAttributes     uint32
+	CreationTime       FILETIME
+	LastAccessTime     FILETIME
+	LastWriteTime      FILETIME
+	VolumeSerialNumber uint32
+	FileSizeHigh       uint32
+	FileSizeLow        uint32
+	NumberOfLinks      uint32
+	FileIndexHigh      uint32
+	FileIndexLow       uint32
+}
+
+type FILETIME struct {
+	LowDateTime  uint32
+	HighDateTime uint32
+}
+
+func (f FILETIME) Uint64() uint64 {
+	return uint64(f.HighDateTime)<<32 | uint64(f.LowDateTime)
+}
+
+// FILE_ID_DESCRIPTOR is a union: FileIdTypeIndex reads the first 8 bytes,
+// FileIdTypeExtended all 16. Sized for the largest member so both fit.
+type FILE_ID_DESCRIPTOR struct {
+	DwSize uint32
+	Type   uint32
+	ID     [16]byte
+}
+
 type SERVICE_DESCRIPTIONW struct{ Description *uint16 }
 type WIN32_FIND_DATAW struct {
 	FileAttributes     uint32
@@ -653,24 +696,54 @@ const (
 
 	CREATE_NO_WINDOW = 0x08000000
 
-	GENERIC_READ               = 0x80000000
-	GENERIC_WRITE              = 0x40000000
-	FILE_READ_DATA             = 0x0001
-	FILE_LIST_DIRECTORY        = 0x0001
-	FILE_APPEND_DATA           = 0x0004
-	READ_CONTROL               = 0x00020000
-	FILE_SHARE_READ            = 0x00000001
-	FILE_SHARE_WRITE           = 0x00000002
-	FILE_SHARE_DELETE          = 0x00000004
-	CREATE_NEW                 = 1
-	CREATE_ALWAYS              = 2
-	OPEN_EXISTING              = 3
-	OPEN_ALWAYS                = 4
-	FILE_ATTRIBUTE_NORMAL      = 0x00000080
-	FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-	FILE_ATTRIBUTE_DIRECTORY   = 0x10
-	INVALID_FILE_ATTRIBUTES    = 0xFFFFFFFF
-	INVALID_HANDLE_VALUE       = ^uintptr(0)
+	GENERIC_READ                 = 0x80000000
+	GENERIC_WRITE                = 0x40000000
+	FILE_READ_DATA               = 0x0001
+	FILE_LIST_DIRECTORY          = 0x0001
+	FILE_APPEND_DATA             = 0x0004
+	FILE_READ_ATTRIBUTES         = 0x0080
+	FILE_TRAVERSE                = 0x0020
+	READ_CONTROL                 = 0x00020000
+	ACCESS_SYSTEM_SECURITY       = 0x01000000
+	FILE_SHARE_READ              = 0x00000001
+	FILE_SHARE_WRITE             = 0x00000002
+	FILE_SHARE_DELETE            = 0x00000004
+	CREATE_NEW                   = 1
+	CREATE_ALWAYS                = 2
+	OPEN_EXISTING                = 3
+	OPEN_ALWAYS                  = 4
+	FILE_ATTRIBUTE_NORMAL        = 0x00000080
+	FILE_FLAG_BACKUP_SEMANTICS   = 0x02000000
+	FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+	FILE_ATTRIBUTE_DIRECTORY     = 0x10
+	FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+	INVALID_FILE_ATTRIBUTES      = 0xFFFFFFFF
+	INVALID_HANDLE_VALUE         = ^uintptr(0)
+
+	// GetFileInformationByHandleEx classes. FileIdInfo carries the 128-bit
+	// identifier ReFS needs; FileAttributeTagInfo is how a reparse point is
+	// detected on an already-open handle.
+	FileAttributeTagInfo = 9
+	FileIdInfo           = 18
+
+	// Volume capability flags. A volume that cannot keep ACLs or cannot open by
+	// file ID cannot carry an audit rule ReadWatch could later find again.
+	FILE_PERSISTENT_ACLS          = 0x00000008
+	FILE_SUPPORTS_OPEN_BY_FILE_ID = 0x01000000
+
+	VOLUME_NAME_GUID = 0x00000001
+
+	// OpenFileById descriptor kinds: 64-bit index on NTFS, 128-bit on ReFS.
+	FileIdTypeIndex    = 0
+	FileIdTypeExtended = 2
+
+	MOVEFILE_REPLACE_EXISTING   = 0x00000001
+	MOVEFILE_WRITE_THROUGH      = 0x00000008
+	MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
+
+	REPLACEFILE_IGNORE_MERGE_ERRORS = 0x00000002
+
+	DUPLICATE_SAME_ACCESS = 0x00000002
 
 	PIPE_ACCESS_DUPLEX         = 0x00000003
 	PIPE_TYPE_BYTE             = 0x00000000
@@ -691,15 +764,20 @@ const (
 	FOS_NOREADONLYRETURN     = 0x00008000
 	SIGDN_FILESYSPATH        = 0x80058000
 
-	SACL_SECURITY_INFORMATION           = 0x00000008
-	DACL_SECURITY_INFORMATION           = 0x00000004
-	PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-	SE_FILE_OBJECT                      = 1
-	POLICY_AUDIT_EVENT_SUCCESS          = 0x00000001
-	POLICY_AUDIT_EVENT_NONE             = 0x00000004
-	SET_AUDIT_SUCCESS                   = 5
-	OBJECT_INHERIT_ACE                  = 0x00000001
-	CONTAINER_INHERIT_ACE               = 0x00000002
+	SACL_SECURITY_INFORMATION             = 0x00000008
+	DACL_SECURITY_INFORMATION             = 0x00000004
+	PROTECTED_DACL_SECURITY_INFORMATION   = 0x80000000
+	PROTECTED_SACL_SECURITY_INFORMATION   = 0x40000000
+	UNPROTECTED_SACL_SECURITY_INFORMATION = 0x10000000
+	// SE_SACL_PROTECTED in the descriptor's control word: restoring a SACL has to
+	// put back whether it blocked inherited audit entries, not just its contents.
+	SE_SACL_PROTECTED          = 0x2000
+	SE_FILE_OBJECT             = 1
+	POLICY_AUDIT_EVENT_SUCCESS = 0x00000001
+	POLICY_AUDIT_EVENT_NONE    = 0x00000004
+	SET_AUDIT_SUCCESS          = 5
+	OBJECT_INHERIT_ACE         = 0x00000001
+	CONTAINER_INHERIT_ACE      = 0x00000002
 
 	SC_MANAGER_CONNECT           = 0x0001
 	SC_MANAGER_CREATE_SERVICE    = 0x0002
@@ -745,32 +823,43 @@ var (
 	ole32    = syscall.NewLazyDLL("ole32.dll")
 	wevtapi  = syscall.NewLazyDLL("wevtapi.dll")
 
-	procGetModuleHandleW        = kernel32.NewProc("GetModuleHandleW")
-	procGetCurrentProcess       = kernel32.NewProc("GetCurrentProcess")
-	procGetCurrentProcessId     = kernel32.NewProc("GetCurrentProcessId")
-	procGetLastError            = kernel32.NewProc("GetLastError")
-	procLocalFree               = kernel32.NewProc("LocalFree")
-	procCreateMutexW            = kernel32.NewProc("CreateMutexW")
-	procOpenMutexW              = kernel32.NewProc("OpenMutexW")
-	procReleaseMutex            = kernel32.NewProc("ReleaseMutex")
-	procCreateEventW            = kernel32.NewProc("CreateEventW")
-	procOpenEventW              = kernel32.NewProc("OpenEventW")
-	procSetEvent                = kernel32.NewProc("SetEvent")
-	procResetEvent              = kernel32.NewProc("ResetEvent")
-	procWaitForSingleObject     = kernel32.NewProc("WaitForSingleObject")
-	procWaitForMultipleObjects  = kernel32.NewProc("WaitForMultipleObjects")
-	procCancelIoEx              = kernel32.NewProc("CancelIoEx")
-	procCloseHandle             = kernel32.NewProc("CloseHandle")
-	procGetFileAttributesW      = kernel32.NewProc("GetFileAttributesW")
-	procMoveFileExW             = kernel32.NewProc("MoveFileExW")
-	procCreateFileW             = kernel32.NewProc("CreateFileW")
-	procCreateNamedPipeW        = kernel32.NewProc("CreateNamedPipeW")
-	procConnectNamedPipe        = kernel32.NewProc("ConnectNamedPipe")
-	procDisconnectNamedPipe     = kernel32.NewProc("DisconnectNamedPipe")
-	procWaitNamedPipeW          = kernel32.NewProc("WaitNamedPipeW")
-	procSetNamedPipeHandleState = kernel32.NewProc("SetNamedPipeHandleState")
-	procFlushFileBuffers        = kernel32.NewProc("FlushFileBuffers")
-	procGetFullPathNameW        = kernel32.NewProc("GetFullPathNameW")
+	procGetModuleHandleW       = kernel32.NewProc("GetModuleHandleW")
+	procGetCurrentProcess      = kernel32.NewProc("GetCurrentProcess")
+	procGetCurrentProcessId    = kernel32.NewProc("GetCurrentProcessId")
+	procGetLastError           = kernel32.NewProc("GetLastError")
+	procLocalFree              = kernel32.NewProc("LocalFree")
+	procCreateMutexW           = kernel32.NewProc("CreateMutexW")
+	procOpenMutexW             = kernel32.NewProc("OpenMutexW")
+	procReleaseMutex           = kernel32.NewProc("ReleaseMutex")
+	procCreateEventW           = kernel32.NewProc("CreateEventW")
+	procOpenEventW             = kernel32.NewProc("OpenEventW")
+	procSetEvent               = kernel32.NewProc("SetEvent")
+	procResetEvent             = kernel32.NewProc("ResetEvent")
+	procWaitForSingleObject    = kernel32.NewProc("WaitForSingleObject")
+	procWaitForMultipleObjects = kernel32.NewProc("WaitForMultipleObjects")
+	procCancelIoEx             = kernel32.NewProc("CancelIoEx")
+	procCloseHandle            = kernel32.NewProc("CloseHandle")
+	procGetFileAttributesW     = kernel32.NewProc("GetFileAttributesW")
+	procMoveFileExW            = kernel32.NewProc("MoveFileExW")
+	procCreateFileW            = kernel32.NewProc("CreateFileW")
+	// The capability set: identify an open object, reopen it without consulting
+	// its name again, and find it later by identity alone.
+	procGetFileInformationByHandle      = kernel32.NewProc("GetFileInformationByHandle")
+	procGetFileInformationByHandleEx    = kernel32.NewProc("GetFileInformationByHandleEx")
+	procGetVolumeInformationByHandleW   = kernel32.NewProc("GetVolumeInformationByHandleW")
+	procGetFinalPathNameByHandleW       = kernel32.NewProc("GetFinalPathNameByHandleW")
+	procGetVolumeNameForVolumeMountPntW = kernel32.NewProc("GetVolumeNameForVolumeMountPointW")
+	procReOpenFile                      = kernel32.NewProc("ReOpenFile")
+	procOpenFileById                    = kernel32.NewProc("OpenFileById")
+	procDuplicateHandle                 = kernel32.NewProc("DuplicateHandle")
+	procReplaceFileW                    = kernel32.NewProc("ReplaceFileW")
+	procCreateNamedPipeW                = kernel32.NewProc("CreateNamedPipeW")
+	procConnectNamedPipe                = kernel32.NewProc("ConnectNamedPipe")
+	procDisconnectNamedPipe             = kernel32.NewProc("DisconnectNamedPipe")
+	procWaitNamedPipeW                  = kernel32.NewProc("WaitNamedPipeW")
+	procSetNamedPipeHandleState         = kernel32.NewProc("SetNamedPipeHandleState")
+	procFlushFileBuffers                = kernel32.NewProc("FlushFileBuffers")
+	procGetFullPathNameW                = kernel32.NewProc("GetFullPathNameW")
 
 	procRegisterClassExW       = user32.NewProc("RegisterClassExW")
 	procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")
@@ -852,36 +941,47 @@ var (
 	procConvertSecurityDescriptorToStringSecurityDescriptorW = advapi32.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW")
 	procGetSecurityDescriptorDacl                            = advapi32.NewProc("GetSecurityDescriptorDacl")
 	procSetNamedSecurityInfoW                                = advapi32.NewProc("SetNamedSecurityInfoW")
-	procGetNamedSecurityInfoW                                = advapi32.NewProc("GetNamedSecurityInfoW")
-	procSetFileSecurityW                                     = advapi32.NewProc("SetFileSecurityW")
-	procBuildTrusteeWithSidW                                 = advapi32.NewProc("BuildTrusteeWithSidW")
-	procSetEntriesInAclW                                     = advapi32.NewProc("SetEntriesInAclW")
-	procAuditQuerySystemPolicy                               = advapi32.NewProc("AuditQuerySystemPolicy")
-	procAuditSetSystemPolicy                                 = advapi32.NewProc("AuditSetSystemPolicy")
-	procAuditFree                                            = advapi32.NewProc("AuditFree")
-	procRegOpenKeyExW                                        = advapi32.NewProc("RegOpenKeyExW")
-	procRegCreateKeyExW                                      = advapi32.NewProc("RegCreateKeyExW")
-	procRegQueryValueExW                                     = advapi32.NewProc("RegQueryValueExW")
-	procRegSetValueExW                                       = advapi32.NewProc("RegSetValueExW")
-	procRegDeleteValueW                                      = advapi32.NewProc("RegDeleteValueW")
-	procRegDeleteTreeW                                       = advapi32.NewProc("RegDeleteTreeW")
-	procRegCloseKey                                          = advapi32.NewProc("RegCloseKey")
-	procImpersonateNamedPipeClient                           = advapi32.NewProc("ImpersonateNamedPipeClient")
-	procRevertToSelf                                         = advapi32.NewProc("RevertToSelf")
-	procOpenSCManagerW                                       = advapi32.NewProc("OpenSCManagerW")
-	procCreateServiceW                                       = advapi32.NewProc("CreateServiceW")
-	procOpenServiceW                                         = advapi32.NewProc("OpenServiceW")
-	procStartServiceW                                        = advapi32.NewProc("StartServiceW")
-	procControlService                                       = advapi32.NewProc("ControlService")
-	procDeleteService                                        = advapi32.NewProc("DeleteService")
-	procQueryServiceStatusEx                                 = advapi32.NewProc("QueryServiceStatusEx")
-	procChangeServiceConfigW                                 = advapi32.NewProc("ChangeServiceConfigW")
-	procChangeServiceConfig2W                                = advapi32.NewProc("ChangeServiceConfig2W")
-	procSetServiceObjectSecurity                             = advapi32.NewProc("SetServiceObjectSecurity")
-	procCloseServiceHandle                                   = advapi32.NewProc("CloseServiceHandle")
-	procStartServiceCtrlDispatcherW                          = advapi32.NewProc("StartServiceCtrlDispatcherW")
-	procRegisterServiceCtrlHandlerExW                        = advapi32.NewProc("RegisterServiceCtrlHandlerExW")
-	procSetServiceStatus                                     = advapi32.NewProc("SetServiceStatus")
+	// The handle forms. A name can be rebound between the read and the write;
+	// a handle refers to the object that was actually checked.
+	procGetSecurityInfo               = advapi32.NewProc("GetSecurityInfo")
+	procSetSecurityInfo               = advapi32.NewProc("SetSecurityInfo")
+	procGetSecurityDescriptorSacl     = advapi32.NewProc("GetSecurityDescriptorSacl")
+	procSetSecurityDescriptorSacl     = advapi32.NewProc("SetSecurityDescriptorSacl")
+	procInitializeSecurityDescriptor  = advapi32.NewProc("InitializeSecurityDescriptor")
+	procSetSecurityDescriptorControl  = advapi32.NewProc("SetSecurityDescriptorControl")
+	procGetSecurityDescriptorControl  = advapi32.NewProc("GetSecurityDescriptorControl")
+	procOpenThreadToken               = advapi32.NewProc("OpenThreadToken")
+	procGetCurrentThread              = kernel32.NewProc("GetCurrentThread")
+	procGetNamedSecurityInfoW         = advapi32.NewProc("GetNamedSecurityInfoW")
+	procSetFileSecurityW              = advapi32.NewProc("SetFileSecurityW")
+	procBuildTrusteeWithSidW          = advapi32.NewProc("BuildTrusteeWithSidW")
+	procSetEntriesInAclW              = advapi32.NewProc("SetEntriesInAclW")
+	procAuditQuerySystemPolicy        = advapi32.NewProc("AuditQuerySystemPolicy")
+	procAuditSetSystemPolicy          = advapi32.NewProc("AuditSetSystemPolicy")
+	procAuditFree                     = advapi32.NewProc("AuditFree")
+	procRegOpenKeyExW                 = advapi32.NewProc("RegOpenKeyExW")
+	procRegCreateKeyExW               = advapi32.NewProc("RegCreateKeyExW")
+	procRegQueryValueExW              = advapi32.NewProc("RegQueryValueExW")
+	procRegSetValueExW                = advapi32.NewProc("RegSetValueExW")
+	procRegDeleteValueW               = advapi32.NewProc("RegDeleteValueW")
+	procRegDeleteTreeW                = advapi32.NewProc("RegDeleteTreeW")
+	procRegCloseKey                   = advapi32.NewProc("RegCloseKey")
+	procImpersonateNamedPipeClient    = advapi32.NewProc("ImpersonateNamedPipeClient")
+	procRevertToSelf                  = advapi32.NewProc("RevertToSelf")
+	procOpenSCManagerW                = advapi32.NewProc("OpenSCManagerW")
+	procCreateServiceW                = advapi32.NewProc("CreateServiceW")
+	procOpenServiceW                  = advapi32.NewProc("OpenServiceW")
+	procStartServiceW                 = advapi32.NewProc("StartServiceW")
+	procControlService                = advapi32.NewProc("ControlService")
+	procDeleteService                 = advapi32.NewProc("DeleteService")
+	procQueryServiceStatusEx          = advapi32.NewProc("QueryServiceStatusEx")
+	procChangeServiceConfigW          = advapi32.NewProc("ChangeServiceConfigW")
+	procChangeServiceConfig2W         = advapi32.NewProc("ChangeServiceConfig2W")
+	procSetServiceObjectSecurity      = advapi32.NewProc("SetServiceObjectSecurity")
+	procCloseServiceHandle            = advapi32.NewProc("CloseServiceHandle")
+	procStartServiceCtrlDispatcherW   = advapi32.NewProc("StartServiceCtrlDispatcherW")
+	procRegisterServiceCtrlHandlerExW = advapi32.NewProc("RegisterServiceCtrlHandlerExW")
+	procSetServiceStatus              = advapi32.NewProc("SetServiceStatus")
 
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 	procShellExecuteW    = shell32.NewProc("ShellExecuteW")

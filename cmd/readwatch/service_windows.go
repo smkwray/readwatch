@@ -20,11 +20,14 @@ import (
 )
 
 type ServiceEngine struct {
-	opMu         sync.Mutex
-	mu           sync.RWMutex
-	cfg          settings.Config
-	watcher      *EventWatcher
-	ipc          *IPCServer
+	opMu    sync.Mutex
+	mu      sync.RWMutex
+	cfg     settings.Config
+	watcher *EventWatcher
+	ipc     *IPCServer
+	// active holds the open folder and log handles the current monitoring
+	// session was authorised with. Everything privileged goes through these.
+	active       *BoundConfig
 	lastError    string
 	ready        bool
 	shuttingDown atomic.Bool
@@ -57,7 +60,17 @@ func loadServiceConfig(path, defaultLog string) (settings.Config, error) {
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return settings.Config{}, err
 	}
-	return settings.Load(path, defaultLog, raw.OwnerSID, raw.OwnerName)
+	cfg, err := settings.Load(path, defaultLog, raw.OwnerSID, raw.OwnerName)
+	if err != nil {
+		return cfg, err
+	}
+	// A version-1 configuration that still owns audit state cannot be carried
+	// forward: its records name paths, and a path no longer identifies an
+	// object well enough to undo a privileged change safely.
+	if err := cfg.MigrateFromV1(); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
 // Start brings up IPC and nothing else. A persisted Enabled=true is desired
@@ -114,23 +127,13 @@ func (e *ServiceEngine) Shutdown() {
 	e.mu.Unlock()
 	e.ipc.Stop()
 	e.opMu.Lock()
-	e.watcher.Stop()
 	// Stopping the service must leave nothing of ReadWatch's behind. The SACLs
 	// and the audit-policy change are ours, and Windows keeps writing 4663 events
 	// into the Security log for as long as they are applied - with no service
 	// running to consume them. Enabled is deliberately left as-is so the next
 	// start resumes monitoring; only the machine-visible state is withdrawn.
-	e.mu.RLock()
-	cfg := cloneConfig(e.cfg)
-	e.mu.RUnlock()
-	if err := cleanupAuditState(&cfg); err != nil {
+	if err := e.stopMonitoringLocked(true, false); err != nil {
 		writeServiceDiagnostic(err)
-	} else if err := settings.Save(paths().Config, cfg); err != nil {
-		writeServiceDiagnostic(err)
-	} else {
-		e.mu.Lock()
-		e.cfg.Snapshots = cfg.Snapshots
-		e.mu.Unlock()
 	}
 	e.opMu.Unlock()
 }
@@ -160,150 +163,7 @@ func (e *ServiceEngine) CurrentState() protocol.State {
 }
 
 func (e *ServiceEngine) ApplyFromClient(pipe HANDLE, public settings.PublicConfig) error {
-	validated, err := validatePublicConfigAsPipeClient(pipe, public)
-	if err != nil {
-		return err
-	}
-	return e.apply(validated)
-}
-
-func (e *ServiceEngine) apply(public settings.PublicConfig) error {
-	e.opMu.Lock()
-	defer e.opMu.Unlock()
-	if err := e.rejectIfStopping(); err != nil {
-		return err
-	}
-
-	e.mu.RLock()
-	old := cloneConfig(e.cfg)
-	e.mu.RUnlock()
-	wasRunning := e.watcher.Running()
-
-	candidate := cloneConfig(old)
-	candidate.ApplyPublic(public)
-	candidate.Enabled = old.Enabled
-
-	if !wasRunning {
-		if err := cleanupAuditState(&candidate); err != nil {
-			return err
-		}
-		if err := settings.Save(paths().Config, candidate); err != nil {
-			return err
-		}
-		e.mu.Lock()
-		e.cfg = candidate
-		e.lastError = ""
-		e.mu.Unlock()
-		return nil
-	}
-
-	e.watcher.Stop()
-	old.Enabled = true
-	if errs := reconcileAuditRules(&old, nil); len(errs) > 0 {
-		_ = e.restoreRunningConfig(old)
-		return errs[0]
-	}
-	candidate.Snapshots = make(map[string]settings.AuditSnapshot)
-	candidate.Enabled = true
-	if err := ensureFileSystemAuditPolicy(&candidate); err != nil {
-		_ = e.restoreRunningConfig(old)
-		return err
-	}
-	if errs := reconcileAuditRules(&candidate, candidate.Folders); len(errs) > 0 {
-		_ = reconcileAndDiscard(&candidate)
-		_ = e.restoreRunningConfig(old)
-		return errs[0]
-	}
-	if err := settings.Save(paths().Config, candidate); err != nil {
-		_ = reconcileAndDiscard(&candidate)
-		_ = e.restoreRunningConfig(old)
-		return err
-	}
-	if err := e.watcher.Start(candidate); err != nil {
-		_ = reconcileAndDiscard(&candidate)
-		_ = e.restoreRunningConfig(old)
-		return err
-	}
-	e.mu.Lock()
-	e.cfg = candidate
-	e.lastError = ""
-	e.mu.Unlock()
-	return nil
-}
-
-func reconcileAndDiscard(cfg *settings.Config) error {
-	if errs := reconcileAuditRules(cfg, nil); len(errs) > 0 {
-		return errs[0]
-	}
-	return nil
-}
-
-func cleanupAuditState(cfg *settings.Config) error {
-	if err := reconcileAndDiscard(cfg); err != nil {
-		return err
-	}
-	return restoreFileSystemAuditPolicy(cfg)
-}
-
-func (e *ServiceEngine) restoreRunningConfig(old settings.Config) error {
-	old.Enabled = true
-	old.Snapshots = make(map[string]settings.AuditSnapshot)
-	if err := ensureFileSystemAuditPolicy(&old); err != nil {
-		return err
-	}
-	if errs := reconcileAuditRules(&old, old.Folders); len(errs) > 0 {
-		return errs[0]
-	}
-	if err := settings.Save(paths().Config, old); err != nil {
-		return err
-	}
-	if err := e.watcher.Start(old); err != nil {
-		return err
-	}
-	e.mu.Lock()
-	e.cfg = old
-	e.mu.Unlock()
-	return nil
-}
-
-// startMonitoringBound takes the pipe handle so the objects it is about to make
-// SYSTEM act on are the ones the connected owner can reach. Q2 replaces the
-// pathname re-resolution inside it with retained handles; the seam is here.
-func (e *ServiceEngine) startMonitoringBound(_ HANDLE, clearError bool) error {
-	if e.watcher.Running() {
-		return nil
-	}
-	e.mu.RLock()
-	cfg := cloneConfig(e.cfg)
-	e.mu.RUnlock()
-	if len(cfg.Folders) == 0 {
-		return errors.New("add at least one folder before starting")
-	}
-	if err := ensureFileSystemAuditPolicy(&cfg); err != nil {
-		return err
-	}
-	if errs := reconcileAuditRules(&cfg, cfg.Folders); len(errs) > 0 {
-		_ = cleanupAuditState(&cfg)
-		return errs[0]
-	}
-	cfg.Enabled = true
-	if err := settings.Save(paths().Config, cfg); err != nil {
-		_ = cleanupAuditState(&cfg)
-		return err
-	}
-	if err := e.watcher.Start(cfg); err != nil {
-		cfg.Enabled = false
-		_ = cleanupAuditState(&cfg)
-		_ = settings.Save(paths().Config, cfg)
-		return err
-	}
-	e.mu.Lock()
-	e.cfg = cfg
-	if clearError {
-		e.lastError = ""
-	}
-	e.mu.Unlock()
-	return nil
+	return e.applyBound(pipe, public)
 }
 
 func (e *ServiceEngine) StopMonitoring(removeRules bool) error {
@@ -312,31 +172,9 @@ func (e *ServiceEngine) StopMonitoring(removeRules bool) error {
 	if err := e.rejectIfStopping(); err != nil {
 		return err
 	}
-	e.watcher.Stop()
-	e.mu.RLock()
-	cfg := cloneConfig(e.cfg)
-	e.mu.RUnlock()
-	var first error
-	if removeRules {
-		if errs := reconcileAuditRules(&cfg, nil); len(errs) > 0 {
-			first = errs[0]
-		} else if err := restoreFileSystemAuditPolicy(&cfg); err != nil {
-			first = err
-		}
-		cfg.Enabled = false
-	}
-	if err := settings.Save(paths().Config, cfg); err != nil && first == nil {
-		first = err
-	}
-	e.mu.Lock()
-	e.cfg = cfg
-	if first == nil {
-		e.lastError = ""
-	} else {
-		e.lastError = first.Error()
-	}
-	e.mu.Unlock()
-	return first
+	// An explicit Stop clears the desired state; a shutdown keeps it, so the
+	// next viewer session resumes what the owner had running.
+	return e.stopMonitoringLocked(removeRules, true)
 }
 
 func (e *ServiceEngine) Cleanup() error {
