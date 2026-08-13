@@ -159,12 +159,15 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 	if h == 0 {
 		opened, err := openByIdentity(snapshot.Identity)
 		if err != nil {
-			// The object cannot be reached: deleted, or on a volume that is not
-			// mounted. There is nothing left to restore - an audit rule lives on
-			// the object, so it went wherever the object went. Dropping the record
-			// is the only outcome that ever becomes true again; keeping it blocks
-			// Stop, Apply and uninstall forever over a folder that no longer
-			// exists, which is what it did.
+			// A condition that will clear on its own is worth waiting for: the
+			// folder is still there and so is the rule.
+			if transientOpenFailure(err) {
+				return fmt.Errorf("%s: %w", snapshot.Path, err)
+			}
+			// Otherwise the object is gone, and an audit rule lives on the object,
+			// so it went with it. There is nothing to restore and nothing that
+			// will ever make this record actionable - keeping it blocks Stop,
+			// Apply and uninstall permanently, which is exactly what it did.
 			writeServiceDiagnostic(fmt.Errorf("%s: forgetting the audit record, the folder could not be found: %w", snapshot.Path, err))
 			delete(cfg.Snapshots, key)
 			return save(cfg)
@@ -197,8 +200,8 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 			return fmt.Errorf("%s: the auditing rules did not return to what ReadWatch found", snapshot.Path)
 		}
 	case equivalentSACL(current, original):
-		// Already back where it started. This also accepts an empty,
-		// unprotected ACL for an originally absent SACL, but never a null SACL.
+		// Already back where it started. This also accepts a valid empty or null
+		// unprotected SACL for an originally absent SACL, but never protected null.
 	default:
 		// The rules are neither what ReadWatch applied nor what it found, so
 		// somebody else has changed them and they are left alone. The record is
@@ -541,4 +544,22 @@ func (e *ServiceEngine) restoreRunning(old *BoundConfig, oldCfg *settings.Config
 func recoverJournalOffline(cfg *settings.Config) error {
 	save := func(c *settings.Config) error { return settings.Save(paths().Config, *c) }
 	return recoverJournal(cfg, save)
+}
+
+// transientOpenFailure reports conditions that say "not now" rather than "not
+// ever": another process holding the folder incompatibly, or a volume that is
+// not mounted. The record is kept so the next Stop or start can finish the job.
+// Anything else is treated as the object being gone, because a record ReadWatch
+// can never act on strands the whole application - a deleted watched folder did
+// exactly that.
+func transientOpenFailure(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	switch uintptr(errno) {
+	case ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_NOT_READY, ERROR_DEV_NOT_EXIST:
+		return true
+	}
+	return false
 }

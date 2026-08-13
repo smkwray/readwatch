@@ -20,11 +20,18 @@ func TestEquivalentSACLNormalisesOnlyProviderMetadata(t *testing.T) {
 	if !equivalentSACL(absent, emptyAutoInherited) {
 		t.Error("an absent and an empty unprotected SACL should be equivalent")
 	}
-	if equivalentSACL(absent, nullUnprotected) {
-		t.Error("an absent SACL must not equal a null SACL, even when both are unprotected")
+	if !equivalentSACL(absent, nullUnprotected) || !equivalentSACL(nullUnprotected, absent) {
+		t.Error("absent and null unprotected SACLs should be equivalent in either comparison order")
+	}
+	if !equivalentSACL(emptyAutoInherited, nullUnprotected) {
+		t.Error("empty and null unprotected SACLs should be equivalent")
 	}
 	if equivalentSACL(absent, nullProtected) {
 		t.Error("an absent SACL must not equal a protected null SACL")
+	}
+	emptyProtected := mustParseSACL(t, "S:P")
+	if equivalentSACL(emptyProtected, nullProtected) {
+		t.Error("a protected null SACL must not equal a protected valid empty SACL")
 	}
 	if !equivalentSACL(applied, appliedAutoInherited) {
 		t.Error("AI is provider-managed and should not make equal ACEs differ")
