@@ -203,8 +203,10 @@ type AppUI struct {
 	liveDropped  atomic.Uint64
 	lastDispText []uint16
 	// The service's counters run from when monitoring started; these baselines
-	// are what Clear resets them to, so the summary always describes the rows
-	// that are actually on screen.
+	// are what Clear resets them to, so the summary describes the span since
+	// Clear rather than the whole session. It is a span, not a row count: the
+	// ring is bounded, so after MaxRows events the list holds fewer rows than
+	// the total says.
 	baseSuppressed  uint64
 	baseLogDropped  uint64
 	baseLiveDropped uint64
@@ -516,12 +518,15 @@ func (u *AppUI) dpiChanged(newDPI uint32, suggested *RECT) {
 	}
 	oldFont := u.font
 	u.font = createUIFont(u.dpi)
-	for _, h := range []HWND{u.status, u.startBtn, u.settingsBtn, u.list, u.summary, u.openBtn, u.clearBtn} {
+	// Exit was missing from this list and kept the old font across a DPI change.
+	for _, h := range []HWND{u.status, u.startBtn, u.settingsBtn, u.list, u.summary, u.openBtn, u.clearBtn, u.exitBtn} {
 		sendMessage(h, WM_SETFONT, uintptr(u.font), 1)
 	}
 	if oldFont != 0 {
 		deleteObject(uintptr(oldFont))
 	}
+	// The hint's wrap width is in pixels, so it has to follow the DPI too.
+	u.hint.setMaxWidth(u.scale(560))
 	u.layout()
 }
 
@@ -817,11 +822,14 @@ func (u *AppUI) updateStatus() {
 		setWindowText(u.status, "○  Stopped")
 		setWindowText(u.startBtn, "Start")
 	}
-	// A command in flight owns both buttons. They used to be disabled by the
-	// caller and re-enabled here by the next state broadcast, which arrives
-	// while the command is still running: the button came back to life
-	// mid-command and the click it then accepted was silently discarded.
-	idle := pending == ""
+	// A command in flight owns both buttons, and the lock says whether one is in
+	// flight - not the label. The label drops as soon as the service reports the
+	// state the command was heading for, and the IPC reader hands that state to
+	// this window *before* it wakes the command goroutine (ipc_windows.go,
+	// TypeResponse). Keying the buttons off the label re-enabled them in that
+	// gap, and a click landing there was thrown away by beginCommand's
+	// compare-and-swap: the silent-click regression this was meant to end.
+	idle := !u.commandBusy.Load()
 	procEnableWindow.Call(uintptr(u.startBtn), boolToUintptr(idle))
 	procEnableWindow.Call(uintptr(u.settingsBtn), boolToUintptr(idle && state.ServiceReady))
 	procEnableWindow.Call(uintptr(u.openBtn), boolToUintptr(state.Config.LogPath != ""))
@@ -904,10 +912,13 @@ func (u *AppUI) updateSummary() {
 	setWindowText(u.summary, text)
 }
 
-// since reports a service counter relative to the last Clear, so every number
-// in the summary describes the same span as the rows on screen. The service
-// zeroes these when monitoring restarts, so a value under the baseline means
-// the baseline is stale, not that the count went backwards.
+// since reports a service counter relative to the last Clear. The baseline is
+// the newest count this window had been told about, which is not necessarily
+// the service's count at that instant - state arrives on connect, after a
+// command and on watcher errors, not per suppressed read - so a Clear can leave
+// a little of the previous span in the next figure. The service zeroes these
+// when monitoring restarts, so a value under the baseline means the baseline is
+// stale, not that the count went backwards.
 func since(current uint64, base *uint64) uint64 {
 	if current < *base {
 		*base = 0
@@ -1013,6 +1024,12 @@ func filepathDir(path string) string {
 func (u *AppUI) clearView() {
 	u.ring.Clear()
 	u.totalEvents = 0
+	// Events already off the pipe but not yet drained belong to the span being
+	// cleared. Without this they land in the next drain and repopulate a list
+	// the user just emptied.
+	u.eventMu.Lock()
+	u.pendingEvent = nil
+	u.eventMu.Unlock()
 	u.baseSuppressed = u.state.Suppressed
 	u.baseLogDropped = u.state.LogDropped
 	u.baseLiveDropped = u.state.LiveDropped + u.liveDropped.Load()

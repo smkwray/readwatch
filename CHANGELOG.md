@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.2.1 — 2026-08-13
+
+Viewer only. The service and its privilege boundary are unchanged.
+
+> The embedded PE version resource still reports `0.1.0.0`, as in 0.2.0: regenerating
+> `rsrc_windows_amd64.syso` needs Clang, which is still not available on the build machine. Only
+> **--version** tracks the release.
+
+### Features
+
+- Hovering a cell whose text the column had to clip shows the whole string, in the event list and
+  in both Settings lists. Only when it was actually clipped — a hint over text you can already read
+  is noise.
+- **Keep the ReadWatch window on top of other windows**, in Settings. A viewer preference: it is
+  stored per user in `HKCU\Software\ReadWatch`, needs no elevation and no running service, and is
+  removed on uninstall.
+- Start and Stop now show `Starting…` / `Stopping…` while the command is in flight, and Save shows
+  `Applying changes…`. Re-applying an audit rule across a large folder takes seconds, and the
+  window used to give no sign it was working.
+
+### Fixes
+
+- Start and Settings stayed clickable while a command was still running, and the click was then
+  discarded without a word. Both buttons, and the matching tray entries, are now held for the
+  command's duration.
+- A folder path typed or pasted into Settings but never **Add**ed was dropped silently by **Save**.
+  It is committed now, and a **Save** that cannot proceed says so instead of doing nothing.
+- `· N excluded` counted suppressed *reads* but read like a count of excluded processes. It says
+  `· N reads excluded`, and **Clear** now rebases the suppressed, log-dropped and live-dropped
+  counters and discards events still queued from before the clear, so the summary describes the
+  span since you cleared it.
+- A state update that arrived while an earlier one was being applied could be left unposted, so the
+  window kept showing the previous state until something else came along.
+- `tools/readwatch_resources_amd64.s` is marked `linguist-generated`; that generated file is larger
+  than all the Go in the repository and GitHub was reporting the project as half Assembly.
+
+### Known
+
+- `comMethod` still passes pointer-bearing COM arguments through a `[]uintptr`, so the
+  `unsafe.Pointer` conversion does not happen in the `syscall.SyscallN` call expression as the
+  unsafe rules require. `go vet` is clean because the helper hides the conversion from it, not
+  because the pattern is sound. Typed per-method wrappers are the fix.
+
 ## 0.2.0 — 2026-08-12
 
 First revision after the preview was actually run on Windows. Several paths had never executed.

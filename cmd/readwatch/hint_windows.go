@@ -39,9 +39,18 @@ func newHintTip(owner HWND, maxWidth int32) *hintTip {
 		return nil
 	}
 	t := &hintTip{tip: HWND(h)}
-	// Without a maximum a long path becomes one tooltip wider than the screen.
-	sendMessage(t.tip, TTM_SETMAXTIPWIDTH, 0, uintptr(maxWidth))
+	t.setMaxWidth(maxWidth)
 	return t
+}
+
+// setMaxWidth caps the wrap width. Without a maximum a long path becomes one
+// tooltip wider than the screen; the value is in pixels, so it is set again
+// whenever the window changes DPI.
+func (t *hintTip) setMaxWidth(maxWidth int32) {
+	if t == nil || t.tip == 0 {
+		return
+	}
+	sendMessage(t.tip, TTM_SETMAXTIPWIDTH, 0, uintptr(maxWidth))
 }
 
 func (t *hintTip) toolInfo(owner, target HWND, text *uint16) TOOLINFOW {
