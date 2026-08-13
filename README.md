@@ -9,13 +9,14 @@ name, PID, full image path, and the file touched. One 2.8 MB `ReadWatch.exe`, on
 install, and it's running.
 
 - **Live view and a durable log.** Text, JSON Lines, or CSV, appended as events arrive.
-- **Privileged only while you're watching.** The service starts when you hit Start and stops when
-  you exit, taking its audit rules off your folders with it.
+- **Privileged only while ReadWatch is open.** The service is demand-start: it comes up with the
+  window, and exiting stops it, taking its audit rules off your folders with it. Nothing of
+  ReadWatch's runs as SYSTEM once you quit.
 - **Filters the noise.** Shell thumbnailing, search indexing and antivirus can easily outnumber
   the reads you're looking for. Exclude them by process name or exact image path — dropped inside
   the service, with a running count of what was suppressed so nothing hides silently.
-- **Cheap to leave running.** Idles at 0% CPU and ~10 MB; roughly 0.1 ms of CPU and 173 bytes of
-  log per event. It's an event subscription, not a polling loop.
+- **Cheap to leave running.** It's an event subscription, not a polling loop: no folder scanning,
+  no timers, nothing to do between reads.
 
 ## How it works
 
@@ -25,9 +26,10 @@ folders, subscribes to Security event **4663**, and turns the raw XML into a rea
 
 A **LocalSystem service** owns everything privileged; a **non-elevated viewer** talks to it over a
 local named pipe admitting only LocalSystem and the installing account. The service is
-`SERVICE_DEMAND_START` behind a protected DACL granting that account exactly
-`SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS` — enough for an ordinary window to run a
-SYSTEM service, too little for anything on the machine to repoint it.
+`SERVICE_DEMAND_START` behind a protected DACL granting that account start, stop, query and
+interrogate rights and nothing else — enough for an ordinary window to run a SYSTEM service, too
+little for anything on the machine to repoint it. Changing the configuration, rewriting the
+descriptor and deleting the service are all withheld, including from the owner.
 
 Before/after SACL snapshots mean a folder is restored only if the live SACL is still what
 ReadWatch applied. The audit policy is owned the same way.
@@ -43,12 +45,13 @@ build.cmd
 which is `go test ./...`, `go vet ./...`, then:
 
 ```bat
-go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.2.0" -o dist\ReadWatch.exe .\cmd\readwatch
+go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.2.1" -o dist\ReadWatch.exe .\cmd\readwatch
 ```
 
 `cmd/readwatch/rsrc_windows_amd64.syso` is checked in with the icon, version info and manifest, so
 a plain `go build` needs only Go. Regenerating it wants Python 3 + Clang:
-`python tools/make_resources.py --version 0.2.0.0`.
+`python tools/make_resources.py --version 0.2.1.0`. It has not been regenerated since 0.1.0, so the
+PE version resource reads `0.1.0.0` while `--version` reports the real release.
 
 ## Use
 
@@ -66,7 +69,8 @@ Prefer the exact path for anything you have several copies of; a machine typical
 noticing an unexpected reader. Nothing is excluded until you say so — the list lives in Settings.
 
 Closing the window hides it to the tray; **Exit** quits and stops the service. **Start ReadWatch
-at sign-in** launches it hidden in the tray on login.
+at sign-in** launches it hidden in the tray on login. **Keep the window on top** is in Settings, and
+hovering a row that is too narrow for its path shows the whole thing.
 
 ## Log
 
@@ -89,8 +93,8 @@ path, event record ID, and access mask.
 - The build is unsigned, so SmartScreen warns on first run.
 
 Install, the demand-start lifecycle, the service DACL boundary, SACL apply/remove and 4663 capture
-are exercised on Windows 11. Parser, log-writer, configuration and exclusion tests run portably and
-under the race detector; `go vet ./...` is clean unsuppressed.
+are exercised on Windows 11. Parser, log-writer, configuration and exclusion tests run portably;
+`go vet ./...` is clean unsuppressed.
 
 ## License
 

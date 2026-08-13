@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "VERSION=%~1"
-if "%VERSION%"=="" set "VERSION=0.1.0"
+if "%VERSION%"=="" set "VERSION=0.2.1"
 
 where go >nul 2>nul
 if errorlevel 1 (
