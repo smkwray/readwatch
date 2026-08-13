@@ -26,7 +26,13 @@ import (
 type FolderCapability struct {
 	Path     string
 	Identity settings.ObjectIdentity
-	Security HANDLE // reopened for ACCESS_SYSTEM_SECURITY, still the same object
+	Security HANDLE // opened by identity for ACCESS_SYSTEM_SECURITY, still the same object
+	// Owner is the handle the owner's own token opened, kept for the session. It
+	// is what pins the folder: Security asks for no data access, and Windows
+	// exempts attribute-only opens from share-mode enforcement, so Security
+	// alone does not stop a rename. Measured, not assumed - see
+	// TestOpenByIdentityHandoffKeepsRootPinned.
+	Owner HANDLE
 }
 
 type LogCapability struct {
@@ -52,6 +58,10 @@ func (b *BoundConfig) Close() {
 		if b.Folders[i].Security != 0 {
 			closeHandle(b.Folders[i].Security)
 			b.Folders[i].Security = 0
+		}
+		if b.Folders[i].Owner != 0 {
+			closeHandle(b.Folders[i].Owner)
+			b.Folders[i].Owner = 0
 		}
 	}
 	if b.Log.Master != 0 {
@@ -200,11 +210,15 @@ func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConf
 		return nil, revertErr, true
 	}
 
-	// The security handle is a reopen of the object already identified above, so
-	// the name is never consulted a second time.
+	// The owner-opened handles stay alive across the privileged open and then for
+	// the whole session. Their no-delete share mode is what prevents deletion,
+	// rename and file-ID reuse - both during the handoff, when a swap would
+	// defeat the identity check, and afterwards, when a rename would move the
+	// watched root away from the audit rule applied to it. The configured
+	// pathname is never consulted a second time.
 	upgradeErr := withPrivilege("SeSecurityPrivilege", func() error {
 		for i := range out.Folders {
-			secure, err := reopenForSecurity(userFolders[i])
+			secure, err := openByIdentity(out.Folders[i].Identity)
 			if err != nil {
 				return fmt.Errorf("%s: %w", out.Folders[i].Path, err)
 			}
@@ -212,6 +226,13 @@ func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConf
 		}
 		return nil
 	})
+	if upgradeErr == nil {
+		// Hand the owner handles to the capability, which now owns closing them.
+		for i := range out.Folders {
+			out.Folders[i].Owner = userFolders[i]
+		}
+		userFolders = nil
+	}
 	closeUserFolders()
 	if upgradeErr != nil {
 		out.Close()
@@ -565,24 +586,17 @@ func requireFinalPath(h HANDLE, expected string) error {
 	return nil
 }
 
-// reopenForSecurity gets the access needed to read and write audit entries
-// without going back to the pathname: ReOpenFile works from the handle.
-func reopenForSecurity(userHandle HANDLE) (HANDLE, error) {
-	r, _, e := procReOpenFile.Call(
-		uintptr(userHandle),
-		ACCESS_SYSTEM_SECURITY|READ_CONTROL|FILE_READ_ATTRIBUTES,
-		FILE_SHARE_READ|FILE_SHARE_WRITE,
-		FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,
-	)
-	if r == INVALID_HANDLE_VALUE || r == 0 {
-		return 0, winErr("ReOpenFile", e)
-	}
-	return HANDLE(r), nil
+// openByIdentity is both the privileged binder handoff and the recovery seam.
+// The stored path may name something else entirely, so the object is found by
+// its identity or not at all. ACCESS_SYSTEM_SECURITY is the only security-
+// descriptor right needed because ReadWatch reads and writes only the SACL.
+func openByIdentity(id settings.ObjectIdentity) (HANDLE, error) {
+	return openByIdentityWithAccess(id, ACCESS_SYSTEM_SECURITY|FILE_READ_ATTRIBUTES)
 }
 
-// openByIdentity is the recovery seam. After a crash the stored path may name
-// something else entirely, so the object is found by its identity or not at all.
-func openByIdentity(id settings.ObjectIdentity) (HANDLE, error) {
+// openByIdentityWithAccess exists so the Windows filesystem tests can exercise
+// the identity/share handoff without requiring SeSecurityPrivilege.
+func openByIdentityWithAccess(id settings.ObjectIdentity, desiredAccess uintptr) (HANDLE, error) {
 	volume, _, e := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(strings.TrimRight(id.VolumeGUID, `\`)))),
 		FILE_READ_ATTRIBUTES,
@@ -607,13 +621,13 @@ func openByIdentity(id settings.ObjectIdentity) (HANDLE, error) {
 	r, _, e := procOpenFileById.Call(
 		volume,
 		uintptr(unsafe.Pointer(&descriptor)),
-		ACCESS_SYSTEM_SECURITY|READ_CONTROL|FILE_READ_ATTRIBUTES,
+		desiredAccess,
 		FILE_SHARE_READ|FILE_SHARE_WRITE,
 		0,
 		FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,
 	)
 	if r == INVALID_HANDLE_VALUE || r == 0 {
-		return 0, fmt.Errorf("find the recorded folder by identity: %w", e)
+		return 0, fmt.Errorf("open the recorded folder by identity: %w", winErr("OpenFileById", e))
 	}
 	h := HANDLE(r)
 	current, err := captureIdentity(h, id.VolumeGUID)
