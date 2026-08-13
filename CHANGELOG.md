@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.0 — 2026-08-13
+
+A security review found that the service validated a folder or log path as you, then later resolved
+that same path again as SYSTEM. Anything able to change what the path pointed at in between could
+have made SYSTEM act on a different object. Closing that changed several things you can see.
+
+> **Upgrading from 0.1.x or 0.2.x:** stop monitoring in the old version before upgrading. The
+> installer refuses to replace a copy that still has audit rules applied, because those records
+> identify folders by path and cannot be undone reliably after the upgrade.
+
+### Changed behaviour
+
+- **Junctions, symbolic links, mounted volumes and cloud placeholders are refused** anywhere in a
+  watched folder's path or its log's path, rather than followed. If a folder you watch sits behind
+  one, it can no longer be watched.
+- **The log file's folder must already exist.** ReadWatch creates the log file itself, with your
+  account's permissions, but no longer creates directories.
+- **Watched folders cannot be renamed or deleted while monitoring is on.** The audit rule and the
+  folder stay together.
+- Monitoring resumes when you open ReadWatch rather than when the service starts, and a folder or
+  log that is no longer the same object as when you set it up is refused with a message instead of
+  being used.
+- Uninstall removes everything immediately except the running program file and its folder, which
+  Windows deletes at the next restart.
+
+### Security
+
+- Folders and the log are opened under your token and held open; every privileged operation goes
+  through those handles instead of re-resolving a name.
+- Audit rules are read and written through the handle, preserving whether the folder's audit entries
+  were protected from inheritance.
+- Every audit change is journalled before it is made, identified by volume and file identity rather
+  than by path, so a crash or power loss can be undone on the next start.
+- The uninstaller elevates the installed program file rather than a copy staged in your Temp folder,
+  and refuses to run as anything but the installed copy.
+- Installation locations come from Windows rather than from environment variables an elevated
+  process inherits.
+- The service now stops itself when no viewer is connected, so killing ReadWatch rather than closing
+  it can no longer leave a SYSTEM process behind.
+
 ## 0.2.1 — 2026-08-13
 
 Viewer only. The service and its privilege boundary are unchanged.

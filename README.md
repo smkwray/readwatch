@@ -5,7 +5,7 @@
 </div>
 
 Point ReadWatch at a folder and it shows you, live, every process that reads a file inside it —
-name, PID, full image path, and the file touched. One 2.8 MB `ReadWatch.exe`, one UAC prompt at
+name, PID, full image path, and the file touched. One 2.9 MB `ReadWatch.exe`, one UAC prompt at
 install, and it's running.
 
 - **Live view and a durable log.** Text, JSON Lines, or CSV, appended as events arrive.
@@ -34,8 +34,14 @@ interrogate rights and nothing else — enough for an ordinary window to run a S
 little for anything on the machine to repoint it. Changing the configuration, rewriting the
 descriptor and deleting the service are all withheld, including from the owner.
 
+Your folders and log file are opened under **your** account when you press Start or Save, and the
+service keeps those handles: every privileged operation goes through them rather than looking the
+path up a second time, so nothing can be swapped for something else in between. Each folder is
+recorded by volume and file identity, not by name.
+
 Before/after SACL snapshots mean a folder is restored only if the live SACL is still what
-ReadWatch applied. The audit policy is owned the same way.
+ReadWatch applied, and each change is written down before it is made, so an interrupted one can be
+undone on the next start. The audit policy is owned the same way.
 
 ## Build
 
@@ -48,12 +54,12 @@ build.cmd
 which is `go test ./...`, `go vet ./...`, then:
 
 ```bat
-go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.2.1" -o dist\ReadWatch.exe .\cmd\readwatch
+go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.3.0" -o dist\ReadWatch.exe .\cmd\readwatch
 ```
 
 `cmd/readwatch/rsrc_windows_amd64.syso` is checked in with the icon, version info and manifest, so
 a plain `go build` needs only Go. Regenerating it wants Python 3 + Clang:
-`python tools/make_resources.py --version 0.2.1.0`. It has not been regenerated since 0.1.0, so the
+`python tools/make_resources.py --version 0.3.0.0`. It has not been regenerated since 0.1.0, so the
 PE version resource reads `0.1.0.0` while `--version` reports the real release.
 
 ## Use
@@ -88,6 +94,13 @@ path, event record ID, and access mask.
 
 - Watches local folders on filesystems that support Windows auditing. For a network share, run
   ReadWatch on the file server against its local path.
+- **Junctions, symbolic links, mounted volumes and cloud placeholders are refused**, at any point in
+  the path — not followed. ReadWatch has to be able to prove that the folder it later applies an
+  audit rule to is the folder you approved, and a link is exactly what can stop being that.
+- **The folder holding your log file has to exist already.** ReadWatch writes the log with your own
+  account's permissions and will create the file, but not its folder.
+- Uninstalling removes everything immediately except the program file itself, which Windows deletes
+  at the next restart because it is running at the time.
 - Event 4663 reports an exercised access right, not which bytes were read.
 - Applying the audit entry rewrites the security descriptor of every file already in the folder —
   reversible, but not instant on a large tree.
@@ -96,8 +109,10 @@ path, event record ID, and access mask.
 - The build is unsigned, so SmartScreen warns on first run.
 
 Install, the demand-start lifecycle, the service DACL boundary, SACL apply/remove and 4663 capture
-are exercised on Windows 11. Parser, log-writer, configuration and exclusion tests run portably;
-`go vet ./...` is clean unsuppressed.
+are exercised on Windows 11. The path-binding rules have tests that run against the real filesystem:
+a junction is refused as a target and as an ancestor, a folder's identity survives a rename and
+distinguishes a replacement at the same path, and a watched folder cannot be renamed while it is
+held. `go vet ./...` is clean unsuppressed.
 
 ## License
 
