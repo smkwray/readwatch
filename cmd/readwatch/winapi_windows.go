@@ -28,6 +28,15 @@ type (
 type POINT struct{ X, Y int32 }
 type SIZE struct{ Cx, Cy int32 }
 type RECT struct{ Left, Top, Right, Bottom int32 }
+
+// MONITORINFO carries the work area - the monitor less the taskbar and any
+// other appbar - which is what a popup has to stay inside.
+type MONITORINFO struct {
+	CbSize    uint32
+	RcMonitor RECT
+	RcWork    RECT
+	DwFlags   uint32
+}
 type GUID struct {
 	Data1 uint32
 	Data2 uint16
@@ -586,11 +595,14 @@ const (
 	TTM_TRACKACTIVATE  = WM_USER + 17
 	TTM_TRACKPOSITION  = WM_USER + 18
 	TTM_SETMAXTIPWIDTH = WM_USER + 24
+	TTM_GETBUBBLESIZE  = WM_USER + 30
 	TTM_ADDTOOLW       = WM_USER + 50
 	TTM_DELTOOLW       = WM_USER + 51
 	TTM_UPDATETIPTEXTW = WM_USER + 57
 	TME_HOVER          = 0x00000001
 	TME_LEAVE          = 0x00000002
+
+	MONITOR_DEFAULTTONEAREST = 0x00000002
 
 	DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ^uintptr(3)
 	DWMWA_USE_IMMERSIVE_DARK_MODE              = 20
@@ -760,46 +772,51 @@ var (
 	procFlushFileBuffers        = kernel32.NewProc("FlushFileBuffers")
 	procGetFullPathNameW        = kernel32.NewProc("GetFullPathNameW")
 
-	procRegisterClassExW              = user32.NewProc("RegisterClassExW")
-	procRegisterWindowMessageW        = user32.NewProc("RegisterWindowMessageW")
-	procCreateWindowExW               = user32.NewProc("CreateWindowExW")
-	procDefWindowProcW                = user32.NewProc("DefWindowProcW")
-	procShowWindow                    = user32.NewProc("ShowWindow")
-	procUpdateWindow                  = user32.NewProc("UpdateWindow")
-	procGetMessageW                   = user32.NewProc("GetMessageW")
-	procIsDialogMessageW              = user32.NewProc("IsDialogMessageW")
-	procTranslateMessage              = user32.NewProc("TranslateMessage")
-	procDispatchMessageW              = user32.NewProc("DispatchMessageW")
-	procPostQuitMessage               = user32.NewProc("PostQuitMessage")
-	procPostMessageW                  = user32.NewProc("PostMessageW")
-	procSendMessageW                  = user32.NewProc("SendMessageW")
-	procGetClientRect                 = user32.NewProc("GetClientRect")
-	procGetWindowRect                 = user32.NewProc("GetWindowRect")
-	procMoveWindow                    = user32.NewProc("MoveWindow")
-	procSetWindowPos                  = user32.NewProc("SetWindowPos")
-	procBeginPaint                    = user32.NewProc("BeginPaint")
-	procEndPaint                      = user32.NewProc("EndPaint")
-	procInvalidateRect                = user32.NewProc("InvalidateRect")
-	procLoadCursorW                   = user32.NewProc("LoadCursorW")
-	procLoadIconW                     = user32.NewProc("LoadIconW")
-	procLoadImageW                    = user32.NewProc("LoadImageW")
-	procSetWindowTextW                = user32.NewProc("SetWindowTextW")
-	procGetWindowTextLengthW          = user32.NewProc("GetWindowTextLengthW")
-	procGetWindowTextW                = user32.NewProc("GetWindowTextW")
-	procEnableWindow                  = user32.NewProc("EnableWindow")
-	procDestroyWindow                 = user32.NewProc("DestroyWindow")
-	procIsWindowVisible               = user32.NewProc("IsWindowVisible")
-	procSetForegroundWindow           = user32.NewProc("SetForegroundWindow")
-	procSetFocus                      = user32.NewProc("SetFocus")
-	procGetWindowLongPtrW             = user32.NewProc("GetWindowLongPtrW")
-	procSetWindowLongPtrW             = user32.NewProc("SetWindowLongPtrW")
-	procCallWindowProcW               = user32.NewProc("CallWindowProcW")
-	procGetDlgCtrlID                  = user32.NewProc("GetDlgCtrlID")
-	procCreatePopupMenu               = user32.NewProc("CreatePopupMenu")
-	procAppendMenuW                   = user32.NewProc("AppendMenuW")
-	procTrackPopupMenu                = user32.NewProc("TrackPopupMenu")
-	procDestroyMenu                   = user32.NewProc("DestroyMenu")
-	procGetCursorPos                  = user32.NewProc("GetCursorPos")
+	procRegisterClassExW       = user32.NewProc("RegisterClassExW")
+	procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")
+	procCreateWindowExW        = user32.NewProc("CreateWindowExW")
+	procDefWindowProcW         = user32.NewProc("DefWindowProcW")
+	procShowWindow             = user32.NewProc("ShowWindow")
+	procUpdateWindow           = user32.NewProc("UpdateWindow")
+	procGetMessageW            = user32.NewProc("GetMessageW")
+	procIsDialogMessageW       = user32.NewProc("IsDialogMessageW")
+	procTranslateMessage       = user32.NewProc("TranslateMessage")
+	procDispatchMessageW       = user32.NewProc("DispatchMessageW")
+	procPostQuitMessage        = user32.NewProc("PostQuitMessage")
+	procPostMessageW           = user32.NewProc("PostMessageW")
+	procSendMessageW           = user32.NewProc("SendMessageW")
+	procGetClientRect          = user32.NewProc("GetClientRect")
+	procGetWindowRect          = user32.NewProc("GetWindowRect")
+	procMoveWindow             = user32.NewProc("MoveWindow")
+	procSetWindowPos           = user32.NewProc("SetWindowPos")
+	procBeginPaint             = user32.NewProc("BeginPaint")
+	procEndPaint               = user32.NewProc("EndPaint")
+	procInvalidateRect         = user32.NewProc("InvalidateRect")
+	procLoadCursorW            = user32.NewProc("LoadCursorW")
+	procLoadIconW              = user32.NewProc("LoadIconW")
+	procLoadImageW             = user32.NewProc("LoadImageW")
+	procSetWindowTextW         = user32.NewProc("SetWindowTextW")
+	procGetWindowTextLengthW   = user32.NewProc("GetWindowTextLengthW")
+	procGetWindowTextW         = user32.NewProc("GetWindowTextW")
+	procEnableWindow           = user32.NewProc("EnableWindow")
+	procDestroyWindow          = user32.NewProc("DestroyWindow")
+	procIsWindowVisible        = user32.NewProc("IsWindowVisible")
+	procSetForegroundWindow    = user32.NewProc("SetForegroundWindow")
+	procSetFocus               = user32.NewProc("SetFocus")
+	procGetWindowLongPtrW      = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtrW      = user32.NewProc("SetWindowLongPtrW")
+	procCallWindowProcW        = user32.NewProc("CallWindowProcW")
+	procGetDlgCtrlID           = user32.NewProc("GetDlgCtrlID")
+	procCreatePopupMenu        = user32.NewProc("CreatePopupMenu")
+	procAppendMenuW            = user32.NewProc("AppendMenuW")
+	procTrackPopupMenu         = user32.NewProc("TrackPopupMenu")
+	procDestroyMenu            = user32.NewProc("DestroyMenu")
+	procGetCursorPos           = user32.NewProc("GetCursorPos")
+	// MonitorFromRect rather than MonitorFromPoint: POINT is an 8-byte struct
+	// passed by value, which x64 hands over in a single register, and getting
+	// that wrong through LazyProc.Call is silent. A rect is a pointer.
+	procMonitorFromRect               = user32.NewProc("MonitorFromRect")
+	procGetMonitorInfoW               = user32.NewProc("GetMonitorInfoW")
 	procMessageBoxW                   = user32.NewProc("MessageBoxW")
 	procSetProcessDpiAwarenessContext = user32.NewProc("SetProcessDpiAwarenessContext")
 	procGetDpiForWindow               = user32.NewProc("GetDpiForWindow")

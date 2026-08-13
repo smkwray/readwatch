@@ -82,20 +82,83 @@ func (t *hintTip) detach(owner, target HWND) {
 	sendMessage(t.tip, TTM_DELTOOLW, 0, uintptr(unsafe.Pointer(&ti)))
 }
 
-// show places the hint below and right of the pointer. A tip drawn under the
-// pointer takes the mouse off the control it describes, which fires
-// WM_MOUSELEAVE, which hides the tip: a flicker loop.
-func (t *hintTip) show(owner, target HWND, text string, x, y int32) {
+// show places the hint near the pointer and inside the monitor it is on.
+func (t *hintTip) show(owner, target HWND, text string, dpi uint32) {
 	if t == nil || t.tip == 0 || text == "" {
 		return
 	}
 	t.buf = syscall.StringToUTF16(text)
 	ti := t.toolInfo(owner, target, &t.buf[0])
 	sendMessage(t.tip, TTM_UPDATETIPTEXTW, 0, uintptr(unsafe.Pointer(&ti)))
+	x, y := t.position(dpi, &ti)
 	sendMessage(t.tip, TTM_TRACKPOSITION, 0, makelparam(x, y))
 	sendMessage(t.tip, TTM_TRACKACTIVATE, 1, uintptr(unsafe.Pointer(&ti)))
 	runtime.KeepAlive(t.buf)
 	t.owner, t.target = owner, target
+}
+
+// position puts the hint below and right of the pointer, then folds it back
+// onto the work area of the monitor the pointer is on - the longest paths are
+// exactly the ones that run off a right-hand edge, and a hint you cannot read
+// is worse than none.
+//
+// The fold is a flip to the other side of the pointer, never a slide along the
+// edge, because the pointer must never end up inside the bubble: that takes the
+// mouse off the control the hint describes, which fires WM_MOUSELEAVE, which
+// hides the hint, which puts the mouse back - a flicker loop. Flipping keeps a
+// gap on one axis whatever the other axis does, so the final clamp below cannot
+// close it.
+func (t *hintTip) position(dpi uint32, ti *TOOLINFOW) (int32, int32) {
+	var pt POINT
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	scale := func(v int32) int32 { return int32(int64(v) * int64(dpi) / 96) }
+	gapX, gapY := scale(16), scale(24)
+	x, y := pt.X+gapX, pt.Y+gapY
+
+	size := t.bubbleSize(ti)
+	work, ok := cursorWorkArea(pt)
+	if !ok || size.Cx <= 0 || size.Cy <= 0 {
+		return x, y
+	}
+	if x+size.Cx > work.Right {
+		x = pt.X - gapX - size.Cx
+	}
+	if y+size.Cy > work.Bottom {
+		y = pt.Y - scale(8) - size.Cy
+	}
+	// A bubble wider or taller than the work area still has to start somewhere
+	// on screen; clipping at the far edge beats drawing off the near one.
+	if x < work.Left {
+		x = work.Left
+	}
+	if y < work.Top {
+		y = work.Top
+	}
+	return x, y
+}
+
+// bubbleSize asks the tooltip how large it would be for the text it is now
+// carrying, which is the only way to know before it is on screen. It reflects
+// TTM_SETMAXTIPWIDTH, so a wrapped multi-line path measures as it will appear.
+func (t *hintTip) bubbleSize(ti *TOOLINFOW) SIZE {
+	r := sendMessage(t.tip, TTM_GETBUBBLESIZE, 0, uintptr(unsafe.Pointer(ti)))
+	return SIZE{Cx: int32(loword(r)), Cy: int32(hiword(r))}
+}
+
+// cursorWorkArea is the usable area of the monitor under the pointer: the
+// taskbar and any other appbar are excluded, so a hint near the bottom of the
+// screen does not hide behind it.
+func cursorWorkArea(pt POINT) (RECT, bool) {
+	rc := RECT{Left: pt.X, Top: pt.Y, Right: pt.X + 1, Bottom: pt.Y + 1}
+	monitor, _, _ := procMonitorFromRect.Call(uintptr(unsafe.Pointer(&rc)), MONITOR_DEFAULTTONEAREST)
+	if monitor == 0 {
+		return RECT{}, false
+	}
+	mi := MONITORINFO{CbSize: uint32(unsafe.Sizeof(MONITORINFO{}))}
+	if r, _, _ := procGetMonitorInfoW.Call(monitor, uintptr(unsafe.Pointer(&mi))); r == 0 {
+		return RECT{}, false
+	}
+	return mi.RcWork, true
 }
 
 func (t *hintTip) hide() {
@@ -167,13 +230,6 @@ func textWidth(hwnd HWND, font HFONT, text string) int32 {
 	return size.Cx
 }
 
-func cursorHintPosition(dpi uint32) (int32, int32) {
-	var pt POINT
-	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-	scale := func(v int32) int32 { return int32(int64(v) * int64(dpi) / 96) }
-	return pt.X + scale(16), pt.Y + scale(24)
-}
-
 // mouseX and mouseY unpack a mouse message's client coordinates, which are
 // signed: the pointer can be left of or above the client area while captured.
 func mouseX(lParam unsafe.Pointer) int32 { return int32(int16(loword(uintptr(lParam)))) }
@@ -211,8 +267,7 @@ func (u *AppUI) hintShow(x, y int32) {
 	if text == "" || textWidth(u.list, u.font, text) <= u.cellTextWidth(sub) {
 		return
 	}
-	tipX, tipY := cursorHintPosition(u.dpi)
-	u.hint.show(u.hwnd, u.list, text, tipX, tipY)
+	u.hint.show(u.hwnd, u.list, text, u.dpi)
 }
 
 // cellTextWidth is the room a cell has for text: the column, less the list
@@ -313,8 +368,7 @@ func (s *SettingsUI) hintShow(list HWND, x, y int32) {
 	if textWidth(list, s.font, text) <= rc.Right-rc.Left-s.scale(8) {
 		return
 	}
-	tipX, tipY := cursorHintPosition(s.dpi)
-	s.app.hint.show(s.hwnd, list, text, tipX, tipY)
+	s.app.hint.show(s.hwnd, list, text, s.dpi)
 }
 
 func (s *SettingsUI) hintClear() {
