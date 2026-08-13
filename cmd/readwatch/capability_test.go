@@ -48,11 +48,13 @@ func TestValidateLexicalPathRejections(t *testing.T) {
 
 func TestValidateLexicalPathNormalises(t *testing.T) {
 	cases := map[string]string{
-		`C:\Docs\Sub`:                `C:\Docs\Sub`,
-		`c:\docs\sub`:                `C:\docs\sub`,
-		`C:/Docs/Sub`:                `C:\Docs\Sub`,
-		`C:\Docs\Sub\`:               `C:\Docs\Sub`,
-		`C:\AI\image\ComfyUI\output`: `C:\AI\image\ComfyUI\output`,
+		`C:\Docs\Sub`:  `C:\Docs\Sub`,
+		`c:\docs\sub`:  `C:\docs\sub`,
+		`C:/Docs/Sub`:  `C:\Docs\Sub`,
+		`C:\Docs\Sub\`: `C:\Docs\Sub`,
+		// A deep path with an all-caps component: the case a real report showed
+		// rendered wrongly, which turned out to be the path itself, not a defect.
+		`C:\AI\Renders\batch\output`: `C:\AI\Renders\batch\output`,
 	}
 	for in, want := range cases {
 		got, err := validateLexicalPath(in)
