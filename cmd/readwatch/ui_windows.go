@@ -27,6 +27,7 @@ const (
 	wmAppActivate = WM_APP + 4
 	wmAppTray     = WM_APP + 5
 	wmAppExit     = WM_APP + 6
+	wmAppStatus   = WM_APP + 7
 
 	idStart    = 101
 	idSettings = 102
@@ -53,14 +54,25 @@ var (
 	mainUI              *AppUI
 )
 
-// listSubclassProc exists only to catch the header's NM_CUSTOMDRAW, which the
-// list view receives as the header's parent and never forwards.
+// listSubclassProc catches the header's NM_CUSTOMDRAW, which the list view
+// receives as the header's parent and never forwards, and the pointer messages
+// that drive the hover hint over clipped cells.
 func listSubclassProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Pointer) uintptr {
 	u := mainUI
 	if u != nil && msg == WM_NOTIFY && u.header != 0 {
 		hdr := (*NMHDR)(lParam)
 		if hdr.HwndFrom == u.header && hdr.Code == NM_CUSTOMDRAW {
 			return u.drawHeader((*NMCUSTOMDRAW)(lParam))
+		}
+	}
+	if u != nil {
+		switch msg {
+		case WM_MOUSEMOVE:
+			u.hintMouseMove(mouseX(lParam), mouseY(lParam))
+		case WM_MOUSEHOVER:
+			u.hintShow(mouseX(lParam), mouseY(lParam))
+		case WM_MOUSELEAVE, WM_MOUSEWHEEL, WM_LBUTTONDOWN, WM_RBUTTONDOWN:
+			u.hintClear()
 		}
 	}
 	if u != nil && u.origListProc != 0 {
@@ -169,6 +181,8 @@ type AppUI struct {
 	iconSmall    HICON
 	theme        uiTheme
 	dpi          uint32
+	hint         *hintTip
+	hover        hintHover
 
 	ownerSID string
 	startup  bool
@@ -188,6 +202,12 @@ type AppUI struct {
 	totalEvents  uint64
 	liveDropped  atomic.Uint64
 	lastDispText []uint16
+	// The service's counters run from when monitoring started; these baselines
+	// are what Clear resets them to, so the summary always describes the rows
+	// that are actually on screen.
+	baseSuppressed  uint64
+	baseLogDropped  uint64
+	baseLiveDropped uint64
 
 	errMu        sync.Mutex
 	pendingError string
@@ -200,8 +220,12 @@ type AppUI struct {
 	taskbarCreatedMsg uint32
 	exiting           atomic.Bool
 	commandBusy       atomic.Bool
-	startupDecided    bool
-	firstRunPrompted  bool
+	// pending is the command in flight, and only the UI thread touches it: the
+	// status line says what is happening while it runs.
+	pending          string
+	alwaysOnTop      bool
+	startupDecided   bool
+	firstRunPrompted bool
 }
 
 func RunUI(startup bool) error {
@@ -220,7 +244,8 @@ func RunUI(startup bool) error {
 	}
 
 	procSetProcessDpiAwarenessContext.Call(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-	icc := INITCOMMONCONTROLSEX{DwSize: uint32(unsafe.Sizeof(INITCOMMONCONTROLSEX{})), DwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES}
+	// ICC_BAR_CLASSES registers the tooltip class the hover hints need.
+	icc := INITCOMMONCONTROLSEX{DwSize: uint32(unsafe.Sizeof(INITCOMMONCONTROLSEX{})), DwICC: ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES}
 	procInitCommonControlsEx.Call(uintptr(unsafe.Pointer(&icc)))
 
 	u := &AppUI{ownerSID: ownerSID, startup: startup, mutex: mutex, ring: newEventRing(1000)}
@@ -328,7 +353,31 @@ func (u *AppUI) createWindow() error {
 	u.createControls()
 	u.applyTheme(true)
 	u.layout()
+	u.alwaysOnTop = alwaysOnTopPreference()
+	u.applyAlwaysOnTop()
 	return nil
+}
+
+// setAlwaysOnTop is a viewer preference, not part of the watched configuration:
+// it needs no elevation and no running service, so it is applied here and kept
+// in the user's own registry hive rather than sent to the service.
+func (u *AppUI) setAlwaysOnTop(on bool) {
+	if u.alwaysOnTop == on {
+		return
+	}
+	u.alwaysOnTop = on
+	u.applyAlwaysOnTop()
+	if err := setAlwaysOnTopPreference(on); err != nil {
+		u.queueError(err)
+	}
+}
+
+func (u *AppUI) applyAlwaysOnTop() {
+	after := HWND_NOTOPMOST
+	if u.alwaysOnTop {
+		after = HWND_TOPMOST
+	}
+	procSetWindowPos.Call(uintptr(u.hwnd), after, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE)
 }
 
 func (u *AppUI) createControls() {
@@ -337,7 +386,9 @@ func (u *AppUI) createControls() {
 	u.startBtn = createControl("BUTTON", "Start", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idStart)
 	u.settingsBtn = createControl("BUTTON", "Settings", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idSettings)
 	u.list = createControl("SysListView32", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_OWNERDATA|LVS_NOSORTHEADER, WS_EX_CLIENTEDGE, u.hwnd, 0)
-	sendMessage(u.list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_LABELTIP)
+	// No LVS_EX_LABELTIP: it unfolds the first column only, and the hover hint
+	// below covers every column including Path, which is the one that clips.
+	sendMessage(u.list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER)
 	for i, c := range []struct {
 		name string
 		w    int32
@@ -357,6 +408,9 @@ func (u *AppUI) createControls() {
 	if prev, _, _ := procSetWindowLongPtrW.Call(uintptr(u.list), GWLP_WNDPROC, listSubclassProcPtr); prev != 0 {
 		u.origListProc = prev
 	}
+	u.hover.reset()
+	u.hint = newHintTip(u.hwnd, u.scale(560))
+	u.hint.attach(u.hwnd, u.list)
 	u.summary = createControl("STATIC", "0 folders · 0 events", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, u.hwnd, 0)
 	u.openBtn = createControl("BUTTON", "Open log", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idOpenLog)
 	u.clearBtn = createControl("BUTTON", "Clear", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, u.hwnd, idClear)
@@ -674,6 +728,16 @@ func (u *AppUI) drainState() {
 		u.firstRunPrompted = true
 		u.openSettings()
 	}
+	// A state that arrived after the read above but before the flag was cleared
+	// has no message of its own, and nothing else would post one: the window
+	// would keep showing the previous state until some later update happened to
+	// come along. drainEvents has always re-checked; this did not.
+	u.stateMu.Lock()
+	more := u.pendingState != nil
+	u.stateMu.Unlock()
+	if more && u.statePosted.CompareAndSwap(false, true) {
+		postMessage(u.hwnd, wmAppState, 0, 0)
+	}
 }
 
 func (u *AppUI) drainEvents() {
@@ -690,6 +754,9 @@ func (u *AppUI) drainEvents() {
 		sendMessage(u.list, LVM_SETITEMCOUNT, uintptr(u.ring.Len()), LVSICF_NOSCROLL)
 		procInvalidateRect.Call(uintptr(u.list), 0, 0)
 		u.updateSummary()
+		// Newest first, so every arrival pushes the rows down past a resting
+		// pointer and any visible hint now describes a different row.
+		u.hintClear()
 	}
 	u.eventMu.Lock()
 	more := len(u.pendingEvent) > 0
@@ -710,32 +777,105 @@ func (u *AppUI) drainError() {
 	}
 }
 
+// cellText is the single source of what a cell says: the list view asks for it
+// on paint, the hover hint asks for it to decide whether it was clipped.
+func (u *AppUI) cellText(index, column int) string {
+	e, ok := u.ring.Newest(index)
+	if !ok {
+		return ""
+	}
+	switch column {
+	case 0:
+		return e.Time.Local().Format("15:04:05.000")
+	case 1:
+		return e.Process
+	case 2:
+		return strconv.FormatUint(uint64(e.PID), 10)
+	case 3:
+		return e.Path
+	}
+	return ""
+}
+
 func (u *AppUI) updateStatus() {
 	state := u.state
-	if !state.ServiceReady {
+	pending := u.pendingLabel()
+	switch {
+	case pending != "":
+		setWindowText(u.status, pending)
+	case !state.ServiceReady:
 		// Not connected is an ordinary state now, not a fault: with a
 		// demand-start service the viewer briefly has no peer at launch, and
 		// after a failed start this button is the only way back. Disabling it
 		// here left the window permanently inert - no Start, no Settings.
 		setWindowText(u.status, "○  Connecting…")
 		setWindowText(u.startBtn, "Start")
-		procEnableWindow.Call(uintptr(u.startBtn), 1)
-	} else if state.Running {
+	case state.Running:
 		setWindowText(u.status, "●  Monitoring")
 		setWindowText(u.startBtn, "Stop")
-		procEnableWindow.Call(uintptr(u.startBtn), 1)
-	} else {
+	default:
 		setWindowText(u.status, "○  Stopped")
 		setWindowText(u.startBtn, "Start")
-		procEnableWindow.Call(uintptr(u.startBtn), 1)
 	}
-	procEnableWindow.Call(uintptr(u.settingsBtn), boolToUintptr(state.ServiceReady))
+	// A command in flight owns both buttons. They used to be disabled by the
+	// caller and re-enabled here by the next state broadcast, which arrives
+	// while the command is still running: the button came back to life
+	// mid-command and the click it then accepted was silently discarded.
+	idle := pending == ""
+	procEnableWindow.Call(uintptr(u.startBtn), boolToUintptr(idle))
+	procEnableWindow.Call(uintptr(u.settingsBtn), boolToUintptr(idle && state.ServiceReady))
 	procEnableWindow.Call(uintptr(u.openBtn), boolToUintptr(state.Config.LogPath != ""))
 	u.updateSummary()
 	u.updateTrayTip()
-	if state.LastError != "" {
+	if state.LastError != "" && idle {
 		setWindowText(u.status, "⚠  "+state.LastError)
 	}
+}
+
+// pendingLabel names the command in flight. Start and Stop drop it the moment
+// the service reports the state they were heading for, which is what keeps
+// "Starting…" a transition rather than a label outliving its transition: the
+// new state usually broadcasts before the command call returns. The marker is
+// the service's actual state, not the requested one - the dot goes solid when
+// monitoring is really on.
+func (u *AppUI) pendingLabel() string {
+	switch u.pending {
+	case protocol.CmdStart:
+		if !u.state.Running {
+			return "○  Starting…"
+		}
+	case protocol.CmdStop:
+		if u.state.Running {
+			return "●  Stopping…"
+		}
+	case protocol.CmdApply:
+		// Apply re-applies the audit rule to every watched folder, the slowest
+		// thing this window asks for and previously the least visible.
+		dot := "○"
+		if u.state.Running {
+			dot = "●"
+		}
+		return dot + "  Applying changes…"
+	}
+	return ""
+}
+
+// beginCommand marks a command in flight and hands the status line and buttons
+// to updateStatus for the duration.
+func (u *AppUI) beginCommand(command string) bool {
+	if !u.commandBusy.CompareAndSwap(false, true) {
+		return false
+	}
+	u.pending = command
+	u.updateStatus()
+	return true
+}
+
+// endCommand runs on the command's own goroutine, so it tells the UI thread by
+// message rather than touching the window.
+func (u *AppUI) endCommand() {
+	u.commandBusy.Store(false)
+	postMessage(u.hwnd, wmAppStatus, 0, 0)
 }
 
 func boolToUintptr(v bool) uintptr {
@@ -748,19 +888,31 @@ func boolToUintptr(v bool) uintptr {
 func (u *AppUI) updateSummary() {
 	folders := len(u.state.Config.Folders)
 	text := fmt.Sprintf("%d %s · %d events", folders, plural(folders, "folder", "folders"), u.totalEvents)
-	if u.state.LogDropped > 0 {
-		text += fmt.Sprintf(" · %d log events dropped", u.state.LogDropped)
+	if dropped := since(u.state.LogDropped, &u.baseLogDropped); dropped > 0 {
+		text += fmt.Sprintf(" · %d log events dropped", dropped)
 	}
-	liveDropped := u.state.LiveDropped + u.liveDropped.Load()
-	if liveDropped > 0 {
-		text += fmt.Sprintf(" · %d live updates dropped", liveDropped)
+	if dropped := since(u.state.LiveDropped+u.liveDropped.Load(), &u.baseLiveDropped); dropped > 0 {
+		text += fmt.Sprintf(" · %d live updates dropped", dropped)
 	}
 	// Suppressed reads are never silently hidden: the count is the user's
-	// evidence that filtering is not concealing a reader they care about.
-	if u.state.Suppressed > 0 {
-		text += fmt.Sprintf(" · %d excluded", u.state.Suppressed)
+	// evidence that filtering is not concealing a reader they care about. It
+	// counts reads, not processes, so it says so - "428 excluded" next to four
+	// exclusion entries reads like a broken number.
+	if suppressed := since(u.state.Suppressed, &u.baseSuppressed); suppressed > 0 {
+		text += fmt.Sprintf(" · %d reads excluded", suppressed)
 	}
 	setWindowText(u.summary, text)
+}
+
+// since reports a service counter relative to the last Clear, so every number
+// in the summary describes the same span as the rows on screen. The service
+// zeroes these when monitoring restarts, so a value under the baseline means
+// the baseline is stale, not that the count went backwards.
+func since(current uint64, base *uint64) uint64 {
+	if current < *base {
+		*base = 0
+	}
+	return current - *base
 }
 
 func plural(n int, one, many string) string {
@@ -771,13 +923,11 @@ func plural(n int, one, many string) string {
 }
 
 func (u *AppUI) runCommand(command string, cfg *settings.PublicConfig) {
-	if !u.commandBusy.CompareAndSwap(false, true) {
+	if !u.beginCommand(command) {
 		return
 	}
-	procEnableWindow.Call(uintptr(u.startBtn), 0)
-	procEnableWindow.Call(uintptr(u.settingsBtn), 0)
 	go func() {
-		defer u.commandBusy.Store(false)
+		defer u.endCommand()
 		u.clientMu.RLock()
 		client := u.client
 		u.clientMu.RUnlock()
@@ -863,9 +1013,13 @@ func filepathDir(path string) string {
 func (u *AppUI) clearView() {
 	u.ring.Clear()
 	u.totalEvents = 0
+	u.baseSuppressed = u.state.Suppressed
+	u.baseLogDropped = u.state.LogDropped
+	u.baseLiveDropped = u.state.LiveDropped + u.liveDropped.Load()
 	sendMessage(u.list, LVM_SETITEMCOUNT, 0, LVSICF_NOSCROLL)
 	procInvalidateRect.Call(uintptr(u.list), 0, 1)
 	u.updateSummary()
+	u.hintClear()
 }
 
 func (u *AppUI) show() {
@@ -875,6 +1029,7 @@ func (u *AppUI) show() {
 }
 
 func (u *AppUI) hide() {
+	u.hintClear()
 	procShowWindow.Call(uintptr(u.hwnd), SW_HIDE)
 }
 
@@ -1031,9 +1186,15 @@ func (u *AppUI) showTrayMenu() {
 	if u.state.Running {
 		toggle = "Stop monitoring"
 	}
-	appendMenu(menu, MF_STRING, trayToggle, toggle)
+	// The two entries a command in flight would refuse are grayed rather than
+	// left live and silently ignored, matching the buttons in the window.
+	busy := uintptr(MF_STRING)
+	if u.commandBusy.Load() {
+		busy |= MF_GRAYED
+	}
+	appendMenu(menu, busy, trayToggle, toggle)
 	appendMenu(menu, MF_STRING, trayOpenLog, "Open log")
-	appendMenu(menu, MF_STRING, traySettings, "Settings")
+	appendMenu(menu, busy, traySettings, "Settings")
 	procAppendMenuW.Call(menu, MF_SEPARATOR, 0, 0)
 	appendMenu(menu, MF_STRING, trayExit, "Exit viewer")
 	var pt POINT
@@ -1166,21 +1327,7 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 		if hdr.HwndFrom == u.list && hdr.Code == LVN_GETDISPINFOW {
 			di := (*NMLVDISPINFOW)(lParam)
 			if di.Item.Mask&LVIF_TEXT != 0 {
-				e, ok := u.ring.Newest(int(di.Item.IItem))
-				text := ""
-				if ok {
-					switch di.Item.ISubItem {
-					case 0:
-						text = e.Time.Local().Format("15:04:05.000")
-					case 1:
-						text = e.Process
-					case 2:
-						text = strconv.FormatUint(uint64(e.PID), 10)
-					case 3:
-						text = e.Path
-					}
-				}
-				u.lastDispText = syscall.StringToUTF16(text)
+				u.lastDispText = syscall.StringToUTF16(u.cellText(int(di.Item.IItem), int(di.Item.ISubItem)))
 				di.Item.PszText = &u.lastDispText[0]
 			}
 			return 0
@@ -1208,6 +1355,14 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 		return 0
 	case wmAppError:
 		u.drainError()
+		u.updateStatus()
+		return 0
+	case wmAppStatus:
+		// Only clear the label if nothing has started since: a tray toggle can
+		// begin the next command before this message is drained.
+		if !u.commandBusy.Load() {
+			u.pending = ""
+		}
 		u.updateStatus()
 		return 0
 	case wmAppActivate:

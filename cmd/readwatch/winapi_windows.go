@@ -26,6 +26,7 @@ type (
 )
 
 type POINT struct{ X, Y int32 }
+type SIZE struct{ Cx, Cy int32 }
 type RECT struct{ Left, Top, Right, Bottom int32 }
 type GUID struct {
 	Data1 uint32
@@ -128,6 +129,36 @@ type NMITEMACTIVATE struct {
 type INITCOMMONCONTROLSEX struct {
 	DwSize uint32
 	DwICC  uint32
+}
+
+// LVHITTESTINFO resolves a pointer position to a cell, which is what the hover
+// hint needs: the row alone is not enough, the column decides which text was
+// clipped.
+type LVHITTESTINFO struct {
+	Pt       POINT
+	Flags    uint32
+	IItem    int32
+	ISubItem int32
+	IGroup   int32
+}
+
+type TOOLINFOW struct {
+	CbSize     uint32
+	UFlags     uint32
+	Hwnd       HWND
+	UId        uintptr
+	Rect       RECT
+	Hinst      HINSTANCE
+	LpszText   *uint16
+	LParam     uintptr
+	LpReserved uintptr
+}
+
+type TRACKMOUSEEVENT struct {
+	CbSize      uint32
+	DwFlags     uint32
+	HwndTrack   HWND
+	DwHoverTime uint32
 }
 
 type LVITEMW struct {
@@ -317,9 +348,15 @@ const (
 	WM_THEMECHANGED    = 0x031A
 	WM_USER            = 0x0400
 	WM_APP             = 0x8000
+	WM_MOUSEMOVE       = 0x0200
+	WM_LBUTTONDOWN     = 0x0201
 	WM_LBUTTONUP       = 0x0202
 	WM_LBUTTONDBLCLK   = 0x0203
+	WM_RBUTTONDOWN     = 0x0204
 	WM_RBUTTONUP       = 0x0205
+	WM_MOUSEWHEEL      = 0x020A
+	WM_MOUSEHOVER      = 0x02A1
+	WM_MOUSELEAVE      = 0x02A3
 	WM_KEYDOWN         = 0x0100
 	WM_SYSCOMMAND      = 0x0112
 	WM_CTLCOLOREDIT    = 0x0133
@@ -338,6 +375,7 @@ const (
 
 	SIZE_MINIMIZED = 1
 
+	WS_POPUP            = 0x80000000
 	WS_OVERLAPPED       = 0x00000000
 	WS_CAPTION          = 0x00C00000
 	WS_SYSMENU          = 0x00080000
@@ -398,9 +436,11 @@ const (
 	LVM_SETBKCOLOR               = LVM_FIRST + 1
 	LVM_SETTEXTCOLOR             = LVM_FIRST + 36
 	LVM_SETTEXTBKCOLOR           = LVM_FIRST + 38
+	LVM_GETCOLUMNWIDTH           = LVM_FIRST + 29
 	LVM_SETCOLUMNWIDTH           = LVM_FIRST + 30
 	LVM_ENSUREVISIBLE            = LVM_FIRST + 19
 	LVM_REDRAWITEMS              = LVM_FIRST + 21
+	LVM_SUBITEMHITTEST           = LVM_FIRST + 57
 
 	LVIF_TEXT                = 0x0001
 	LVCF_FMT                 = 0x0001
@@ -428,15 +468,17 @@ const (
 	LVSICF_NOINVALIDATEALL = 0x00000001
 	LVSICF_NOSCROLL        = 0x00000002
 
-	LB_ADDSTRING    = 0x0180
-	LB_DELETESTRING = 0x0182
-	LB_GETCOUNT     = 0x018B
-	LB_GETCURSEL    = 0x0188
-	LB_GETTEXT      = 0x0189
-	LB_GETTEXTLEN   = 0x018A
-	LB_RESETCONTENT = 0x0184
-	LB_SETCURSEL    = 0x0186
-	LB_ERR          = -1
+	LB_ADDSTRING     = 0x0180
+	LB_DELETESTRING  = 0x0182
+	LB_GETITEMRECT   = 0x0198
+	LB_ITEMFROMPOINT = 0x01A9
+	LB_GETCOUNT      = 0x018B
+	LB_GETCURSEL     = 0x0188
+	LB_GETTEXT       = 0x0189
+	LB_GETTEXTLEN    = 0x018A
+	LB_RESETCONTENT  = 0x0184
+	LB_SETCURSEL     = 0x0186
+	LB_ERR           = -1
 
 	CB_ADDSTRING = 0x0143
 	CB_GETCURSEL = 0x0147
@@ -486,8 +528,14 @@ const (
 	CS_VREDRAW = 0x0001
 	CS_DBLCLKS = 0x0008
 
+	SWP_NOSIZE     = 0x0001
+	SWP_NOMOVE     = 0x0002
 	SWP_NOZORDER   = 0x0004
 	SWP_NOACTIVATE = 0x0010
+
+	// SetWindowPos takes these as HWND values, hence -1 and -2 as uintptr.
+	HWND_TOPMOST   = ^uintptr(0)
+	HWND_NOTOPMOST = ^uintptr(1)
 
 	GWLP_USERDATA  = -21
 	GWLP_HINSTANCE = -6
@@ -525,7 +573,24 @@ const (
 	IDYES              = 6
 
 	ICC_LISTVIEW_CLASSES = 0x00000001
+	ICC_BAR_CLASSES      = 0x00000004
 	ICC_STANDARD_CLASSES = 0x00004000
+
+	// Hover hints for text the control had to clip.
+	TOOLTIPS_CLASS     = "tooltips_class32"
+	TTS_ALWAYSTIP      = 0x01
+	TTS_NOPREFIX       = 0x02
+	TTF_IDISHWND       = 0x0001
+	TTF_TRACK          = 0x0020
+	TTF_ABSOLUTE       = 0x0080
+	TTM_TRACKACTIVATE  = WM_USER + 17
+	TTM_TRACKPOSITION  = WM_USER + 18
+	TTM_SETMAXTIPWIDTH = WM_USER + 24
+	TTM_ADDTOOLW       = WM_USER + 50
+	TTM_DELTOOLW       = WM_USER + 51
+	TTM_UPDATETIPTEXTW = WM_USER + 57
+	TME_HOVER          = 0x00000001
+	TME_LEAVE          = 0x00000002
 
 	DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ^uintptr(3)
 	DWMWA_USE_IMMERSIVE_DARK_MODE              = 20
@@ -746,15 +811,19 @@ var (
 	procIsIconic                      = user32.NewProc("IsIconic")
 	procGetSystemMetrics              = user32.NewProc("GetSystemMetrics")
 	procGetSysColor                   = user32.NewProc("GetSysColor")
+	procGetDC                         = user32.NewProc("GetDC")
+	procReleaseDC                     = user32.NewProc("ReleaseDC")
+	procTrackMouseEvent               = user32.NewProc("TrackMouseEvent")
 
-	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procDeleteObject     = gdi32.NewProc("DeleteObject")
-	procCreateFontW      = gdi32.NewProc("CreateFontW")
-	procSetBkMode        = gdi32.NewProc("SetBkMode")
-	procSetTextColor     = gdi32.NewProc("SetTextColor")
-	procSetBkColor       = gdi32.NewProc("SetBkColor")
-	procSelectObject     = gdi32.NewProc("SelectObject")
-	procGetStockObject   = gdi32.NewProc("GetStockObject")
+	procGetTextExtentPoint32W = gdi32.NewProc("GetTextExtentPoint32W")
+	procCreateSolidBrush      = gdi32.NewProc("CreateSolidBrush")
+	procDeleteObject          = gdi32.NewProc("DeleteObject")
+	procCreateFontW           = gdi32.NewProc("CreateFontW")
+	procSetBkMode             = gdi32.NewProc("SetBkMode")
+	procSetTextColor          = gdi32.NewProc("SetTextColor")
+	procSetBkColor            = gdi32.NewProc("SetBkColor")
+	procSelectObject          = gdi32.NewProc("SelectObject")
+	procGetStockObject        = gdi32.NewProc("GetStockObject")
 
 	procOpenProcessToken                                     = advapi32.NewProc("OpenProcessToken")
 	procGetTokenInformation                                  = advapi32.NewProc("GetTokenInformation")

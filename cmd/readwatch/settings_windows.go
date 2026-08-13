@@ -33,6 +33,7 @@ const (
 	idExcludeText      = 313
 	idAddExclude       = 314
 	idRemoveExclude    = 315
+	idAlwaysOnTop      = 316
 	settingsWindowBase = 520
 )
 
@@ -70,9 +71,11 @@ type SettingsUI struct {
 	includeDirs HWND
 	startLogin  HWND
 	openLogin   HWND
+	alwaysTop   HWND
 	saveBtn     HWND
 	cancelBtn   HWND
 
+	hover   hintHover
 	closing atomic.Bool
 }
 
@@ -89,8 +92,12 @@ func (u *AppUI) openSettings() {
 	if u.commandBusy.Load() {
 		return
 	}
+	// Both lists are edited in place here and collected back on Save, so both
+	// need their own backing array; sharing one with the live state let the
+	// dialog rewrite the app's current configuration as it was being typed.
 	cfg := u.state.Config
 	cfg.Folders = append([]string(nil), cfg.Folders...)
+	cfg.ExcludedProcesses = append([]string(nil), cfg.ExcludedProcesses...)
 	if cfg.MaxRows < 200 {
 		cfg.MaxRows = 1000
 	}
@@ -131,7 +138,9 @@ func (s *SettingsUI) create() error {
 		s.dpi = 96
 	}
 	width := s.scale(520)
-	height := s.scale(540)
+	// Tall enough that the last checkbox still clears the Save row, which the
+	// layout below anchors to the bottom edge.
+	height := s.scale(566)
 	x, y := centeredWindowPosition(s.app.hwnd, width, height)
 	style := uintptr(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN)
 	hwnd, _, e := procCreateWindowExW.Call(
@@ -152,6 +161,7 @@ func (s *SettingsUI) create() error {
 	s.createControls()
 	s.layout()
 	s.applyTheme()
+	s.attachHints()
 	return nil
 }
 
@@ -199,6 +209,10 @@ func (s *SettingsUI) createControls() {
 	s.includeDirs = createControl("BUTTON", "Also log reads of the folder itself, not just files", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idIncludeFolders)
 	s.startLogin = createControl("BUTTON", "Start ReadWatch at sign-in (runs in the tray)", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idStartAtLogin)
 	s.openLogin = createControl("BUTTON", "…and open the window too", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idOpenAtLogin)
+	// A window preference rather than a watch setting: it is stored per user and
+	// applied by the viewer, so it is the one control here the service knows
+	// nothing about.
+	s.alwaysTop = createControl("BUTTON", "Keep the ReadWatch window on top of other windows", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idAlwaysOnTop)
 	s.saveBtn = createControl("BUTTON", "Save", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 0, s.hwnd, IDOK)
 	s.cancelBtn = createControl("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, IDCANCEL)
 
@@ -218,6 +232,7 @@ func (s *SettingsUI) createControls() {
 	setChecked(s.includeDirs, s.cfg.IncludeDirectories)
 	setChecked(s.startLogin, s.cfg.StartAtLogin)
 	setChecked(s.openLogin, s.cfg.OpenAtLogin)
+	setChecked(s.alwaysTop, s.app.alwaysOnTop)
 	for _, folder := range s.cfg.Folders {
 		sendMessage(s.folderList, LB_ADDSTRING, 0, uintptr(unsafe.Pointer(utf16Ptr(folder))))
 	}
@@ -238,7 +253,7 @@ func (s *SettingsUI) controls() []HWND {
 		s.foldersLabel, s.folderList, s.addBtn, s.removeBtn, s.folderPath, s.addPathBtn,
 		s.excludeLabel, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn,
 		s.logLabel, s.logPath, s.browseBtn, s.formatLabel, s.formatCombo,
-		s.includeDirs, s.startLogin, s.openLogin, s.saveBtn, s.cancelBtn,
+		s.includeDirs, s.startLogin, s.openLogin, s.alwaysTop, s.saveBtn, s.cancelBtn,
 	}
 }
 
@@ -302,6 +317,8 @@ func (s *SettingsUI) layout() {
 	place(s.startLogin, m, y, w-2*m, fieldH)
 	y += fieldH + s.scale(2)
 	place(s.openLogin, m+s.scale(20), y, w-2*m-s.scale(20), fieldH)
+	y += fieldH + s.scale(2)
+	place(s.alwaysTop, m, y, w-2*m, fieldH)
 
 	bottomY := h - m - buttonH
 	procMoveWindow.Call(uintptr(s.cancelBtn), uintptr(w-m-buttonW*2-gap), uintptr(bottomY), uintptr(buttonW), uintptr(buttonH), 1)
@@ -324,7 +341,7 @@ func (s *SettingsUI) applyTheme() {
 	if dark {
 		themeName = "DarkMode_Explorer"
 	}
-	for _, h := range []HWND{s.folderList, s.folderPath, s.addPathBtn, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn, s.logPath, s.formatCombo, s.addBtn, s.removeBtn, s.browseBtn, s.includeDirs, s.startLogin, s.openLogin, s.saveBtn, s.cancelBtn} {
+	for _, h := range []HWND{s.folderList, s.folderPath, s.addPathBtn, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn, s.logPath, s.formatCombo, s.addBtn, s.removeBtn, s.browseBtn, s.includeDirs, s.startLogin, s.openLogin, s.alwaysTop, s.saveBtn, s.cancelBtn} {
 		procSetWindowTheme.Call(uintptr(h), uintptr(unsafe.Pointer(utf16Ptr(themeName))), 0)
 	}
 	procInvalidateRect.Call(uintptr(s.hwnd), 0, 1)
@@ -519,14 +536,29 @@ func (s *SettingsUI) collect() (settings.PublicConfig, error) {
 }
 
 func (s *SettingsUI) save() {
+	// A path pasted into the box but never Added used to be dropped without a
+	// word - Save collects the list, and the box is not in it. Commit both
+	// pending edits first. addTypedFolder clears the box when it accepts the
+	// path, so text still sitting there means it was rejected and said why;
+	// saving over that would discard the folder the user came here to add.
+	if strings.TrimSpace(windowText(s.folderPath)) != "" {
+		s.addTypedFolder()
+		if strings.TrimSpace(windowText(s.folderPath)) != "" {
+			return
+		}
+	}
+	addToList(s.excludeList, s.excludeText, windowText(s.excludeText))
 	cfg, err := s.collect()
 	if err != nil {
 		messageBox(s.hwnd, err.Error(), appName, MB_OK|MB_ICONWARNING)
 		return
 	}
 	if !s.app.applySettings(cfg) {
+		// Refusing silently is what a dead button looks like.
+		messageBox(s.hwnd, "ReadWatch is still applying an earlier change.\r\n\r\nTry Save again in a moment.", appName, MB_OK|MB_ICONINFORMATION)
 		return
 	}
+	s.app.setAlwaysOnTop(isChecked(s.alwaysTop))
 	s.close()
 }
 
@@ -556,15 +588,13 @@ func (s *SettingsUI) dpiChanged(newDPI uint32, suggested *RECT) {
 }
 
 func (u *AppUI) applySettings(cfg settings.PublicConfig) bool {
-	if !u.commandBusy.CompareAndSwap(false, true) {
+	if !u.beginCommand(protocol.CmdApply) {
 		return false
 	}
-	procEnableWindow.Call(uintptr(u.startBtn), 0)
-	procEnableWindow.Call(uintptr(u.settingsBtn), 0)
 	oldStart := u.state.Config.StartAtLogin
 	oldOpen := u.state.Config.OpenAtLogin
 	go func() {
-		defer u.commandBusy.Store(false)
+		defer u.endCommand()
 		u.clientMu.RLock()
 		client := u.client
 		u.clientMu.RUnlock()
@@ -653,6 +683,7 @@ func settingsWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.
 		s.close()
 		return 0
 	case WM_DESTROY:
+		s.detachHints()
 		if s.font != 0 {
 			deleteObject(uintptr(s.font))
 			s.font = 0
