@@ -775,6 +775,9 @@ const (
 	SE_FILE_OBJECT             = 1
 	POLICY_AUDIT_EVENT_SUCCESS = 0x00000001
 	POLICY_AUDIT_EVENT_NONE    = 0x00000004
+	ACL_REVISION_INFORMATION   = 1
+	ACL_SIZE_INFORMATION       = 2
+	REVOKE_ACCESS              = 4
 	SET_AUDIT_SUCCESS          = 5
 	OBJECT_INHERIT_ACE         = 0x00000001
 	CONTAINER_INHERIT_ACE      = 0x00000002
@@ -949,6 +952,8 @@ var (
 	procGetSecurityInfo               = advapi32.NewProc("GetSecurityInfo")
 	procSetSecurityInfo               = advapi32.NewProc("SetSecurityInfo")
 	procGetSecurityDescriptorSacl     = advapi32.NewProc("GetSecurityDescriptorSacl")
+	procGetAclInformation             = advapi32.NewProc("GetAclInformation")
+	procGetAce                        = advapi32.NewProc("GetAce")
 	procSetSecurityDescriptorSacl     = advapi32.NewProc("SetSecurityDescriptorSacl")
 	procInitializeSecurityDescriptor  = advapi32.NewProc("InitializeSecurityDescriptor")
 	procSetSecurityDescriptorControl  = advapi32.NewProc("SetSecurityDescriptorControl")

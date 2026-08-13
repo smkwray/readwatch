@@ -60,14 +60,22 @@ func (e *ServiceEngine) applyAuditRule(cfg *settings.Config, folder FolderCapabi
 	}
 	key := folder.Identity.Key()
 	if existing, ok := cfg.Snapshots[key]; ok && existing.Phase == settings.PhaseApplied {
-		current, _, err := readSACL(folder.Security)
+		current, err := readSACLState(folder.Security)
 		if err != nil {
 			return fmt.Errorf("%s: %w", folder.Path, err)
 		}
-		if current == existing.Applied {
+		applied, err := parseSACLState(existing.Applied)
+		if err != nil {
+			return fmt.Errorf("%s: parse the journalled applied auditing rules: %w", folder.Path, err)
+		}
+		if equivalentSACL(current, applied) {
 			return nil
 		}
-		if current != existing.Original {
+		before, err := parseSACLState(existing.Original)
+		if err != nil {
+			return fmt.Errorf("%s: parse the journalled original auditing rules: %w", folder.Path, err)
+		}
+		if !equivalentSACL(current, before) {
 			return fmt.Errorf("auditing rules on %s changed outside ReadWatch; they were left untouched", folder.Path)
 		}
 		original = existing.Original
@@ -91,12 +99,19 @@ func (e *ServiceEngine) applyAuditRule(cfg *settings.Config, folder FolderCapabi
 	if err := addReadAuditRule(folder.Security, protected); err != nil {
 		return fmt.Errorf("%s: %w", folder.Path, err)
 	}
-	applied, _, err := readSACL(folder.Security)
+	applied, err := readSACLState(folder.Security)
 	if err != nil {
 		return fmt.Errorf("%s: %w", folder.Path, err)
 	}
+	expected, err := parseSACLState(predicted)
+	if err != nil {
+		return fmt.Errorf("%s: parse the predicted auditing rules: %w", folder.Path, err)
+	}
+	if !equivalentSACL(applied, expected) {
+		return fmt.Errorf("%s: the auditing rules did not take the value ReadWatch set", folder.Path)
+	}
 	snapshot := cfg.Snapshots[key]
-	snapshot.Applied = applied
+	snapshot.Applied = applied.sddl
 	snapshot.Phase = settings.PhaseApplied
 	cfg.Snapshots[key] = snapshot
 	return e.saveConfig(cfg)
@@ -155,24 +170,33 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 		defer closeHandle(opened)
 		h = opened
 	}
-	current, protected, err := readSACL(h)
+	current, err := readSACLState(h)
 	if err != nil {
 		return fmt.Errorf("%s: %w", snapshot.Path, err)
 	}
-	switch current {
-	case snapshot.Applied:
-		if err := restoreSACL(h, snapshot.Original, protected); err != nil {
+	applied, err := parseSACLState(snapshot.Applied)
+	if err != nil {
+		return fmt.Errorf("%s: parse the journalled applied auditing rules: %w", snapshot.Path, err)
+	}
+	original, err := parseSACLState(snapshot.Original)
+	if err != nil {
+		return fmt.Errorf("%s: parse the journalled original auditing rules: %w", snapshot.Path, err)
+	}
+	switch {
+	case equivalentSACL(current, applied):
+		if err := restoreSACL(h, snapshot.Original); err != nil {
 			return fmt.Errorf("%s: %w", snapshot.Path, err)
 		}
-		verify, _, err := readSACL(h)
+		verify, err := readSACLState(h)
 		if err != nil {
 			return fmt.Errorf("%s: %w", snapshot.Path, err)
 		}
-		if verify != snapshot.Original {
+		if !equivalentSACL(verify, original) {
 			return fmt.Errorf("%s: the auditing rules did not return to what ReadWatch found", snapshot.Path)
 		}
-	case snapshot.Original:
-		// Already back where it started.
+	case equivalentSACL(current, original):
+		// Already back where it started. This also accepts an empty,
+		// unprotected ACL for an originally absent SACL, but never a null SACL.
 	default:
 		// Somebody else owns this now. Leaving it alone is the only safe move,
 		// and the record stays so the conflict remains visible.
