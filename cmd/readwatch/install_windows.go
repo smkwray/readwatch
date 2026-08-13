@@ -103,18 +103,10 @@ func installApp() error {
 	if err := setStartup(cfg.StartAtLogin); err != nil {
 		return err
 	}
-	// Installing no longer starts LocalSystem. The service comes up only when
-	// monitoring is on, so a fresh install leaves nothing privileged running and
-	// the viewer starts it on demand. An upgrade over a configuration that was
-	// already monitoring resumes it here.
-	if cfg.Enabled {
-		if err := startInstalledService(); err != nil {
-			return err
-		}
-		if err := waitForServiceState(SERVICE_RUNNING, 10*time.Second); err != nil {
-			return err
-		}
-	}
+	// The installer must not leave a LocalSystem process with no viewer holding
+	// its lease - the service would simply time out and stop again. Launch the
+	// viewer and let it start the service and resume monitoring, bound to its
+	// own token, if the saved configuration says monitoring was on.
 	if err := launch(p.Exe, "--installed"); err != nil {
 		return err
 	}
@@ -179,7 +171,9 @@ func uninstallElevated(quiet bool) error {
 				return errors.New("ReadWatch is still running; exit it from the tray and retry uninstall")
 			}
 		}
-		if client, err := ConnectIPC(cfg.OwnerSID, 1500*time.Millisecond, nil, nil, nil); err == nil {
+		// Maintenance, not viewer: this connection must not hold the service open
+		// past the cleanup it came to run.
+		if client, err := ConnectIPC(cfg.OwnerSID, protocol.RoleMaintenance, 1500*time.Millisecond, nil, nil, nil); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			cleanupErr := client.Command(ctx, protocol.CmdCleanup, nil)
 			cancel()

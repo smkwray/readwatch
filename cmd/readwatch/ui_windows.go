@@ -632,7 +632,7 @@ func (u *AppUI) startConnectionLoop() {
 					u.queueError(err)
 				}
 			}
-			client, err := ConnectIPC(u.ownerSID, 2*time.Second, u.queueState, u.queueEvent, func(err error) {
+			client, err := ConnectIPC(u.ownerSID, protocol.RoleViewer, 2*time.Second, u.queueState, u.queueEvent, func(err error) {
 				if err != nil && !u.exiting.Load() {
 					u.queueDisconnected()
 				}
@@ -943,9 +943,9 @@ func (u *AppUI) runCommand(command string, cfg *settings.PublicConfig) {
 		client := u.client
 		u.clientMu.RUnlock()
 		if client == nil {
-			// The service is demand-start, so nothing is listening until
-			// monitoring is wanted. Only Start may bring it up; every other
-			// command needs a service that is already running.
+			// The connection loop starts the service and normally holds it, so
+			// reaching here means the pipe is down. Start may bring it back;
+			// every other command needs a service that is already listening.
 			if command != protocol.CmdStart {
 				u.queueError(fmt.Errorf("ReadWatch service is not connected"))
 				return

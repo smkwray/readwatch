@@ -10,8 +10,11 @@ install, and it's running.
 
 - **Live view and a durable log.** Text, JSON Lines, or CSV, appended as events arrive.
 - **Privileged only while ReadWatch is open.** The service is demand-start: it comes up with the
-  window, and exiting stops it, taking its audit rules off your folders with it. Nothing of
-  ReadWatch's runs as SYSTEM once you quit.
+  window so the viewer can read the protected configuration, and it stops when you exit — including
+  when the viewer is killed rather than closed, because the service stops itself once no viewer is
+  connected. **Stop** ends monitoring and removes ReadWatch's audit rules, folder handles and log
+  handle; the idle service stays only while the window is open. Nothing of ReadWatch's runs as
+  SYSTEM once you quit.
 - **Filters the noise.** Shell thumbnailing, search indexing and antivirus can easily outnumber
   the reads you're looking for. Exclude them by process name or exact image path — dropped inside
   the service, with a running count of what was suppressed so nothing hides silently.

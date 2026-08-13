@@ -22,13 +22,27 @@ import (
 	"readwatch/internal/settings"
 )
 
+// The pipe handle reaches the handler because authority to touch a configured
+// folder or log comes from the connected owner's token, not from a pathname the
+// service resolves later on its own.
 type serviceCommandHandler interface {
 	CurrentState() protocol.State
-	Apply(settings.PublicConfig) error
-	StartMonitoring() error
+	OnViewerHello(pipe HANDLE) error
+	ApplyFromClient(pipe HANDLE, cfg settings.PublicConfig) error
+	StartMonitoringFromClient(pipe HANDLE) error
 	StopMonitoring(removeRules bool) error
 	Cleanup() error
 }
+
+// Lease timings. The startup lease covers a service brought up by hand with
+// `sc start`, or by a viewer that died before it could say hello. The orphan
+// lease is the gap a reconnecting viewer is allowed: the client's reconnect loop
+// backs off from 250 ms, so three seconds clears an ordinary reconnect without
+// leaving a stranded LocalSystem process around for long.
+const (
+	leaseStartupGrace = 15 * time.Second
+	leaseOrphanGrace  = 3 * time.Second
+)
 
 type IPCServer struct {
 	name     string
@@ -42,6 +56,17 @@ type IPCServer struct {
 	stopped  atomic.Bool
 	dropped  atomic.Uint64
 
+	// The service exists to serve a viewer. Losing the last one stops it, so a
+	// killed viewer cannot strand a LocalSystem process: AppUI.shutdown's
+	// synchronous stop is the fast path, this is the backstop behind it.
+	leaseMu          sync.Mutex
+	viewerClients    int
+	activeOperations int
+	startupTimer     *time.Timer
+	orphanTimer      *time.Timer
+	stopRequested    bool
+	leaseReleased    bool
+
 	connectEvent HANDLE
 	stopEvent    HANDLE
 }
@@ -53,6 +78,11 @@ type serverPipeClient struct {
 	out    chan protocol.Message
 	done   chan struct{}
 	once   sync.Once
+
+	// Only the reader goroutine touches these before close(), so they need no
+	// lock of their own.
+	greeted bool
+	role    protocol.ClientRole
 }
 
 func NewIPCServer(ownerSID string, handler serviceCommandHandler) *IPCServer {
@@ -72,12 +102,103 @@ func NewIPCServer(ownerSID string, handler serviceCommandHandler) *IPCServer {
 	}
 }
 
-func (s *IPCServer) Start() { go s.acceptLoop() }
+func (s *IPCServer) Start() {
+	s.armStartupLease()
+	go s.acceptLoop()
+}
+
+// armStartupLease stops a service that nobody asked for. Reaching RUNNING with
+// no viewer means someone ran `sc start`, or the viewer that started it died
+// first; either way there is no session for it to serve.
+func (s *IPCServer) armStartupLease() {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if s.leaseReleased || s.startupTimer != nil {
+		return
+	}
+	s.startupTimer = time.AfterFunc(leaseStartupGrace, s.leaseExpired)
+}
+
+// viewerHello takes the lease for a viewer session.
+func (s *IPCServer) viewerHello() {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	s.viewerClients++
+	s.cancelTimersLocked()
+}
+
+// clientClosed releases whatever the connection held. The orphan timer is armed
+// only when the last viewer goes, and any new hello cancels it.
+func (s *IPCServer) clientClosed(c *serverPipeClient) {
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if c.role != protocol.RoleViewer || !c.greeted {
+		return
+	}
+	if s.viewerClients > 0 {
+		s.viewerClients--
+	}
+	if s.viewerClients == 0 && !s.leaseReleased && s.orphanTimer == nil {
+		s.orphanTimer = time.AfterFunc(leaseOrphanGrace, s.leaseExpired)
+	}
+}
+
+// operationStarted keeps a command from being torn down half-applied. An
+// uninstall's cleanup is the case that matters: it runs over a maintenance
+// connection, which deliberately holds no lease.
+func (s *IPCServer) operationStarted() {
+	s.leaseMu.Lock()
+	s.activeOperations++
+	s.leaseMu.Unlock()
+}
+
+func (s *IPCServer) operationFinished() {
+	s.leaseMu.Lock()
+	if s.activeOperations > 0 {
+		s.activeOperations--
+	}
+	stop := s.stopRequested && s.activeOperations == 0 && s.viewerClients == 0 && !s.leaseReleased
+	s.leaseMu.Unlock()
+	if stop {
+		requestServiceStop()
+	}
+}
+
+func (s *IPCServer) leaseExpired() {
+	s.leaseMu.Lock()
+	if s.leaseReleased || s.viewerClients > 0 {
+		s.leaseMu.Unlock()
+		return
+	}
+	if s.activeOperations > 0 {
+		// The last operation to finish stops the service instead.
+		s.stopRequested = true
+		s.leaseMu.Unlock()
+		return
+	}
+	s.leaseMu.Unlock()
+	requestServiceStop()
+}
+
+func (s *IPCServer) cancelTimersLocked() {
+	if s.startupTimer != nil {
+		s.startupTimer.Stop()
+		s.startupTimer = nil
+	}
+	if s.orphanTimer != nil {
+		s.orphanTimer.Stop()
+		s.orphanTimer = nil
+	}
+}
 
 func (s *IPCServer) Stop() {
 	if !s.stopped.CompareAndSwap(false, true) {
 		return
 	}
+	s.leaseMu.Lock()
+	s.leaseReleased = true
+	s.cancelTimersLocked()
+	s.leaseMu.Unlock()
 	close(s.stop)
 	s.mu.Lock()
 	clients := make([]*serverPipeClient, 0, len(s.clients))
@@ -265,6 +386,7 @@ func (c *serverPipeClient) close() {
 		c.server.mu.Lock()
 		delete(c.server.clients, c)
 		c.server.mu.Unlock()
+		c.server.clientClosed(c)
 	})
 }
 
@@ -291,34 +413,63 @@ func (c *serverPipeClient) reader() {
 		if err := dec.Decode(&msg); err != nil {
 			return
 		}
-		c.handleMessage(msg)
+		if !c.handleMessage(msg) {
+			return
+		}
 	}
 }
 
-func (c *serverPipeClient) handleMessage(msg protocol.Message) {
-	if msg.Type == protocol.TypeHello || (msg.Type == protocol.TypeCommand && msg.Command == protocol.CmdGetState) {
+// handleMessage returns false when the connection must be closed. A protocol
+// violation is not negotiated: the connection carries the authority to direct
+// privileged work, so anything that does not fit the sequence ends it.
+func (c *serverPipeClient) handleMessage(msg protocol.Message) bool {
+	if msg.Version != protocol.Version {
+		return false
+	}
+	if msg.Type == protocol.TypeHello {
+		if c.greeted || !protocol.ValidRole(msg.Role) {
+			return false
+		}
+		c.greeted = true
+		c.role = msg.Role
+		if c.role == protocol.RoleViewer {
+			c.server.viewerHello()
+			// A viewer that arrives with monitoring configured on may resume it,
+			// but only bound to this connection's token - never from a stored
+			// pathname resolved by LocalSystem on its own.
+			c.server.operationStarted()
+			resumeErr := c.server.handler.OnViewerHello(c.handle)
+			c.server.operationFinished()
+			if resumeErr != nil {
+				writeServiceDiagnostic(resumeErr)
+			}
+		}
 		state := c.server.handler.CurrentState()
 		c.send(protocol.Message{Version: protocol.Version, Type: protocol.TypeState, ID: msg.ID, State: &state, OK: true})
-		return
+		return true
+	}
+	if !c.greeted {
+		return false
+	}
+	if msg.Type == protocol.TypeCommand && msg.Command == protocol.CmdGetState {
+		state := c.server.handler.CurrentState()
+		c.send(protocol.Message{Version: protocol.Version, Type: protocol.TypeState, ID: msg.ID, State: &state, OK: true})
+		return true
 	}
 	if msg.Type != protocol.TypeCommand {
-		return
+		return true
 	}
+	c.server.operationStarted()
 	var err error
 	switch msg.Command {
 	case protocol.CmdApply:
 		if msg.Config == nil {
 			err = errors.New("configuration is missing")
 		} else {
-			validated, validateErr := validatePublicConfigAsPipeClient(c.handle, *msg.Config)
-			if validateErr != nil {
-				err = validateErr
-			} else {
-				err = c.server.handler.Apply(validated)
-			}
+			err = c.server.handler.ApplyFromClient(c.handle, *msg.Config)
 		}
 	case protocol.CmdStart:
-		err = c.server.handler.StartMonitoring()
+		err = c.server.handler.StartMonitoringFromClient(c.handle)
 	case protocol.CmdStop:
 		err = c.server.handler.StopMonitoring(true)
 	case protocol.CmdCleanup:
@@ -333,6 +484,8 @@ func (c *serverPipeClient) handleMessage(msg protocol.Message) {
 	}
 	c.send(resp)
 	c.server.BroadcastState()
+	c.server.operationFinished()
+	return true
 }
 
 func (c *serverPipeClient) send(msg protocol.Message) {
@@ -448,7 +601,9 @@ type IPCClient struct {
 	onClose   func(error)
 }
 
-func ConnectIPC(ownerSID string, timeout time.Duration, onState func(protocol.State), onEvent func(model.Event), onClose func(error)) (*IPCClient, error) {
+// ConnectIPC dials the service. The role decides whether this connection holds
+// the service open: a viewer session does, a maintenance connection does not.
+func ConnectIPC(ownerSID string, role protocol.ClientRole, timeout time.Duration, onState func(protocol.State), onEvent func(model.Event), onClose func(error)) (*IPCClient, error) {
 	name := pipeName(ownerSID)
 	deadline := time.Now().Add(timeout)
 	for {
@@ -477,7 +632,9 @@ func ConnectIPC(ownerSID string, timeout time.Duration, onState func(protocol.St
 		onState: onState, onEvent: onEvent, onClose: onClose,
 	}
 	go c.reader()
-	if err := c.send(protocol.Message{Version: protocol.Version, Type: protocol.TypeHello}); err != nil {
+	// Hello is mandatory and must be first: the service refuses commands until
+	// it knows which kind of session this is.
+	if err := c.send(protocol.Message{Version: protocol.Version, Type: protocol.TypeHello, Role: role}); err != nil {
 		c.Close()
 		return nil, err
 	}

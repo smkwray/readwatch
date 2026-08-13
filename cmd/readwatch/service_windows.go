@@ -60,19 +60,51 @@ func loadServiceConfig(path, defaultLog string) (settings.Config, error) {
 	return settings.Load(path, defaultLog, raw.OwnerSID, raw.OwnerName)
 }
 
+// Start brings up IPC and nothing else. A persisted Enabled=true is desired
+// state, not permission: resuming means opening the owner's folders and log,
+// and the authority for that is a connected owner's token, which does not exist
+// yet. The resume happens on the first viewer hello instead.
 func (e *ServiceEngine) Start() error {
 	e.ipc.Start()
 	e.mu.Lock()
 	e.ready = true
-	auto := e.cfg.Enabled
 	e.mu.Unlock()
-	if auto {
-		if err := e.startMonitoring(false); err != nil {
-			e.setLastError(err)
-		}
-	}
 	e.ipc.BroadcastState()
 	return nil
+}
+
+// OnViewerHello resumes monitoring for a configuration that was left enabled,
+// bound to the token of the viewer that just connected.
+func (e *ServiceEngine) OnViewerHello(pipe HANDLE) error {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	if err := e.rejectIfStopping(); err != nil {
+		return err
+	}
+	if e.watcher.Running() {
+		return nil
+	}
+	e.mu.RLock()
+	enabled := e.cfg.Enabled
+	folders := len(e.cfg.Folders)
+	e.mu.RUnlock()
+	if !enabled || folders == 0 {
+		return nil
+	}
+	if err := e.startMonitoringBound(pipe, false); err != nil {
+		e.setLastError(err)
+		return err
+	}
+	return nil
+}
+
+func (e *ServiceEngine) StartMonitoringFromClient(pipe HANDLE) error {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	if err := e.rejectIfStopping(); err != nil {
+		return err
+	}
+	return e.startMonitoringBound(pipe, true)
 }
 
 func (e *ServiceEngine) Shutdown() {
@@ -127,7 +159,15 @@ func (e *ServiceEngine) CurrentState() protocol.State {
 	}
 }
 
-func (e *ServiceEngine) Apply(public settings.PublicConfig) error {
+func (e *ServiceEngine) ApplyFromClient(pipe HANDLE, public settings.PublicConfig) error {
+	validated, err := validatePublicConfigAsPipeClient(pipe, public)
+	if err != nil {
+		return err
+	}
+	return e.apply(validated)
+}
+
+func (e *ServiceEngine) apply(public settings.PublicConfig) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	if err := e.rejectIfStopping(); err != nil {
@@ -226,16 +266,10 @@ func (e *ServiceEngine) restoreRunningConfig(old settings.Config) error {
 	return nil
 }
 
-func (e *ServiceEngine) StartMonitoring() error {
-	e.opMu.Lock()
-	defer e.opMu.Unlock()
-	if err := e.rejectIfStopping(); err != nil {
-		return err
-	}
-	return e.startMonitoring(true)
-}
-
-func (e *ServiceEngine) startMonitoring(clearError bool) error {
+// startMonitoringBound takes the pipe handle so the objects it is about to make
+// SYSTEM act on are the ones the connected owner can reach. Q2 replaces the
+// pathname re-resolution inside it with retained handles; the seam is here.
+func (e *ServiceEngine) startMonitoringBound(_ HANDLE, clearError bool) error {
 	if e.watcher.Running() {
 		return nil
 	}
@@ -400,13 +434,21 @@ func serviceMain(_ uint32, _ uintptr) uintptr {
 func serviceControlHandler(control uint32, _ uint32, _ uintptr, _ uintptr) uintptr {
 	switch control {
 	case SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_PRESHUTDOWN:
-		serviceStopOnce.Do(func() {
-			if serviceStopCh != nil {
-				close(serviceStopCh)
-			}
-		})
+		requestServiceStop()
 	}
 	return 0
+}
+
+// requestServiceStop is the one way the service ends, whether the SCM asked or
+// the viewer lease expired. It hands control back to serviceMain rather than
+// tearing down from whichever goroutine noticed, so the status transition and
+// the serialized shutdown stay in one place.
+func requestServiceStop() {
+	serviceStopOnce.Do(func() {
+		if serviceStopCh != nil {
+			close(serviceStopCh)
+		}
+	})
 }
 
 func setServiceStatus(state, win32Exit, accepted, waitHint uint32) {
