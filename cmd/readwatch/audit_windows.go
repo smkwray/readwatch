@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -140,36 +141,176 @@ func restoreFileSystemAuditPolicy(cfg *settings.Config, save func(*settings.Conf
 	return save(cfg)
 }
 
+// saclState is the security-relevant part of a SACL snapshot. Windows may add
+// automatic-inheritance bookkeeping when it writes a descriptor, so AI/AR are
+// deliberately not part of equality. SDDL also cannot persist SE_SACL_DEFAULTED.
+// Protection, nullness, ACL revision and every ordered ACE byte are compared.
+// Unused ACL buffer capacity is not security state and is deliberately excluded.
+type saclState struct {
+	sddl      string
+	protected bool
+	present   bool
+	null      bool
+	revision  uint32
+	aces      [][]byte
+}
+
+type aclRevisionInformation struct {
+	revision uint32
+}
+
+type aclSizeInformation struct {
+	aceCount   uint32
+	bytesInUse uint32
+	bytesFree  uint32
+}
+
+type aceHeader struct {
+	type_ uint8
+	flags uint8
+	size  uint16
+}
+
 // readSACL reports a handle's audit entries and whether they are protected from
 // inheritance. Restoring one without the other would silently change the
 // folder's relationship to its parent.
 func readSACL(h HANDLE) (string, bool, error) {
-	var sacl, sd uintptr
+	state, err := readSACLState(h)
+	if err != nil {
+		return "", false, err
+	}
+	return state.sddl, state.protected, nil
+}
+
+func readSACLState(h HANDLE) (saclState, error) {
+	var sacl uintptr
+	var sd uintptr
 	code, _, _ := procGetSecurityInfo.Call(
 		uintptr(h), SE_FILE_OBJECT, SACL_SECURITY_INFORMATION,
 		0, 0, 0, uintptr(unsafe.Pointer(&sacl)), uintptr(unsafe.Pointer(&sd)),
 	)
 	if code != ERROR_SUCCESS {
-		return "", false, fmt.Errorf("read auditing rules: %w", syscall.Errno(code))
+		return saclState{}, fmt.Errorf("read auditing rules: %w", syscall.Errno(code))
 	}
 	defer procLocalFree.Call(sd)
 
-	var control uint16
-	var revision uint32
-	r, _, e := procGetSecurityDescriptorControl.Call(sd, uintptr(unsafe.Pointer(&control)), uintptr(unsafe.Pointer(&revision)))
-	if r == 0 {
-		return "", false, winErr("GetSecurityDescriptorControl", e)
-	}
 	var text *uint16
 	var length uint32
-	r, _, e = procConvertSecurityDescriptorToStringSecurityDescriptorW.Call(
+	r, _, e := procConvertSecurityDescriptorToStringSecurityDescriptorW.Call(
 		sd, 1, SACL_SECURITY_INFORMATION, uintptr(unsafe.Pointer(&text)), uintptr(unsafe.Pointer(&length)),
 	)
 	if r == 0 {
-		return "", false, winErr("ConvertSecurityDescriptorToStringSecurityDescriptor", e)
+		return saclState{}, winErr("ConvertSecurityDescriptorToStringSecurityDescriptor", e)
 	}
 	defer procLocalFree.Call(uintptr(unsafe.Pointer(text)))
-	return utf16FromPtr(text), control&SE_SACL_PROTECTED != 0, nil
+	return saclStateFromDescriptor(sd, utf16FromPtr(text))
+}
+
+func parseSACLState(sddl string) (saclState, error) {
+	var sd uintptr
+	var size uint32
+	r, _, e := procConvertStringSecurityDescriptorToSecurityDescriptorW.Call(
+		uintptr(unsafe.Pointer(utf16Ptr(sddl))), 1, uintptr(unsafe.Pointer(&sd)), uintptr(unsafe.Pointer(&size)),
+	)
+	if r == 0 {
+		return saclState{}, winErr("ConvertStringSecurityDescriptorToSecurityDescriptor", e)
+	}
+	defer procLocalFree.Call(sd)
+	return saclStateFromDescriptor(sd, sddl)
+}
+
+func saclStateFromDescriptor(sd uintptr, sddl string) (saclState, error) {
+	var control uint16
+	var sdRevision uint32
+	r, _, e := procGetSecurityDescriptorControl.Call(sd, uintptr(unsafe.Pointer(&control)), uintptr(unsafe.Pointer(&sdRevision)))
+	if r == 0 {
+		return saclState{}, winErr("GetSecurityDescriptorControl", e)
+	}
+
+	var present, defaulted int32
+	var sacl uintptr
+	r, _, e = procGetSecurityDescriptorSacl.Call(
+		sd, uintptr(unsafe.Pointer(&present)), uintptr(unsafe.Pointer(&sacl)), uintptr(unsafe.Pointer(&defaulted)),
+	)
+	if r == 0 {
+		return saclState{}, winErr("GetSecurityDescriptorSacl", e)
+	}
+
+	state := saclState{
+		sddl:      sddl,
+		protected: control&SE_SACL_PROTECTED != 0,
+		present:   present != 0,
+	}
+	if !state.present {
+		return state, nil
+	}
+	if sacl == 0 {
+		state.null = true
+		return state, nil
+	}
+
+	var aclRevision aclRevisionInformation
+	r, _, e = procGetAclInformation.Call(
+		sacl, uintptr(unsafe.Pointer(&aclRevision)), unsafe.Sizeof(aclRevision), ACL_REVISION_INFORMATION,
+	)
+	if r == 0 {
+		return saclState{}, winErr("GetAclInformation(revision)", e)
+	}
+	var size aclSizeInformation
+	r, _, e = procGetAclInformation.Call(
+		sacl, uintptr(unsafe.Pointer(&size)), unsafe.Sizeof(size), ACL_SIZE_INFORMATION,
+	)
+	if r == 0 {
+		return saclState{}, winErr("GetAclInformation(size)", e)
+	}
+
+	state.revision = aclRevision.revision
+	state.aces = make([][]byte, 0, size.aceCount)
+	for i := uint32(0); i < size.aceCount; i++ {
+		var ace *aceHeader
+		r, _, e = procGetAce.Call(sacl, uintptr(i), uintptr(unsafe.Pointer(&ace)))
+		if r == 0 {
+			return saclState{}, winErr("GetAce", e)
+		}
+		if ace == nil || ace.size < uint16(unsafe.Sizeof(aceHeader{})) {
+			return saclState{}, errors.New("the auditing rules contain an invalid ACE header")
+		}
+		state.aces = append(state.aces, append([]byte(nil), unsafe.Slice((*byte)(unsafe.Pointer(ace)), int(ace.size))...))
+	}
+	return state, nil
+}
+
+// equivalentSACL is deliberately stricter than an effective-access check. It
+// requires the same protection state, ACL revision and ordered ACE bytes. The only
+// normalisations are:
+//   - AI/AR are automatic-inheritance bookkeeping and are not compared; and
+//   - an absent SACL and a valid empty SACL are equivalent only while both are
+//     unprotected. Both contain no audit ACEs and remain open to inheritance.
+//
+// A null SACL is never equivalent to either one.
+func equivalentSACL(left, right saclState) bool {
+	if left.protected != right.protected {
+		return false
+	}
+	if left.null || right.null {
+		return left.present == right.present && left.null == right.null
+	}
+	if !left.protected && left.noAuditACEs() && right.noAuditACEs() {
+		return true
+	}
+	if left.present != right.present || left.revision != right.revision || len(left.aces) != len(right.aces) {
+		return false
+	}
+	for i := range left.aces {
+		if !bytes.Equal(left.aces[i], right.aces[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s saclState) noAuditACEs() bool {
+	return !s.present || (!s.null && len(s.aces) == 0)
 }
 
 func saclSecurityInformation(protected bool) uintptr {
@@ -223,9 +364,22 @@ func addReadAuditRule(h HANDLE, protected bool) error {
 	return nil
 }
 
-// restoreSACL puts back exactly the descriptor that was captured, including
-// whether it blocked inheritance.
-func restoreSACL(h HANDLE, sddl string, protected bool) error {
+// restoreSACL restores the captured audit state. SetSecurityInfo has no
+// bSaclPresent input: with SACL_SECURITY_INFORMATION, a nil pSacl assigns a
+// present null SACL rather than clearing SE_SACL_PRESENT. An absent original is
+// therefore restored by revoking ReadWatch's sole Everyone audit entry from the
+// current ACL and writing the resulting valid empty ACL as unprotected. Windows
+// may retain that empty ACL and add AI; equivalentSACL treats that representation
+// as the same inheriting, zero-ACE state, but never equates it with a null SACL.
+func restoreSACL(h HANDLE, sddl string) error {
+	original, err := parseSACLState(sddl)
+	if err != nil {
+		return err
+	}
+	if !original.present {
+		return restoreAbsentSACL(h, original.protected)
+	}
+
 	var sd uintptr
 	var size uint32
 	r, _, e := procConvertStringSecurityDescriptorToSecurityDescriptorW.Call(
@@ -243,16 +397,60 @@ func restoreSACL(h HANDLE, sddl string, protected bool) error {
 		return winErr("GetSecurityDescriptorSacl", e)
 	}
 	if present == 0 {
-		// No audit entries at all is a real state, and a null SACL is how it is
-		// written back.
-		sacl = 0
+		return errors.New("the captured auditing rules unexpectedly have no SACL")
 	}
 	code, _, _ := procSetSecurityInfo.Call(
-		uintptr(h), SE_FILE_OBJECT, saclSecurityInformation(protected),
+		uintptr(h), SE_FILE_OBJECT, saclSecurityInformation(original.protected),
 		0, 0, 0, sacl,
 	)
 	if code != ERROR_SUCCESS {
 		return fmt.Errorf("restore auditing rules: %w", syscall.Errno(code))
+	}
+	return nil
+}
+
+// restoreAbsentSACL is called only after the caller has proved that the current
+// descriptor still matches the state ReadWatch applied. With an absent original
+// there were no pre-existing audit ACEs, so revoking Everyone removes only the
+// rule ReadWatch added. SetEntriesInAcl must return a real empty ACL; passing nil
+// back to SetSecurityInfo would recreate the protected-null bug this path fixes.
+func restoreAbsentSACL(h HANDLE, protected bool) error {
+	var oldSACL, sd uintptr
+	code, _, _ := procGetSecurityInfo.Call(
+		uintptr(h), SE_FILE_OBJECT, SACL_SECURITY_INFORMATION,
+		0, 0, 0, uintptr(unsafe.Pointer(&oldSACL)), uintptr(unsafe.Pointer(&sd)),
+	)
+	if code != ERROR_SUCCESS {
+		return fmt.Errorf("read auditing rules for removal: %w", syscall.Errno(code))
+	}
+	defer procLocalFree.Call(sd)
+
+	var everyoneSID uintptr
+	r, _, e := procConvertStringSidToSidW.Call(uintptr(unsafe.Pointer(utf16Ptr("S-1-1-0"))), uintptr(unsafe.Pointer(&everyoneSID)))
+	if r == 0 {
+		return winErr("ConvertStringSidToSid", e)
+	}
+	defer procLocalFree.Call(everyoneSID)
+
+	ea := EXPLICITACCESSW{AccessMode: REVOKE_ACCESS}
+	procBuildTrusteeWithSidW.Call(uintptr(unsafe.Pointer(&ea.Trustee)), everyoneSID)
+
+	var newSACL uintptr
+	code, _, _ = procSetEntriesInAclW.Call(1, uintptr(unsafe.Pointer(&ea)), oldSACL, uintptr(unsafe.Pointer(&newSACL)))
+	if code != ERROR_SUCCESS {
+		return fmt.Errorf("remove ReadWatch auditing rule: %w", syscall.Errno(code))
+	}
+	if newSACL == 0 {
+		return errors.New("remove ReadWatch auditing rule: Windows returned a null ACL")
+	}
+	defer procLocalFree.Call(newSACL)
+
+	code, _, _ = procSetSecurityInfo.Call(
+		uintptr(h), SE_FILE_OBJECT, saclSecurityInformation(protected),
+		0, 0, 0, newSACL,
+	)
+	if code != ERROR_SUCCESS {
+		return fmt.Errorf("restore absent auditing rules: %w", syscall.Errno(code))
 	}
 	return nil
 }
