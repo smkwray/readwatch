@@ -130,9 +130,14 @@ func (e *ServiceEngine) Shutdown() {
 	// Stopping the service must leave nothing of ReadWatch's behind. The SACLs
 	// and the audit-policy change are ours, and Windows keeps writing 4663 events
 	// into the Security log for as long as they are applied - with no service
-	// running to consume them. Enabled is deliberately left as-is so the next
-	// start resumes monitoring; only the machine-visible state is withdrawn.
-	if err := e.stopMonitoringLocked(true, false); err != nil {
+	// running to consume them.
+	//
+	// Exiting also means monitoring is off, not paused: the desired state is
+	// cleared, so opening ReadWatch again starts idle and waits to be told. The
+	// owner's words - "exit should stop the monitoring as well". Nothing here
+	// affects a service that died while the viewer stayed open; that path still
+	// resumes on reconnect, because the owner never said to stop.
+	if err := e.stopMonitoringLocked(true, true); err != nil {
 		writeServiceDiagnostic(err)
 	}
 	e.opMu.Unlock()

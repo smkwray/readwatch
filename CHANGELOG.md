@@ -19,9 +19,9 @@ have made SYSTEM act on a different object. Closing that changed several things 
   account's permissions, but no longer creates directories.
 - **Watched folders cannot be renamed or deleted while monitoring is on.** The audit rule and the
   folder stay together.
-- Monitoring resumes when you open ReadWatch rather than when the service starts, and a folder or
-  log that is no longer the same object as when you set it up is refused with a message instead of
-  being used.
+- **Exit stops monitoring**, it does not pause it. Opening ReadWatch again starts idle and waits for
+  Start, rather than resuming what was running when you quit. A folder or log that is no longer the
+  same object as when you set it up is refused with a message instead of being used.
 - Uninstall removes everything immediately except the running program file and its folder, which
   Windows deletes at the next restart.
 - Cleanup is best-effort when the target has gone: a deleted watched folder, or one whose rules were

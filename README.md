@@ -77,8 +77,9 @@ Prefer the exact path for anything you have several copies of; a machine typical
 `python.exe` installs, and a filename is easy to imitate, which matters for a tool whose job is
 noticing an unexpected reader. Nothing is excluded until you say so — the list lives in Settings.
 
-Closing the window hides it to the tray; **Exit** quits and stops the service. **Start ReadWatch
-at sign-in** launches it hidden in the tray on login. **Keep the window on top** is in Settings, and
+Closing the window hides it to the tray; **Exit** quits, stops monitoring and stops the service —
+opening ReadWatch again starts idle, waiting for you to press Start. **Start ReadWatch at sign-in**
+puts it in the tray on login, also idle. **Keep the window on top** is in Settings, and
 hovering a row that is too narrow for its path shows the whole thing.
 
 ## Log
