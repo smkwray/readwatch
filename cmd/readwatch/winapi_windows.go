@@ -853,13 +853,17 @@ var (
 	procOpenFileById                    = kernel32.NewProc("OpenFileById")
 	procDuplicateHandle                 = kernel32.NewProc("DuplicateHandle")
 	procReplaceFileW                    = kernel32.NewProc("ReplaceFileW")
-	procCreateNamedPipeW                = kernel32.NewProc("CreateNamedPipeW")
-	procConnectNamedPipe                = kernel32.NewProc("ConnectNamedPipe")
-	procDisconnectNamedPipe             = kernel32.NewProc("DisconnectNamedPipe")
-	procWaitNamedPipeW                  = kernel32.NewProc("WaitNamedPipeW")
-	procSetNamedPipeHandleState         = kernel32.NewProc("SetNamedPipeHandleState")
-	procFlushFileBuffers                = kernel32.NewProc("FlushFileBuffers")
-	procGetFullPathNameW                = kernel32.NewProc("GetFullPathNameW")
+	// Known folders are the authority for these locations. An elevated process
+	// must not take them from inherited environment variables, which the account
+	// it elevated from controls.
+	procSHGetKnownFolderPath    = shell32.NewProc("SHGetKnownFolderPath")
+	procCreateNamedPipeW        = kernel32.NewProc("CreateNamedPipeW")
+	procConnectNamedPipe        = kernel32.NewProc("ConnectNamedPipe")
+	procDisconnectNamedPipe     = kernel32.NewProc("DisconnectNamedPipe")
+	procWaitNamedPipeW          = kernel32.NewProc("WaitNamedPipeW")
+	procSetNamedPipeHandleState = kernel32.NewProc("SetNamedPipeHandleState")
+	procFlushFileBuffers        = kernel32.NewProc("FlushFileBuffers")
+	procGetFullPathNameW        = kernel32.NewProc("GetFullPathNameW")
 
 	procRegisterClassExW       = user32.NewProc("RegisterClassExW")
 	procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")

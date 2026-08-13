@@ -35,19 +35,35 @@ type appPaths struct {
 	StartMenu  string
 }
 
+// Known-folder identifiers. These are asked of Windows rather than read from
+// the environment: an elevated process inherits ProgramFiles, ProgramData and
+// APPDATA from whoever launched it, so trusting them would let the account being
+// protected against choose where the installer writes and what the uninstaller
+// elevates.
+var (
+	folderIDProgramFiles = GUID{0x905e63b6, 0xc1bf, 0x494e, [8]byte{0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a}}
+	folderIDProgramData  = GUID{0x62ab5d82, 0xfdc1, 0x4dc3, [8]byte{0xa9, 0xdd, 0x07, 0x0d, 0x1d, 0x49, 0x5d, 0x97}}
+	folderIDPrograms     = GUID{0xa77f5d77, 0x2e2b, 0x44c3, [8]byte{0xa6, 0xa2, 0xab, 0xa6, 0x01, 0x05, 0x4a, 0x51}}
+)
+
+func knownFolderPath(id *GUID, fallback string) string {
+	var p *uint16
+	hr, _, _ := procSHGetKnownFolderPath.Call(uintptr(unsafe.Pointer(id)), 0, 0, uintptr(unsafe.Pointer(&p)))
+	if failed(hr) || p == nil {
+		// A fixed literal, never the environment: if Windows cannot answer, the
+		// answer still must not be something another process can set.
+		return fallback
+	}
+	defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(p)))
+	return utf16FromPtr(p)
+}
+
+// paths resolves the machine-wide locations plus the Start-menu entry of the
+// account that is running. Everything privileged uses the machine ones.
 func paths() appPaths {
-	programFiles := os.Getenv("ProgramFiles")
-	if programFiles == "" {
-		programFiles = `C:\Program Files`
-	}
-	programData := os.Getenv("ProgramData")
-	if programData == "" {
-		programData = `C:\ProgramData`
-	}
-	appData := os.Getenv("APPDATA")
-	if appData == "" {
-		appData = filepath.Join(os.Getenv("USERPROFILE"), `AppData\Roaming`)
-	}
+	programFiles := knownFolderPath(&folderIDProgramFiles, `C:\Program Files`)
+	programData := knownFolderPath(&folderIDProgramData, `C:\ProgramData`)
+	programs := knownFolderPath(&folderIDPrograms, filepath.Join(os.Getenv("APPDATA"), `Microsoft\Windows\Start Menu\Programs`))
 	installDir := filepath.Join(programFiles, appName)
 	dataDir := filepath.Join(programData, appName)
 	return appPaths{
@@ -58,7 +74,7 @@ func paths() appPaths {
 		DataDir:    dataDir,
 		Config:     filepath.Join(dataDir, configFile),
 		DefaultLog: `C:\Tools\ReadWatch.log`,
-		StartMenu:  filepath.Join(appData, `Microsoft\Windows\Start Menu\Programs`, "ReadWatch.lnk"),
+		StartMenu:  filepath.Join(programs, "ReadWatch.lnk"),
 	}
 }
 
@@ -123,32 +139,6 @@ func currentUserName() string {
 		return domain + `\` + name
 	}
 	return name
-}
-
-func enablePrivilege(name string) error {
-	var token HANDLE
-	r, _, e := procOpenProcessToken.Call(procGetCurrentProcessHandle(), TOKEN_QUERY|TOKEN_ADJUST_PRIVILEGES, uintptr(unsafe.Pointer(&token)))
-	if r == 0 {
-		return winErr("OpenProcessToken", e)
-	}
-	defer closeHandle(token)
-
-	var luid LUID
-	r, _, e = procLookupPrivilegeValueW.Call(0, uintptr(unsafe.Pointer(utf16Ptr(name))), uintptr(unsafe.Pointer(&luid)))
-	if r == 0 {
-		return winErr("LookupPrivilegeValue", e)
-	}
-	tp := TOKEN_PRIVILEGES{PrivilegeCount: 1}
-	tp.Privileges[0] = LUIDAndAttributes{Luid: luid, Attributes: SE_PRIVILEGE_ENABLED}
-	r, _, e = procAdjustTokenPrivileges.Call(uintptr(token), 0, uintptr(unsafe.Pointer(&tp)), 0, 0, 0)
-	if r == 0 {
-		return winErr("AdjustTokenPrivileges", e)
-	}
-	last, _, _ := procGetLastError.Call()
-	if last == ERROR_NOT_ALL_ASSIGNED {
-		return errors.New("SeSecurityPrivilege is not assigned to this account")
-	}
-	return nil
 }
 
 func securityAttributesFromSDDL(sddl string) (SECURITY_ATTRIBUTES, uintptr, error) {

@@ -5,7 +5,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -699,7 +698,3 @@ func tokenUserSID(token HANDLE) (string, error) {
 	defer procLocalFree.Call(uintptr(unsafe.Pointer(sidText)))
 	return utf16FromPtr(sidText), nil
 }
-
-// displayPath is what the user sees. Internal volume-GUID spellings are an
-// implementation detail and would be unreadable in the UI or the log.
-func displayPath(p string) string { return filepath.Clean(p) }

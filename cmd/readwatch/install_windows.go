@@ -113,27 +113,92 @@ func installApp() error {
 	return nil
 }
 
+// beginUninstall always elevates the protected installed executable, whichever
+// copy of ReadWatch was run. The previous version copied itself into the user's
+// own Temp directory and elevated that copy: the bytes that got administrator
+// rights lived somewhere the unelevated account could rewrite between the copy
+// and the UAC prompt. The installed image is the one thing here that account
+// cannot modify.
 func beginUninstall(quiet bool) error {
-	if !executableIsInstalled() && isElevated() {
-		return uninstallElevated(quiet)
-	}
-	tempDir := filepath.Join(os.TempDir(), "ReadWatch-Uninstall")
-	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		return err
-	}
-	tempExe := filepath.Join(tempDir, fmt.Sprintf("ReadWatch-Uninstall-%d.exe", time.Now().UnixNano()))
-	src, err := os.Executable()
-	if err != nil {
-		return err
-	}
-	if err := copyFile(src, tempExe); err != nil {
-		return err
+	p := paths()
+	if err := verifyPlainFile(p.Exe); err != nil {
+		return fmt.Errorf("the installed copy of ReadWatch is missing or is not a plain file, so there is nothing safe to elevate; reinstall ReadWatch and then uninstall it: %w", err)
 	}
 	args := "--uninstall-elevated"
 	if quiet {
 		args += " --quiet"
 	}
-	return elevatePath(tempExe, args)
+	return elevatePath(p.Exe, args)
+}
+
+// verifyPlainFile refuses a directory or a reparse point standing where a file
+// is expected.
+func verifyPlainFile(path string) error {
+	h, err := openForIdentity(path)
+	if err != nil {
+		return err
+	}
+	defer closeHandle(h)
+	return requireNotReparsePoint(h)
+}
+
+func openForIdentity(path string) (HANDLE, error) {
+	r, _, e := procCreateFileW.Call(
+		uintptr(unsafe.Pointer(utf16Ptr(path))),
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+		0, OPEN_EXISTING,
+		FILE_FLAG_OPEN_REPARSE_POINT,
+		0,
+	)
+	if r == INVALID_HANDLE_VALUE || r == 0 {
+		return 0, fmt.Errorf("open %s: %w", path, e)
+	}
+	return HANDLE(r), nil
+}
+
+// sameObject compares two paths by what they actually refer to rather than by
+// how they are spelled.
+func sameObject(a, b string) (bool, error) {
+	ha, err := openForIdentity(a)
+	if err != nil {
+		return false, err
+	}
+	defer closeHandle(ha)
+	hb, err := openForIdentity(b)
+	if err != nil {
+		return false, err
+	}
+	defer closeHandle(hb)
+
+	var ia, ib FILE_ID_INFO
+	if r, _, e := procGetFileInformationByHandleEx.Call(uintptr(ha), FileIdInfo, uintptr(unsafe.Pointer(&ia)), unsafe.Sizeof(ia)); r == 0 {
+		return false, winErr("GetFileInformationByHandleEx(FileIdInfo)", e)
+	}
+	if r, _, e := procGetFileInformationByHandleEx.Call(uintptr(hb), FileIdInfo, uintptr(unsafe.Pointer(&ib)), unsafe.Sizeof(ib)); r == 0 {
+		return false, winErr("GetFileInformationByHandleEx(FileIdInfo)", e)
+	}
+	if ia != ib {
+		return false, nil
+	}
+	finalA, err := finalPath(ha)
+	if err != nil {
+		return false, err
+	}
+	finalB, err := finalPath(hb)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(finalA, finalB), nil
+}
+
+func finalPath(h HANDLE) (string, error) {
+	buf := make([]uint16, 1024)
+	r, _, e := procGetFinalPathNameByHandleW.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), VOLUME_NAME_GUID)
+	if r == 0 || int(r) >= len(buf) {
+		return "", winErr("GetFinalPathNameByHandle", e)
+	}
+	return syscall.UTF16ToString(buf[:r]), nil
 }
 
 func elevatePath(exe, args string) error {
@@ -156,6 +221,19 @@ func uninstallElevated(quiet bool) error {
 		return errors.New("uninstall requires administrator permission")
 	}
 	p := paths()
+	// Only the installed image may run the elevated cleanup. Reaching here as
+	// some other executable means the elevation was aimed at the wrong bytes.
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	same, err := sameObject(self, p.Exe)
+	if err != nil {
+		return fmt.Errorf("confirm this is the installed copy of ReadWatch: %w", err)
+	}
+	if !same {
+		return errors.New("run the uninstall from the installed copy of ReadWatch, or from Installed apps")
+	}
 	cfg, cfgErr := loadServiceConfig(p.Config, p.DefaultLog)
 	if cfgErr != nil && !errors.Is(cfgErr, os.ErrNotExist) {
 		return fmt.Errorf("read configuration before uninstall: %w", cfgErr)
@@ -196,6 +274,13 @@ func uninstallElevated(quiet bool) error {
 			return err
 		}
 	}
+	// Fail closed. If any audit rule or policy change is still unresolved, stop
+	// before deleting the service and the configuration: that configuration is
+	// the only record of what was changed, and this installation is the only
+	// thing that can repair it.
+	if cfgErr == nil && (len(cfg.Snapshots) > 0 || cfg.AuditPolicy != nil) {
+		return errors.New("ReadWatch still has auditing changes it could not undo, so it was left installed rather than losing the record of them; start ReadWatch, stop monitoring, and try again")
+	}
 	if err := deleteInstalledService(); err != nil {
 		return err
 	}
@@ -204,22 +289,66 @@ func uninstallElevated(quiet bool) error {
 	}
 	_ = removeViewerPreferences()
 	_ = os.Remove(p.StartMenu)
+
+	// The user's log is theirs, and is deliberately left. Only files ReadWatch
+	// created are removed, and the directory goes only if that emptied it.
+	for _, name := range []string{configFile, "service-error.log"} {
+		_ = os.Remove(filepath.Join(p.DataDir, name))
+	}
+	if entries, err := os.ReadDir(p.DataDir); err == nil {
+		leftovers := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), configFile+".") && strings.HasSuffix(entry.Name(), ".tmp") {
+				_ = os.Remove(filepath.Join(p.DataDir, entry.Name()))
+				continue
+			}
+			leftovers = append(leftovers, entry.Name())
+		}
+		if len(leftovers) == 0 {
+			_ = os.Remove(p.DataDir)
+		}
+	}
+
+	// Never RemoveAll the installation folder as SYSTEM: delete what was
+	// installed, report anything else, and schedule the running executable and
+	// then its folder for deletion at the next restart. Order matters - a
+	// directory is only removed once it is empty.
+	for _, name := range []string{"ReadWatch.ico", installedExe + ".manifest"} {
+		_ = os.Remove(filepath.Join(p.InstallDir, name))
+	}
+	unexpected := []string{}
+	if entries, err := os.ReadDir(p.InstallDir); err == nil {
+		for _, entry := range entries {
+			if !strings.EqualFold(entry.Name(), installedExe) {
+				unexpected = append(unexpected, entry.Name())
+			}
+		}
+	}
+	scheduled := true
+	if r, _, e := procMoveFileExW.Call(uintptr(unsafe.Pointer(utf16Ptr(p.Exe))), 0, MOVEFILE_DELAY_UNTIL_REBOOT); r == 0 {
+		scheduled = false
+		writeServiceDiagnostic(fmt.Errorf("schedule %s for deletion: %v", p.Exe, e))
+	}
+	if len(unexpected) == 0 {
+		if r, _, e := procMoveFileExW.Call(uintptr(unsafe.Pointer(utf16Ptr(p.InstallDir))), 0, MOVEFILE_DELAY_UNTIL_REBOOT); r == 0 {
+			scheduled = false
+			writeServiceDiagnostic(fmt.Errorf("schedule %s for deletion: %v", p.InstallDir, e))
+		}
+	}
+
+	// Last, because until this is gone the installation is still repairable.
 	if err := unregisterUninstaller(); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(p.InstallDir); err != nil {
-		return fmt.Errorf("remove installation folder: %w", err)
-	}
-	if err := os.RemoveAll(p.DataDir); err != nil {
-		return fmt.Errorf("remove configuration folder: %w", err)
-	}
-
-	self, _ := os.Executable()
-	if self != "" && !strings.EqualFold(filepath.Clean(self), filepath.Clean(p.Exe)) {
-		procMoveFileExW.Call(uintptr(unsafe.Pointer(utf16Ptr(self))), 0, 0x4)
-	}
 	if !quiet {
-		messageBox(0, "ReadWatch was removed. Your log file was left in place.", appName, MB_OK|MB_ICONINFORMATION)
+		message := "ReadWatch was removed. The program file and its folder are deleted when Windows next restarts. Your log file was left in place."
+		if !scheduled {
+			message = "ReadWatch was removed, but its program file could not be scheduled for deletion. Delete " + p.InstallDir + " by hand after restarting. Your log file was left in place."
+		}
+		if len(unexpected) > 0 {
+			message += "\r\n\r\nFiles that ReadWatch did not install were left in " + p.InstallDir + ": " + strings.Join(unexpected, ", ")
+		}
+		messageBox(0, message, appName, MB_OK|MB_ICONINFORMATION)
 	}
 	return nil
 }
