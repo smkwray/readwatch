@@ -159,13 +159,15 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 	if h == 0 {
 		opened, err := openByIdentity(snapshot.Identity)
 		if err != nil {
-			// The volume may be absent, or the object deleted. Neither is a
-			// reason to fail forever; the record is kept or dropped below.
-			if strings.Contains(err.Error(), "no longer exists") {
-				delete(cfg.Snapshots, key)
-				return save(cfg)
-			}
-			return fmt.Errorf("%s: %w", snapshot.Path, err)
+			// The object cannot be reached: deleted, or on a volume that is not
+			// mounted. There is nothing left to restore - an audit rule lives on
+			// the object, so it went wherever the object went. Dropping the record
+			// is the only outcome that ever becomes true again; keeping it blocks
+			// Stop, Apply and uninstall forever over a folder that no longer
+			// exists, which is what it did.
+			writeServiceDiagnostic(fmt.Errorf("%s: forgetting the audit record, the folder could not be found: %w", snapshot.Path, err))
+			delete(cfg.Snapshots, key)
+			return save(cfg)
 		}
 		defer closeHandle(opened)
 		h = opened
@@ -198,9 +200,13 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 		// Already back where it started. This also accepts an empty,
 		// unprotected ACL for an originally absent SACL, but never a null SACL.
 	default:
-		// Somebody else owns this now. Leaving it alone is the only safe move,
-		// and the record stays so the conflict remains visible.
-		return fmt.Errorf("auditing rules on %s changed outside ReadWatch; they were left untouched", snapshot.Path)
+		// The rules are neither what ReadWatch applied nor what it found, so
+		// somebody else has changed them and they are left alone. The record is
+		// dropped rather than kept: ReadWatch no longer owns this state, and a
+		// record it will never be able to act on blocks Stop, Apply and uninstall
+		// permanently. Same reasoning as the audit policy, which already does
+		// this. Reported once, then forgotten.
+		writeServiceDiagnostic(fmt.Errorf("auditing rules on %s changed outside ReadWatch; they were left untouched and ReadWatch has stopped tracking them", snapshot.Path))
 	}
 	delete(cfg.Snapshots, key)
 	return save(cfg)
