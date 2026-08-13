@@ -588,10 +588,15 @@ func requireFinalPath(h HANDLE, expected string) error {
 
 // openByIdentity is both the privileged binder handoff and the recovery seam.
 // The stored path may name something else entirely, so the object is found by
-// its identity or not at all. ACCESS_SYSTEM_SECURITY is the only security-
-// descriptor right needed because ReadWatch reads and writes only the SACL.
+// its identity or not at all.
+//
+// READ_CONTROL is required even though ReadWatch only ever reads and writes the
+// SACL. The documentation assigns READ_CONTROL to the owner, group and DACL, so
+// it looks droppable; measured on this host, GetSecurityInfo returns
+// ERROR_ACCESS_DENIED without it whether the handle came from OpenFileById or
+// CreateFile, and succeeds with it. See do/evidence/2026-08-13-sacl-access.
 func openByIdentity(id settings.ObjectIdentity) (HANDLE, error) {
-	return openByIdentityWithAccess(id, ACCESS_SYSTEM_SECURITY|FILE_READ_ATTRIBUTES)
+	return openByIdentityWithAccess(id, ACCESS_SYSTEM_SECURITY|READ_CONTROL|FILE_READ_ATTRIBUTES)
 }
 
 // openByIdentityWithAccess exists so the Windows filesystem tests can exercise
