@@ -3,13 +3,29 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
 )
+
+// Every vtable method below gets its own wrapper with exact pointer and scalar
+// parameter types. The generic `comMethod(obj, index, ...uintptr)` this
+// replaces converted Go pointers to uintptr at each call site, carried them
+// through a []uintptr and only then reached syscall.SyscallN - so the value had
+// stopped being a pointer long before the call that consumes it, which is
+// exactly what the unsafe.Pointer rules forbid. go vet was clean because the
+// helper hid the conversion from it, not because the pattern was sound.
+//
+// A wrapper taking unsafe.Pointer arguments would have been legal, but it
+// cannot describe this surface honestly: Show takes an HWND, SetOptions a flag
+// word, SetIconLocation a string and an index. Scalars written as
+// unsafe.Pointer(uintptr(v)) would put the ambiguity straight back. The
+// signature is the ABI documentation.
 
 var (
 	clsidShellLink  = GUID{0x00021401, 0x0000, 0x0000, [8]byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}
@@ -27,21 +43,239 @@ func hrError(label string, hr uintptr) error {
 	return fmt.Errorf("%s failed: HRESULT 0x%08x", label, uint32(hr))
 }
 
-func comMethod(obj unsafe.Pointer, index uintptr, args ...uintptr) (uintptr, uintptr, syscall.Errno) {
+// hrCancelled is what a dialog returns when the user closes it.
+const hrCancelled = 0x800704C7 // HRESULT_FROM_WIN32(ERROR_CANCELLED)
+
+// comSlot reads a method address out of an object's vtable. It returns a code
+// address, never an argument, so nothing here outlives the read.
+func comSlot(obj unsafe.Pointer, index uintptr) uintptr {
 	vtbl := *(*unsafe.Pointer)(obj)
-	fn := *(*uintptr)(unsafe.Add(vtbl, index*unsafe.Sizeof(uintptr(0))))
-	all := make([]uintptr, 0, len(args)+1)
-	all = append(all, uintptr(obj))
-	all = append(all, args...)
-	r1, r2, err := syscall.SyscallN(fn, all...)
-	return r1, r2, err
+	return *(*uintptr)(unsafe.Add(vtbl, index*unsafe.Sizeof(uintptr(0))))
+}
+
+// --- IUnknown -------------------------------------------------------------
+
+func comQueryInterface(obj unsafe.Pointer, iid *GUID) (unsafe.Pointer, error) {
+	var out unsafe.Pointer
+	hr, _, _ := syscall.SyscallN(
+		comSlot(obj, 0),
+		uintptr(obj),
+		uintptr(unsafe.Pointer(iid)),
+		uintptr(unsafe.Pointer(&out)),
+	)
+	runtime.KeepAlive(iid)
+	if failed(hr) {
+		return nil, hrError("IUnknown.QueryInterface", hr)
+	}
+	if out == nil {
+		return nil, errors.New("IUnknown.QueryInterface returned a nil interface")
+	}
+	return out, nil
 }
 
 func comRelease(obj unsafe.Pointer) {
-	if obj != nil {
-		comMethod(obj, 2)
+	if obj == nil {
+		return
 	}
+	syscall.SyscallN(comSlot(obj, 2), uintptr(obj))
 }
+
+// --- IShellLinkW ----------------------------------------------------------
+
+func shellLinkSetPath(link unsafe.Pointer, path *uint16) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(link, 20),
+		uintptr(link),
+		uintptr(unsafe.Pointer(path)),
+	)
+	runtime.KeepAlive(path)
+	if failed(hr) {
+		return hrError("IShellLinkW.SetPath", hr)
+	}
+	return nil
+}
+
+func shellLinkSetDescription(link unsafe.Pointer, text *uint16) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(link, 7),
+		uintptr(link),
+		uintptr(unsafe.Pointer(text)),
+	)
+	runtime.KeepAlive(text)
+	if failed(hr) {
+		return hrError("IShellLinkW.SetDescription", hr)
+	}
+	return nil
+}
+
+func shellLinkSetWorkingDirectory(link unsafe.Pointer, dir *uint16) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(link, 9),
+		uintptr(link),
+		uintptr(unsafe.Pointer(dir)),
+	)
+	runtime.KeepAlive(dir)
+	if failed(hr) {
+		return hrError("IShellLinkW.SetWorkingDirectory", hr)
+	}
+	return nil
+}
+
+func shellLinkSetIconLocation(link unsafe.Pointer, path *uint16, index int32) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(link, 17),
+		uintptr(link),
+		uintptr(unsafe.Pointer(path)),
+		uintptr(index),
+	)
+	runtime.KeepAlive(path)
+	if failed(hr) {
+		return hrError("IShellLinkW.SetIconLocation", hr)
+	}
+	return nil
+}
+
+// --- IPersistFile ---------------------------------------------------------
+
+func persistFileSave(persist unsafe.Pointer, path *uint16, remember bool) error {
+	flag := uintptr(0)
+	if remember {
+		flag = 1
+	}
+	hr, _, _ := syscall.SyscallN(
+		comSlot(persist, 6),
+		uintptr(persist),
+		uintptr(unsafe.Pointer(path)),
+		flag,
+	)
+	runtime.KeepAlive(path)
+	if failed(hr) {
+		return hrError("IPersistFile.Save", hr)
+	}
+	return nil
+}
+
+// --- IFileDialog ----------------------------------------------------------
+
+// fileDialogShow reports ok=false for a user cancellation, which is an outcome
+// rather than a failure.
+func fileDialogShow(dialog unsafe.Pointer, owner HWND) (bool, error) {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(dialog, 3),
+		uintptr(dialog),
+		uintptr(owner),
+	)
+	if uint32(hr) == hrCancelled {
+		return false, nil
+	}
+	if failed(hr) {
+		return false, hrError("IFileDialog.Show", hr)
+	}
+	return true, nil
+}
+
+func fileDialogGetOptions(dialog unsafe.Pointer) (uint32, error) {
+	var options uint32
+	hr, _, _ := syscall.SyscallN(
+		comSlot(dialog, 10),
+		uintptr(dialog),
+		uintptr(unsafe.Pointer(&options)),
+	)
+	if failed(hr) {
+		return 0, hrError("IFileDialog.GetOptions", hr)
+	}
+	return options, nil
+}
+
+func fileDialogSetOptions(dialog unsafe.Pointer, options uint32) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(dialog, 9),
+		uintptr(dialog),
+		uintptr(options),
+	)
+	if failed(hr) {
+		return hrError("IFileDialog.SetOptions", hr)
+	}
+	return nil
+}
+
+func fileDialogSetTitle(dialog unsafe.Pointer, title *uint16) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(dialog, 17),
+		uintptr(dialog),
+		uintptr(unsafe.Pointer(title)),
+	)
+	runtime.KeepAlive(title)
+	if failed(hr) {
+		return hrError("IFileDialog.SetTitle", hr)
+	}
+	return nil
+}
+
+func fileDialogSetFileName(dialog unsafe.Pointer, name *uint16) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(dialog, 15),
+		uintptr(dialog),
+		uintptr(unsafe.Pointer(name)),
+	)
+	runtime.KeepAlive(name)
+	if failed(hr) {
+		return hrError("IFileDialog.SetFileName", hr)
+	}
+	return nil
+}
+
+func fileDialogSetDefaultExtension(dialog unsafe.Pointer, ext *uint16) error {
+	hr, _, _ := syscall.SyscallN(
+		comSlot(dialog, 22),
+		uintptr(dialog),
+		uintptr(unsafe.Pointer(ext)),
+	)
+	runtime.KeepAlive(ext)
+	if failed(hr) {
+		return hrError("IFileDialog.SetDefaultExtension", hr)
+	}
+	return nil
+}
+
+func fileDialogGetResult(dialog unsafe.Pointer) (unsafe.Pointer, error) {
+	var item unsafe.Pointer
+	hr, _, _ := syscall.SyscallN(
+		comSlot(dialog, 20),
+		uintptr(dialog),
+		uintptr(unsafe.Pointer(&item)),
+	)
+	if failed(hr) {
+		return nil, hrError("IFileDialog.GetResult", hr)
+	}
+	if item == nil {
+		return nil, errors.New("IFileDialog.GetResult returned a nil item")
+	}
+	return item, nil
+}
+
+// --- IShellItem -----------------------------------------------------------
+
+// shellItemGetDisplayName returns COM-allocated memory the caller frees with
+// CoTaskMemFree.
+func shellItemGetDisplayName(item unsafe.Pointer, kind uint32) (*uint16, error) {
+	var text *uint16
+	hr, _, _ := syscall.SyscallN(
+		comSlot(item, 5),
+		uintptr(item),
+		uintptr(kind),
+		uintptr(unsafe.Pointer(&text)),
+	)
+	if failed(hr) {
+		return nil, hrError("IShellItem.GetDisplayName", hr)
+	}
+	if text == nil {
+		return nil, errors.New("IShellItem.GetDisplayName returned nil")
+	}
+	return text, nil
+}
+
+// --- COM lifetime ---------------------------------------------------------
 
 func coInit() (bool, error) {
 	hr, _, _ := procCoInitializeEx.Call(0, COINIT_APARTMENTTHREADED)
@@ -60,19 +294,32 @@ func coCreate(clsid, iid *GUID) (unsafe.Pointer, error) {
 	if failed(hr) {
 		return nil, hrError("CoCreateInstance", hr)
 	}
+	if obj == nil {
+		return nil, errors.New("CoCreateInstance returned a nil interface")
+	}
 	return obj, nil
 }
 
-func comQueryInterface(obj unsafe.Pointer, iid *GUID) (unsafe.Pointer, error) {
-	var out unsafe.Pointer
-	hr, _, _ := comMethod(obj, 0, uintptr(unsafe.Pointer(iid)), uintptr(unsafe.Pointer(&out)))
-	if failed(hr) {
-		return nil, hrError("QueryInterface", hr)
-	}
-	return out, nil
-}
+// --- Callers --------------------------------------------------------------
 
 func createShellLink(linkPath, targetPath, iconPath string) error {
+	target, err := syscall.UTF16PtrFromString(targetPath)
+	if err != nil {
+		return fmt.Errorf("encode shortcut target: %w", err)
+	}
+	description, err := syscall.UTF16PtrFromString("Monitor which processes read selected folders")
+	if err != nil {
+		return err
+	}
+	workingDir, err := syscall.UTF16PtrFromString(filepath.Dir(targetPath))
+	if err != nil {
+		return fmt.Errorf("encode shortcut working directory: %w", err)
+	}
+	link16, err := syscall.UTF16PtrFromString(linkPath)
+	if err != nil {
+		return fmt.Errorf("encode shortcut path: %w", err)
+	}
+
 	inited, err := coInit()
 	if err != nil {
 		return err
@@ -86,18 +333,22 @@ func createShellLink(linkPath, targetPath, iconPath string) error {
 	}
 	defer comRelease(link)
 
-	if hr, _, _ := comMethod(link, 20, uintptr(unsafe.Pointer(utf16Ptr(targetPath)))); failed(hr) {
-		return hrError("IShellLink.SetPath", hr)
+	if err := shellLinkSetPath(link, target); err != nil {
+		return err
 	}
-	if hr, _, _ := comMethod(link, 7, uintptr(unsafe.Pointer(utf16Ptr("Monitor which processes read selected folders")))); failed(hr) {
-		return hrError("IShellLink.SetDescription", hr)
+	if err := shellLinkSetDescription(link, description); err != nil {
+		return err
 	}
-	if hr, _, _ := comMethod(link, 9, uintptr(unsafe.Pointer(utf16Ptr(filepath.Dir(targetPath))))); failed(hr) {
-		return hrError("IShellLink.SetWorkingDirectory", hr)
+	if err := shellLinkSetWorkingDirectory(link, workingDir); err != nil {
+		return err
 	}
 	if iconPath != "" {
-		if hr, _, _ := comMethod(link, 17, uintptr(unsafe.Pointer(utf16Ptr(iconPath))), 0); failed(hr) {
-			return hrError("IShellLink.SetIconLocation", hr)
+		icon, err := syscall.UTF16PtrFromString(iconPath)
+		if err != nil {
+			return fmt.Errorf("encode shortcut icon path: %w", err)
+		}
+		if err := shellLinkSetIconLocation(link, icon, 0); err != nil {
+			return err
 		}
 	}
 
@@ -109,13 +360,14 @@ func createShellLink(linkPath, targetPath, iconPath string) error {
 	if err := os.MkdirAll(filepath.Dir(linkPath), 0o755); err != nil {
 		return err
 	}
-	if hr, _, _ := comMethod(persist, 6, uintptr(unsafe.Pointer(utf16Ptr(linkPath))), 1); failed(hr) {
-		return hrError("IPersistFile.Save", hr)
-	}
-	return nil
+	return persistFileSave(persist, link16, true)
 }
 
 func pickFolder(owner HWND) (string, bool, error) {
+	title, err := syscall.UTF16PtrFromString("Choose a folder to watch")
+	if err != nil {
+		return "", false, err
+	}
 	inited, err := coInit()
 	if err != nil {
 		return "", false, err
@@ -129,26 +381,50 @@ func pickFolder(owner HWND) (string, bool, error) {
 	}
 	defer comRelease(dlg)
 
-	var options uint32
-	if hr, _, _ := comMethod(dlg, 10, uintptr(unsafe.Pointer(&options))); failed(hr) {
-		return "", false, hrError("IFileDialog.GetOptions", hr)
+	options, err := fileDialogGetOptions(dlg)
+	if err != nil {
+		return "", false, err
 	}
+	// FOS_PICKFOLDERS is what makes this the folder picker the contract
+	// requires, so a failure here must not fall through to a file dialog.
 	options |= FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST
-	if hr, _, _ := comMethod(dlg, 9, uintptr(options)); failed(hr) {
-		return "", false, hrError("IFileDialog.SetOptions", hr)
+	if err := fileDialogSetOptions(dlg, options); err != nil {
+		return "", false, err
 	}
-	comMethod(dlg, 17, uintptr(unsafe.Pointer(utf16Ptr("Choose a folder to watch"))))
-	hr, _, _ := comMethod(dlg, 3, uintptr(owner))
-	if uint32(hr) == 0x800704C7 { // HRESULT_FROM_WIN32(ERROR_CANCELLED)
-		return "", false, nil
+	if err := fileDialogSetTitle(dlg, title); err != nil {
+		return "", false, err
 	}
-	if failed(hr) {
-		return "", false, hrError("IFileDialog.Show", hr)
+	shown, err := fileDialogShow(dlg, owner)
+	if err != nil || !shown {
+		return "", false, err
 	}
 	return fileDialogResult(dlg)
 }
 
 func pickLogFile(owner HWND, current, format string) (string, bool, error) {
+	ext := ".log"
+	if format == "jsonl" {
+		ext = ".jsonl"
+	} else if format == "csv" {
+		ext = ".csv"
+	}
+	name := filepath.Base(current)
+	if name == "." || name == string(filepath.Separator) || name == "" {
+		name = "ReadWatch" + ext
+	}
+	title, err := syscall.UTF16PtrFromString("Choose the ReadWatch log file")
+	if err != nil {
+		return "", false, err
+	}
+	name16, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		return "", false, err
+	}
+	ext16, err := syscall.UTF16PtrFromString(strings.TrimPrefix(ext, "."))
+	if err != nil {
+		return "", false, err
+	}
+
 	inited, err := coInit()
 	if err != nil {
 		return "", false, err
@@ -162,31 +438,27 @@ func pickLogFile(owner HWND, current, format string) (string, bool, error) {
 	}
 	defer comRelease(dlg)
 
-	var options uint32
-	comMethod(dlg, 10, uintptr(unsafe.Pointer(&options)))
+	options, err := fileDialogGetOptions(dlg)
+	if err != nil {
+		return "", false, err
+	}
 	options |= FOS_FORCEFILESYSTEM | FOS_OVERWRITEPROMPT | FOS_NOREADONLYRETURN
-	comMethod(dlg, 9, uintptr(options))
-	comMethod(dlg, 17, uintptr(unsafe.Pointer(utf16Ptr("Choose the ReadWatch log file"))))
+	if err := fileDialogSetOptions(dlg, options); err != nil {
+		return "", false, err
+	}
+	if err := fileDialogSetTitle(dlg, title); err != nil {
+		return "", false, err
+	}
+	if err := fileDialogSetFileName(dlg, name16); err != nil {
+		return "", false, err
+	}
+	if err := fileDialogSetDefaultExtension(dlg, ext16); err != nil {
+		return "", false, err
+	}
 
-	ext := ".log"
-	if format == "jsonl" {
-		ext = ".jsonl"
-	} else if format == "csv" {
-		ext = ".csv"
-	}
-	name := filepath.Base(current)
-	if name == "." || name == string(filepath.Separator) || name == "" {
-		name = "ReadWatch" + ext
-	}
-	comMethod(dlg, 15, uintptr(unsafe.Pointer(utf16Ptr(name))))
-	comMethod(dlg, 22, uintptr(unsafe.Pointer(utf16Ptr(strings.TrimPrefix(ext, ".")))))
-
-	hr, _, _ := comMethod(dlg, 3, uintptr(owner))
-	if uint32(hr) == 0x800704C7 {
-		return "", false, nil
-	}
-	if failed(hr) {
-		return "", false, hrError("IFileDialog.Show", hr)
+	shown, err := fileDialogShow(dlg, owner)
+	if err != nil || !shown {
+		return "", false, err
 	}
 	path, ok, err := fileDialogResult(dlg)
 	if err == nil && ok && filepath.Ext(path) == "" {
@@ -196,14 +468,14 @@ func pickLogFile(owner HWND, current, format string) (string, bool, error) {
 }
 
 func fileDialogResult(dlg unsafe.Pointer) (string, bool, error) {
-	var item unsafe.Pointer
-	if hr, _, _ := comMethod(dlg, 20, uintptr(unsafe.Pointer(&item))); failed(hr) {
-		return "", false, hrError("IFileDialog.GetResult", hr)
+	item, err := fileDialogGetResult(dlg)
+	if err != nil {
+		return "", false, err
 	}
 	defer comRelease(item)
-	var text *uint16
-	if hr, _, _ := comMethod(item, 5, SIGDN_FILESYSPATH, uintptr(unsafe.Pointer(&text))); failed(hr) {
-		return "", false, hrError("IShellItem.GetDisplayName", hr)
+	text, err := shellItemGetDisplayName(item, SIGDN_FILESYSPATH)
+	if err != nil {
+		return "", false, err
 	}
 	defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(text)))
 	return utf16FromPtr(text), true, nil
