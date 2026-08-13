@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,21 +30,20 @@ type Writer struct {
 	dirty  bool
 }
 
-func Open(path string, format Format) (*Writer, error) {
-	if path == "" {
-		return nil, errors.New("log path is empty")
+// New takes an already-open file and owns it from then on. It deliberately
+// cannot open a path: the service opens the log under the connected owner's
+// token and hands the handle here, so nothing in the writing path can be
+// redirected by changing what the configured pathname points at. Creating the
+// parent directory is gone for the same reason - a missing log folder is an
+// error the owner fixes, not something to create with SYSTEM's authority.
+func New(file *os.File, format Format) (*Writer, error) {
+	if file == nil {
+		return nil, errors.New("no log file was provided")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create log directory: %w", err)
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	w := &Writer{file: f, buf: bufio.NewWriterSize(f, 64*1024), format: format}
+	w := &Writer{file: file, buf: bufio.NewWriterSize(file, 64*1024), format: format}
 	if format == CSV {
 		w.csv = csv.NewWriter(w.buf)
-		if info, statErr := f.Stat(); statErr == nil && info.Size() == 0 {
+		if info, statErr := file.Stat(); statErr == nil && info.Size() == 0 {
 			_ = w.csv.Write([]string{"time", "action", "process", "pid", "user", "path", "process_path", "record_id", "access_mask"})
 		}
 	}

@@ -224,8 +224,11 @@ func uninstallElevated(quiet bool) error {
 	return nil
 }
 
+// directAuditCleanup is the uninstall path when the service cannot be reached.
+// It undoes ReadWatch's machine changes from the journal, by identity, without
+// resolving any of the recorded pathnames.
 func directAuditCleanup(cfg *settings.Config) error {
-	if err := cleanupAuditState(cfg); err != nil {
+	if err := recoverJournalOffline(cfg); err != nil {
 		return err
 	}
 	cfg.Enabled = false
