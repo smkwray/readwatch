@@ -52,6 +52,17 @@ func installApp() error {
 	if err := stopInstalledService(8 * time.Second); err != nil {
 		return err
 	}
+	// The version-1 gate has to run while the old executable is still in place.
+	// A version-1 configuration that still owns audit rules records them by
+	// path, and a path is not enough to find those objects again afterwards - so
+	// the only version that can undo them is the one that applied them. Replacing
+	// the binary first would strand that machine state with nothing able to
+	// repair it.
+	if existing, loadErr := settings.Load(p.Config, p.DefaultLog, ownerSID, ownerName); loadErr == nil {
+		if err := existing.MigrateFromV1(); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(p.InstallDir, 0o755); err != nil {
 		return err
 	}
