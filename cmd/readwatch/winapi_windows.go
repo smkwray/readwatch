@@ -703,7 +703,6 @@ const (
 	FILE_APPEND_DATA             = 0x0004
 	FILE_READ_ATTRIBUTES         = 0x0080
 	FILE_TRAVERSE                = 0x0020
-	READ_CONTROL                 = 0x00020000
 	ACCESS_SYSTEM_SECURITY       = 0x01000000
 	FILE_SHARE_READ              = 0x00000001
 	FILE_SHARE_WRITE             = 0x00000002
@@ -842,14 +841,13 @@ var (
 	procGetFileAttributesW     = kernel32.NewProc("GetFileAttributesW")
 	procMoveFileExW            = kernel32.NewProc("MoveFileExW")
 	procCreateFileW            = kernel32.NewProc("CreateFileW")
-	// The capability set: identify an open object, reopen it without consulting
-	// its name again, and find it later by identity alone.
+	// The capability set: identify an open object and find it again by identity
+	// alone, without consulting its configured name.
 	procGetFileInformationByHandle      = kernel32.NewProc("GetFileInformationByHandle")
 	procGetFileInformationByHandleEx    = kernel32.NewProc("GetFileInformationByHandleEx")
 	procGetVolumeInformationByHandleW   = kernel32.NewProc("GetVolumeInformationByHandleW")
 	procGetFinalPathNameByHandleW       = kernel32.NewProc("GetFinalPathNameByHandleW")
 	procGetVolumeNameForVolumeMountPntW = kernel32.NewProc("GetVolumeNameForVolumeMountPointW")
-	procReOpenFile                      = kernel32.NewProc("ReOpenFile")
 	procOpenFileById                    = kernel32.NewProc("OpenFileById")
 	procDuplicateHandle                 = kernel32.NewProc("DuplicateHandle")
 	procReplaceFileW                    = kernel32.NewProc("ReplaceFileW")

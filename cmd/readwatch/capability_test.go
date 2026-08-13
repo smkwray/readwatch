@@ -48,10 +48,11 @@ func TestValidateLexicalPathRejections(t *testing.T) {
 
 func TestValidateLexicalPathNormalises(t *testing.T) {
 	cases := map[string]string{
-		`C:\Docs\Sub`:  `C:\Docs\Sub`,
-		`c:\docs\sub`:  `C:\docs\sub`,
-		`C:/Docs/Sub`:  `C:\Docs\Sub`,
-		`C:\Docs\Sub\`: `C:\Docs\Sub`,
+		`C:\Docs\Sub`:                `C:\Docs\Sub`,
+		`c:\docs\sub`:                `C:\docs\sub`,
+		`C:/Docs/Sub`:                `C:\Docs\Sub`,
+		`C:\Docs\Sub\`:               `C:\Docs\Sub`,
+		`C:\AI\image\ComfyUI\output`: `C:\AI\image\ComfyUI\output`,
 	}
 	for in, want := range cases {
 		got, err := validateLexicalPath(in)
@@ -193,6 +194,70 @@ func TestIdentitySurvivesRenameAndDistinguishesReplacement(t *testing.T) {
 	if first.Equal(impostor) {
 		t.Error("a different folder at the same path produced the same identity; substitution would go unnoticed")
 	}
+}
+
+// The binder opens a second handle by file ID while the owner's original
+// no-delete handle is still open. This proves the two coexist, and pins down
+// which of them actually holds the folder still.
+//
+// The answer is not the identity handle. It asks for no data access, and
+// Windows exempts attribute-only opens from share-mode enforcement, so on its
+// own it does not stop a rename - the first version of this test asserted that
+// it did and failed here on the host. That is why the binder keeps the owner
+// handle for the whole session rather than closing it once the identity handle
+// exists.
+//
+// Ordinary attribute access is used deliberately; the privileged
+// ACCESS_SYSTEM_SECURITY open needs the service and is covered by a host run.
+func TestOpenByIdentityHandoffKeepsRootPinned(t *testing.T) {
+	base := t.TempDir()
+	original := filepath.Join(base, "watched")
+	if err := os.Mkdir(original, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ownerHandle, identity, _, err := openWatchedFolderAsClientForTest(original)
+	if err != nil {
+		t.Fatalf("open %s as owner: %v", original, err)
+	}
+	ownerOpen := true
+	defer func() {
+		if ownerOpen {
+			closeHandle(ownerHandle)
+		}
+	}()
+
+	identityHandle, err := openByIdentityWithAccess(identity, FILE_READ_ATTRIBUTES)
+	if err != nil {
+		t.Fatalf("open %s by identity while the owner handle is open: %v", original, err)
+	}
+	identityOpen := true
+	defer func() {
+		if identityOpen {
+			closeHandle(identityHandle)
+		}
+	}()
+
+	// While the owner handle is open, the folder is pinned.
+	renamed := filepath.Join(base, "moved")
+	if err := os.Rename(original, renamed); err == nil {
+		t.Fatal("the folder was renamed while the owner handle was open; the audit rule could be moved off the object it was applied to")
+	}
+
+	// Close it, and the identity handle alone does not hold the folder. This is
+	// the measurement the binder's lifetime decision rests on: if this ever
+	// starts blocking renames, the owner handle could be released at bind time.
+	closeHandle(ownerHandle)
+	ownerOpen = false
+	if err := os.Rename(original, renamed); err != nil {
+		t.Fatalf("an attribute-only identity handle blocked a rename, which the binder does not rely on: %v", err)
+	}
+	if err := os.Rename(renamed, original); err != nil {
+		t.Fatal(err)
+	}
+
+	closeHandle(identityHandle)
+	identityOpen = false
 }
 
 // openWatchedFolderAsClientForTest runs the binder's per-folder open without
