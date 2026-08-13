@@ -101,6 +101,11 @@ path, event record ID, and access mask.
   account's permissions and will create the file, but not its folder.
 - Uninstalling removes everything immediately except the program file itself, which Windows deletes
   at the next restart because it is running at the time.
+- **Cleanup is best-effort when a folder has gone.** ReadWatch removes its audit rule from every
+  folder it applied one to. If a watched folder is deleted, or its rules are changed by something
+  else, ReadWatch says so once and stops tracking it rather than refusing to continue — an
+  unfinishable cleanup used to block Stop, Save and uninstall permanently. A folder that is only
+  temporarily unreachable is retried, not forgotten.
 - Event 4663 reports an exercised access right, not which bytes were read.
 - Applying the audit entry rewrites the security descriptor of every file already in the folder —
   reversible, but not instant on a large tree.

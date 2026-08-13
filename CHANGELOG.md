@@ -24,6 +24,9 @@ have made SYSTEM act on a different object. Closing that changed several things 
   being used.
 - Uninstall removes everything immediately except the running program file and its folder, which
   Windows deletes at the next restart.
+- Cleanup is best-effort when the target has gone: a deleted watched folder, or one whose rules were
+  changed elsewhere, is reported once and forgotten rather than blocking Stop, Save and uninstall
+  forever. A temporarily unreachable folder is retried instead.
 
 ### Security
 

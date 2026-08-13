@@ -284,19 +284,19 @@ func saclStateFromDescriptor(sd uintptr, sddl string) (saclState, error) {
 // requires the same protection state, ACL revision and ordered ACE bytes. The only
 // normalisations are:
 //   - AI/AR are automatic-inheritance bookkeeping and are not compared; and
-//   - an absent SACL and a valid empty SACL are equivalent only while both are
-//     unprotected. Both contain no audit ACEs and remain open to inheritance.
+//   - absent, null and valid empty SACLs are equivalent only while both are
+//     unprotected. All three contain no ACEs and remain open to inheritance.
 //
-// A null SACL is never equivalent to either one.
+// A protected null SACL remains distinct from an absent or valid empty SACL.
 func equivalentSACL(left, right saclState) bool {
 	if left.protected != right.protected {
 		return false
 	}
-	if left.null || right.null {
-		return left.present == right.present && left.null == right.null
-	}
 	if !left.protected && left.noAuditACEs() && right.noAuditACEs() {
 		return true
+	}
+	if left.null || right.null {
+		return left.present == right.present && left.null == right.null
 	}
 	if left.present != right.present || left.revision != right.revision || len(left.aces) != len(right.aces) {
 		return false
@@ -310,7 +310,7 @@ func equivalentSACL(left, right saclState) bool {
 }
 
 func (s saclState) noAuditACEs() bool {
-	return !s.present || (!s.null && len(s.aces) == 0)
+	return !s.present || s.null || len(s.aces) == 0
 }
 
 func saclSecurityInformation(protected bool) uintptr {
@@ -369,8 +369,9 @@ func addReadAuditRule(h HANDLE, protected bool) error {
 // present null SACL rather than clearing SE_SACL_PRESENT. An absent original is
 // therefore restored by revoking ReadWatch's sole Everyone audit entry from the
 // current ACL and writing the resulting valid empty ACL as unprotected. Windows
-// may retain that empty ACL and add AI; equivalentSACL treats that representation
-// as the same inheriting, zero-ACE state, but never equates it with a null SACL.
+// may retain that empty ACL or normalise it to an unprotected null SACL and add
+// AI. equivalentSACL accepts those zero-ACE inheriting representations, while
+// keeping protected null distinct.
 func restoreSACL(h HANDLE, sddl string) error {
 	original, err := parseSACLState(sddl)
 	if err != nil {
