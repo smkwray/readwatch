@@ -890,9 +890,13 @@ var (
 	procWaitForMultipleObjects = kernel32.NewProc("WaitForMultipleObjects")
 	procCancelIoEx             = kernel32.NewProc("CancelIoEx")
 	procCloseHandle            = kernel32.NewProc("CloseHandle")
-	procGetFileAttributesW     = kernel32.NewProc("GetFileAttributesW")
-	procMoveFileExW            = kernel32.NewProc("MoveFileExW")
-	procCreateFileW            = kernel32.NewProc("CreateFileW")
+	// Naming the process behind a read. ETW reports a process id and nothing
+	// else, so the image and the owner have to be asked for separately.
+	procOpenProcess                = kernel32.NewProc("OpenProcess")
+	procQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
+	procGetFileAttributesW         = kernel32.NewProc("GetFileAttributesW")
+	procMoveFileExW                = kernel32.NewProc("MoveFileExW")
+	procCreateFileW                = kernel32.NewProc("CreateFileW")
 	// The capability set: identify an open object and find it again by identity
 	// alone, without consulting its configured name.
 	procGetFileInformationByHandle      = kernel32.NewProc("GetFileInformationByHandle")
@@ -998,6 +1002,7 @@ var (
 	procLookupPrivilegeValueW                                = advapi32.NewProc("LookupPrivilegeValueW")
 	procAdjustTokenPrivileges                                = advapi32.NewProc("AdjustTokenPrivileges")
 	procConvertSidToStringSidW                               = advapi32.NewProc("ConvertSidToStringSidW")
+	procLookupAccountSidW                                    = advapi32.NewProc("LookupAccountSidW")
 	procConvertStringSidToSidW                               = advapi32.NewProc("ConvertStringSidToSidW")
 	procConvertStringSecurityDescriptorToSecurityDescriptorW = advapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
 	procConvertSecurityDescriptorToStringSecurityDescriptorW = advapi32.NewProc("ConvertSecurityDescriptorToStringSecurityDescriptorW")

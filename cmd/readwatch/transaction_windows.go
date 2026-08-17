@@ -292,6 +292,12 @@ func (e *ServiceEngine) startMonitoringBound(pipe HANDLE, clearError bool) error
 		return errors.New("add at least one folder before starting")
 	}
 
+	// Which mechanism runs is decided before anything privileged happens, because
+	// it decides whether anything privileged happens at all: event tracing writes
+	// no marker and needs no audit-policy change.
+	choice := settings.ChooseMechanism(cfg.Mechanism, markerCapability(cfg.Folders))
+	e.setMechanism(choice)
+
 	bound, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, cfg.Public())
 	if err != nil {
 		return err
@@ -308,7 +314,7 @@ func (e *ServiceEngine) startMonitoringBound(pipe HANDLE, clearError bool) error
 		bound.Close()
 		return err
 	}
-	if err := e.startWithCapabilities(&cfg, bound, clearError); err != nil {
+	if err := e.startWithCapabilities(&cfg, bound, choice, clearError); err != nil {
 		bound.Close()
 		return err
 	}
@@ -389,7 +395,7 @@ func logIdentityMatches(cfg *settings.Config, bound *BoundConfig) error {
 
 // startWithCapabilities applies the machine changes and starts the watcher. On
 // any failure it unwinds through the same handles it applied with.
-func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *BoundConfig, clearError bool) error {
+func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *BoundConfig, choice settings.MechanismChoice, clearError bool) error {
 	// Only folders that were actually opened get a rule. Driving this from the
 	// configured list instead would ask for a handle that does not exist, and
 	// would do so after the audit policy had already been changed.
@@ -420,25 +426,30 @@ func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *Bound
 		}
 	}
 
-	if err := ensureFileSystemAuditPolicy(cfg, e.saveConfig); err != nil {
-		return err
-	}
-	err := withPrivilege("SeSecurityPrivilege", func() error {
-		for _, root := range roots {
-			capability := bound.folderByPath(root)
-			if capability == nil {
-				return fmt.Errorf("%s: no open handle for this folder", root)
-			}
-			if err := e.applyAuditRule(cfg, *capability); err != nil {
-				return err
-			}
-			applied = append(applied, *capability)
+	// Under event tracing nothing is written to any volume and the machine-wide
+	// audit policy is not touched, so there is nothing to apply and nothing to
+	// unwind. Skipping it is the point of the mechanism, not an optimisation.
+	if choice.Use == settings.MechanismMarkers {
+		if err := ensureFileSystemAuditPolicy(cfg, e.saveConfig); err != nil {
+			return err
 		}
-		return nil
-	})
-	if err != nil {
-		rollback()
-		return err
+		err := withPrivilege("SeSecurityPrivilege", func() error {
+			for _, root := range roots {
+				capability := bound.folderByPath(root)
+				if capability == nil {
+					return fmt.Errorf("%s: no open handle for this folder", root)
+				}
+				if err := e.applyAuditRule(cfg, *capability); err != nil {
+					return err
+				}
+				applied = append(applied, *capability)
+			}
+			return nil
+		})
+		if err != nil {
+			rollback()
+			return err
+		}
 	}
 
 	cfg.ApplyPublic(bound.Public)
@@ -460,7 +471,7 @@ func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *Bound
 	// have reads under it reported as if they came from the watched folder.
 	watchCfg := cloneConfig(*cfg)
 	watchCfg.Folders = append([]string(nil), bound.AttachedPaths()...)
-	if err := e.watcher.Start(watchCfg, logFile); err != nil {
+	if err := e.watcher.Start(watchCfg, logFile, choice.Use); err != nil {
 		rollback()
 		cfg.Enabled = false
 		_ = e.saveConfig(cfg)
@@ -695,7 +706,11 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 	}
 
 	cfg = cloneConfig(oldCfg)
-	err = e.startWithCapabilities(&cfg, candidate, true)
+	// Recomputed rather than carried over: an apply can add or remove a folder,
+	// and a folder on a volume that cannot carry a marker changes the answer.
+	choice := settings.ChooseMechanism(cfg.Mechanism, markerCapability(cfg.Folders))
+	e.setMechanism(choice)
+	err = e.startWithCapabilities(&cfg, candidate, choice, true)
 	if errors.Is(err, errNoFolderAvailable) {
 		// The change itself is fine; there is just nothing reachable left to
 		// watch. Go idle with the desired state still on, so the folders are
@@ -769,7 +784,12 @@ func (e *ServiceEngine) restoreRunning(old *BoundConfig, oldCfg *settings.Config
 	if old == nil {
 		return nil
 	}
-	err := e.startWithCapabilities(oldCfg, old, false)
+	// The configuration being restored is the old one, so its mechanism is
+	// decided from the old one too. Reusing the rejected candidate's answer could
+	// put the previous folders under a mechanism they were never started with.
+	choice := settings.ChooseMechanism(oldCfg.Mechanism, markerCapability(oldCfg.Folders))
+	e.setMechanism(choice)
+	err := e.startWithCapabilities(oldCfg, old, choice, false)
 	if err == nil {
 		// The status recorded for the rejected candidate would otherwise keep
 		// describing folders this configuration does not have.
