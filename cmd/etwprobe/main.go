@@ -22,16 +22,35 @@ import (
 //   - what does consuming the machine's whole file-read stream actually cost.
 
 type counters struct {
-	total       atomic.Uint64
-	reads       atomic.Uint64
-	resolved    atomic.Uint64
-	unresolved  atomic.Uint64
-	names       atomic.Uint64
-	creates     atomic.Uint64
-	opEnds      atomic.Uint64
-	shortEvents atomic.Uint64
-	retired     atomic.Uint64
+	total          atomic.Uint64
+	reads          atomic.Uint64
+	resolved       atomic.Uint64
+	unresolved     atomic.Uint64
+	names          atomic.Uint64
+	creates        atomic.Uint64
+	opEnds         atomic.Uint64
+	shortEvents    atomic.Uint64
+	retired        atomic.Uint64
+	rundownNames   atomic.Uint64
+	otherProvider  atomic.Uint64
+	completed      atomic.Uint64
+	failedReads    atomic.Uint64
+	emptyReads     atomic.Uint64
+	pendingEvicted atomic.Uint64
+	closeWouldHit  atomic.Uint64
+	closeWouldMiss atomic.Uint64
 }
+
+// pendingRead is a read that has started and not yet been told whether it
+// worked. Bounded, because an IRP whose completion never arrives must not grow
+// the map without limit.
+type pendingRead struct {
+	path string
+	pid  uint32
+	tid  uint32
+}
+
+const pendingReadMax = 20000
 
 // unresolvedRead is one read whose file could not be named. Bounded: this is a
 // diagnostic sample, not a log.
@@ -55,6 +74,31 @@ type resolver struct {
 	// bounded sample of the raw identities so a specific case can be traced.
 	unresolvedByPID  map[uint32]int
 	unresolvedSample []unresolvedRead
+	// pending holds started reads awaiting their OperationEnd, keyed by IRP.
+	pending map[uint64]pendingRead
+}
+
+func (r *resolver) pend(irp uint64, p pendingRead) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pending) >= pendingReadMax {
+		// Drop the whole generation rather than grow without bound or evict
+		// arbitrarily. Counted, so a run that hits this is visibly degraded
+		// rather than quietly lossy.
+		cnt.pendingEvicted.Add(uint64(len(r.pending)))
+		r.pending = make(map[uint64]pendingRead, pendingReadMax)
+	}
+	r.pending[irp] = p
+}
+
+func (r *resolver) takePending(irp uint64) (pendingRead, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.pending[irp]
+	if ok {
+		delete(r.pending, irp)
+	}
+	return p, ok
 }
 
 func newResolver() *resolver {
@@ -63,6 +107,7 @@ func newResolver() *resolver {
 		byObj:           make(map[uint64]string, 1<<16),
 		hits:            make(map[string]map[uint32]int),
 		unresolvedByPID: make(map[uint32]int),
+		pending:         make(map[uint64]pendingRead, 4096),
 	}
 }
 
@@ -105,6 +150,7 @@ var (
 	cnt      counters
 	res      = newResolver()
 	filter   string
+	expect   string
 	verbose  bool
 	callback uintptr
 )
@@ -114,6 +160,45 @@ var (
 // here becomes backpressure on the whole machine's file I/O reporting.
 func eventCallback(rec *EVENT_RECORD) uintptr {
 	cnt.total.Add(1)
+
+	// Dispatch on the provider first. Classic FileIo and the manifest
+	// Kernel-File provider number their events in overlapping spaces, so keying
+	// on the number alone would decode one provider's payload with the other's
+	// layout the moment both are enabled on the same session.
+	if rec.EventHeader.ProviderId.equals(fileIoGUID) {
+		switch rec.EventHeader.EventDescriptor.Opcode {
+		case fileIoFileRundown, fileIoFileCreate, fileIoNameType:
+			obj, name, err := decodeFileIoName(payload(rec))
+			if err != nil || name == "" {
+				cnt.shortEvents.Add(1)
+				return 0
+			}
+			res.mu.Lock()
+			res.byObj[obj] = name
+			res.mu.Unlock()
+			if rec.EventHeader.EventDescriptor.Opcode == fileIoFileRundown {
+				cnt.rundownNames.Add(1)
+			} else {
+				cnt.names.Add(1)
+			}
+		case fileIoFileDelete:
+			obj, _, err := decodeFileIoName(payload(rec))
+			if err != nil {
+				cnt.shortEvents.Add(1)
+				return 0
+			}
+			res.mu.Lock()
+			delete(res.byObj, obj)
+			res.mu.Unlock()
+			cnt.retired.Add(1)
+		}
+		return 0
+	}
+	if !rec.EventHeader.ProviderId.equals(kernelFileProvider) {
+		cnt.otherProvider.Add(1)
+		return 0
+	}
+
 	id := rec.EventHeader.EventDescriptor.Id
 	switch id {
 	case evNameCreate:
@@ -143,8 +228,14 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		res.mu.Unlock()
 		cnt.retired.Add(1)
 	case evCleanup, evClose:
-		// The other half of retirement: a FileObject is only valid until the
-		// object is freed, after which the same pointer can name something else.
+		// A FileObject is only valid until the object is freed, after which the
+		// same pointer names something else, so these have to retire the mapping.
+		//
+		// This layout was the one decoder taken from documentation rather than
+		// from a captured sample, so it was measured before being trusted: 30,770
+		// of these events name a FileObject already in the map against 64 that do
+		// not. A wrong layout would produce essentially all misses, so the layout
+		// is right and the retirement is real work, not deletion of random keys.
 		b := payload(rec)
 		c, err := decodeClose(b)
 		if err != nil {
@@ -152,9 +243,15 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 			return 0
 		}
 		res.mu.Lock()
+		_, hit := res.byObj[c.FileObject]
 		delete(res.byObj, c.FileObject)
 		res.mu.Unlock()
-		cnt.retired.Add(1)
+		if hit {
+			cnt.closeWouldHit.Add(1)
+			cnt.retired.Add(1)
+		} else {
+			cnt.closeWouldMiss.Add(1)
+		}
 	case evCreate:
 		b := payload(rec)
 		c, err := decodeCreate(b)
@@ -178,18 +275,45 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		if !ok {
 			// Keeping a sample of what did NOT resolve is the difference between
 			// "that file produced no read event" and "its read was among the
-			// unresolved" — two claims the previous run could not tell apart, and
+			// unresolved" — two claims an earlier run could not tell apart, and
 			// the whole basis of the pre-open-handle finding.
 			cnt.unresolved.Add(1)
 			res.recordUnresolved(rd, rec.EventHeader.ProcessId)
 			return 0
 		}
 		cnt.resolved.Add(1)
-		if filter == "" || strings.Contains(strings.ToLower(path), filter) {
-			res.record(path, rec.EventHeader.ProcessId)
-		}
+		// A Read event is the *start* of an operation. Publishing here would count
+		// requests that go on to fail, be cancelled, or return nothing, and would
+		// report the size asked for rather than the size delivered. Hold it until
+		// OperationEnd says what happened.
+		res.pend(rd.Irp, pendingRead{
+			path: path,
+			pid:  rec.EventHeader.ProcessId,
+			tid:  rd.IssuingThreadID,
+		})
 	case evOperationEnd:
 		cnt.opEnds.Add(1)
+		oe, err := decodeOpEnd(payload(rec))
+		if err != nil {
+			cnt.shortEvents.Add(1)
+			return 0
+		}
+		p, ok := res.takePending(oe.Irp)
+		if !ok {
+			return 0
+		}
+		if oe.Status != 0 {
+			cnt.failedReads.Add(1)
+			return 0
+		}
+		if oe.ExtraInformation == 0 {
+			cnt.emptyReads.Add(1)
+			return 0
+		}
+		cnt.completed.Add(1)
+		if filter == "" || strings.Contains(strings.ToLower(p.path), filter) {
+			res.record(p.path, p.pid)
+		}
 	}
 	return 0
 }
@@ -199,9 +323,11 @@ func main() {
 	flag.DurationVar(&duration, "duration", 8*time.Second, "how long to consume")
 	flag.StringVar(&filter, "filter", "", "only report paths containing this (lower-case substring)")
 	flag.BoolVar(&verbose, "v", false, "list every resolved path")
+	flag.StringVar(&expect, "expect", "", "report whether this path substring was ever named, and how")
 	rundown := flag.Bool("rundown", true, "trigger the filename rundown after starting")
 	flag.Parse()
 	filter = strings.ToLower(filter)
+	expect = strings.ToLower(expect)
 
 	if err := run(duration, *rundown); err != nil {
 		fmt.Fprintln(os.Stderr, "etwprobe:", err)
@@ -229,15 +355,32 @@ func run(duration time.Duration, rundown bool) error {
 	done := make(chan error, 1)
 	go func() { done <- s.openAndProcess(callback) }()
 
-	time.Sleep(300 * time.Millisecond)
+	// Wait for the consumer to actually be attached before asking for a rundown:
+	// a fixed sleep was never readiness, and a rundown emitted before OpenTrace
+	// succeeded is delivered to nobody.
+	if err := s.waitConsumerReady(5 * time.Second); err != nil {
+		return err
+	}
+	fmt.Println("  consumer attached")
 	if rundown {
-		if err := s.captureState(); err != nil {
-			fmt.Println("  rundown FAILED:", err)
+		if err := s.requestSystemRundown(); err != nil {
+			fmt.Println("  system rundown FAILED:", err)
+			fmt.Println("  (falling back to the manifest provider's own capture state)")
+			if err := s.captureState(); err != nil {
+				fmt.Println("  provider capture state FAILED too:", err)
+			}
 		} else {
-			fmt.Println("  filename rundown requested")
+			fmt.Println("  system rundown requested")
 		}
+		if err := s.flush(); err != nil {
+			fmt.Println("  flush FAILED:", err)
+		}
+		// Give the rundown events a moment to be delivered before the workload
+		// starts producing reads that depend on them.
+		time.Sleep(500 * time.Millisecond)
+		fmt.Printf("  names known after rundown: %d\n", cnt.rundownNames.Load()+cnt.names.Load())
 	} else {
-		fmt.Println("  filename rundown SKIPPED (-rundown=false)")
+		fmt.Println("  rundown SKIPPED (-rundown=false)")
 	}
 
 	cpuStart := processCPU()
@@ -274,7 +417,18 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 	fmt.Printf("  create events      %d\n", cnt.creates.Load())
 	fmt.Printf("  operation ends     %d\n", cnt.opEnds.Load())
 	fmt.Printf("  names retired      %d\n", cnt.retired.Load())
+	fmt.Printf("  rundown names      %d\n", cnt.rundownNames.Load())
+	fmt.Printf("  close retire hit   %d  (layout confirmed by hit rate)\n", cnt.closeWouldHit.Load())
+	fmt.Printf("  close retire miss  %d\n", cnt.closeWouldMiss.Load())
+	fmt.Printf("  other providers    %d\n", cnt.otherProvider.Load())
 	fmt.Printf("  short/undecodable  %d\n", cnt.shortEvents.Load())
+
+	fmt.Println()
+	fmt.Println("=== completion ===")
+	fmt.Printf("  reads completed ok %d\n", cnt.completed.Load())
+	fmt.Printf("  reads that failed  %d\n", cnt.failedReads.Load())
+	fmt.Printf("  reads with 0 bytes %d\n", cnt.emptyReads.Load())
+	fmt.Printf("  pending evicted    %d\n", cnt.pendingEvicted.Load())
 
 	fmt.Println()
 	fmt.Println("=== cost ===")
@@ -298,6 +452,40 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 		fmt.Printf("  reads resolved to a path   %d/%d = %.1f%%\n", resolved, reads, 100*float64(resolved)/float64(reads))
 		fmt.Printf("  reads with no known name   %d\n", unresolved)
 	}
+	// The decisive diagnostic for the pre-open gap: is the file's name absent
+	// from the maps entirely (the rundown never named it), or present under an
+	// identity the read did not carry (the rundown named it under a key that
+	// does not match)? Those need completely different fixes, and without this
+	// the two are indistinguishable.
+	if expect != "" {
+		res.mu.Lock()
+		byObjHits, byKeyHits := 0, 0
+		var sample string
+		for _, n := range res.byObj {
+			if strings.Contains(strings.ToLower(n), expect) {
+				byObjHits++
+				sample = n
+			}
+		}
+		for _, n := range res.byKey {
+			if strings.Contains(strings.ToLower(n), expect) {
+				byKeyHits++
+				sample = n
+			}
+		}
+		res.mu.Unlock()
+		fmt.Println()
+		fmt.Printf("=== expectation: %q ===\n", expect)
+		fmt.Printf("  named by FileObject: %d\n", byObjHits)
+		fmt.Printf("  named by FileKey:    %d\n", byKeyHits)
+		if sample != "" {
+			fmt.Printf("  e.g. %s\n", sample)
+			fmt.Println("  → the name WAS known; the read carried an identity that did not match it")
+		} else {
+			fmt.Println("  → the name was never learned at all: the rundown did not cover this file")
+		}
+	}
+
 	res.mu.Lock()
 	if len(res.unresolvedByPID) > 0 {
 		type pidCount struct {
