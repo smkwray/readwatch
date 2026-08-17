@@ -9,6 +9,7 @@ package main
 import (
 	"fmt"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -51,6 +52,7 @@ const (
 
 	EVENT_TRACE_CONTROL_STOP  = 1
 	EVENT_TRACE_CONTROL_QUERY = 0
+	EVENT_TRACE_CONTROL_FLUSH = 3
 
 	INVALID_PROCESSTRACE_HANDLE = ^uint64(0)
 )
@@ -243,6 +245,21 @@ func checkLayout() error {
 		{"EVENT_TRACE_HEADER", unsafe.Sizeof(EVENT_TRACE_HEADER{}), 48},
 		{"EVENT_TRACE", unsafe.Sizeof(EVENT_TRACE{}), 88},
 		{"EVENT_RECORD.UserData offset", unsafe.Offsetof(EVENT_RECORD{}.UserData), 96},
+		// EVENT_TRACE_LOGFILEW is the one ProcessTrace writes into, so a wrong
+		// offset here means Windows scribbles through a displaced callback or
+		// context pointer. It was the largest unasserted structure and is the one
+		// a review specifically asked to see checked.
+		{"TRACE_LOGFILE_HEADER", unsafe.Sizeof(TRACE_LOGFILE_HEADER{}), 280},
+		{"EVENT_TRACE_LOGFILEW", unsafe.Sizeof(EVENT_TRACE_LOGFILEW{}), 448},
+		{"LOGFILEW.CurrentEvent offset", unsafe.Offsetof(EVENT_TRACE_LOGFILEW{}.CurrentEvent), 32},
+		{"LOGFILEW.LogfileHeader offset", unsafe.Offsetof(EVENT_TRACE_LOGFILEW{}.LogfileHeader), 120},
+		{"LOGFILEW.BufferCallback offset", unsafe.Offsetof(EVENT_TRACE_LOGFILEW{}.BufferCallback), 400},
+		{"LOGFILEW.EventCallback offset", unsafe.Offsetof(EVENT_TRACE_LOGFILEW{}.EventCallback), 424},
+		{"LOGFILEW.Context offset", unsafe.Offsetof(EVENT_TRACE_LOGFILEW{}.Context), 440},
+		{"EVENT_FILTER_DESCRIPTOR", unsafe.Sizeof(EVENT_FILTER_DESCRIPTOR{}), 16},
+		// 12 bytes of ULONGs, then a 4-aligned GUID at 12, then the pointer pads
+		// out to 32, then a trailing ULONG rounded to the struct's 8 alignment.
+		{"ENABLE_TRACE_PARAMETERS", unsafe.Sizeof(ENABLE_TRACE_PARAMETERS{}), 48},
 	} {
 		if c.got != c.want {
 			return fmt.Errorf("%s is %d bytes, want %d — the ABI is wrong and every field read would be garbage", c.name, c.got, c.want)
@@ -259,6 +276,20 @@ type session struct {
 	handle uint64 // TRACEHANDLE from StartTraceW
 	trace  uint64 // TRACEHANDLE from OpenTraceW
 	props  []byte
+	// ready closes once OpenTraceW has succeeded. A rundown asked for before
+	// that is delivered to nobody, and a fixed sleep is not proof of anything.
+	ready chan struct{}
+}
+
+// waitConsumerReady blocks until the consumer is attached, or gives up and says
+// so rather than proceeding on an assumption.
+func (s *session) waitConsumerReady(timeout time.Duration) error {
+	select {
+	case <-s.ready:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("the consumer did not attach within %s", timeout)
+	}
 }
 
 // propertiesBuffer lays out EVENT_TRACE_PROPERTIES followed by the logger name,
@@ -273,15 +304,25 @@ func propertiesBuffer(name string, realtime bool) ([]byte, *EVENT_TRACE_PROPERTI
 	p.Wnode.BufferSize = uint32(total)
 	p.Wnode.Flags = WNODE_FLAG_TRACED_GUID
 	p.Wnode.ClientContext = 1 // QPC
+	// A system logger needs its own identity here. Leaving this zero, or setting
+	// it to SystemTraceControlGuid, asks for the single legacy NT Kernel Logger
+	// instead of a private multiplexed one.
+	p.Wnode.Guid = probeSessionGUID
 	p.LoggerNameOffset = uint32(structSize)
 	p.LogFileNameOffset = 0
-	p.BufferSize = 1024 // KB
+	// 64 KB rather than 1 MB: Microsoft's guidance is that most sessions want
+	// 64 KB or less, and the earlier 1 MB x 64-256 envelope reserved up to 256 MB
+	// for what is meant to be a lightweight consumer.
+	p.BufferSize = 64
 	p.MinimumBuffers = 64
 	p.MaximumBuffers = 256
 	p.FlushTimer = 1
 	if realtime {
-		p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE
+		p.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
 	}
+	// Disk file I/O is what carries the classic FileRundown; Windows requires
+	// DISK_IO to be enabled alongside it.
+	p.EnableFlags = EVENT_TRACE_FLAG_DISK_IO | EVENT_TRACE_FLAG_DISK_FILE_IO
 	return buf, p
 }
 
@@ -325,7 +366,7 @@ func startSession() (*session, error) {
 		}
 		return nil, fmt.Errorf("StartTrace: %w", syscall.Errno(r))
 	}
-	s := &session{handle: handle, props: buf}
+	s := &session{handle: handle, props: buf, ready: make(chan struct{})}
 
 	params := ENABLE_TRACE_PARAMETERS{Version: 2}
 	r, _, _ = procEnableTraceEx2.Call(
@@ -413,6 +454,7 @@ func (s *session) openAndProcess(callback uintptr) error {
 		return fmt.Errorf("OpenTrace failed")
 	}
 	s.trace = uint64(r)
+	close(s.ready)
 	handles := [1]uint64{s.trace}
 	rc, _, _ := procProcessTrace.Call(
 		uintptr(unsafe.Pointer(&handles[0])), 1, 0, 0,
