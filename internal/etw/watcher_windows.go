@@ -191,21 +191,26 @@ func (w *Watcher) Start() error {
 	if w.session != nil {
 		return nil
 	}
-	if active.Load() != nil {
-		return errAlreadyActive
-	}
 
 	w.initState()
 	w.refreshVolumes()
 
+	// Claimed before the session is created, and by compare-and-swap rather than
+	// a check followed by a store: two watchers sharing one callback would each
+	// see only some of the stream, and the check-then-store form leaves a window
+	// where both pass.
+	if !active.CompareAndSwap(nil, w) {
+		return errAlreadyActive
+	}
+
 	s, err := startSession()
 	if err != nil {
+		active.Store(nil)
 		return err
 	}
 	w.session = s
 	w.stop = make(chan struct{})
 	w.done = make(chan struct{})
-	active.Store(w)
 	w.running.Store(true)
 
 	consumerDone := make(chan struct{})
