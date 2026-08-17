@@ -22,6 +22,11 @@ const (
 
 	EVENT_TRACE_FLAG_DISK_IO      = 0x00000100
 	EVENT_TRACE_FLAG_DISK_FILE_IO = 0x00000200
+	// The two that were missing. DISK_FILE_IO alone yields file *names*; the
+	// file-I/O operations themselves — and their completions — need these, and a
+	// rundown of open files plausibly needs the operation class enabled too.
+	EVENT_TRACE_FLAG_FILE_IO      = 0x02000000
+	EVENT_TRACE_FLAG_FILE_IO_INIT = 0x04000000
 
 	// EVENT_FILTER_TYPE_TRACEHANDLE names the session the rundown should be
 	// directed at, which is what makes this "capture state for me" rather than a
@@ -34,6 +39,12 @@ const (
 	fileIoFileCreate  = 32
 	fileIoFileDelete  = 35
 	fileIoFileRundown = 36
+	// Classic read/write and completion. Consuming the read side from the same
+	// provider as the names removes the cross-provider join entirely — the
+	// documented equality is classic ReadWrite.FileKey == classic Name.FileObject.
+	fileIoRead         = 67
+	fileIoWrite        = 68
+	fileIoOperationEnd = 76
 )
 
 // SystemTraceControlGuid {9E814AAD-3204-11D2-9A82-006008A86939}

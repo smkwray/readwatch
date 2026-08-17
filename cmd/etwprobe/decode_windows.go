@@ -167,3 +167,36 @@ func payload(rec *EVENT_RECORD) []byte {
 	copy(out, src)
 	return out
 }
+
+// classicRead is FileIo_ReadWrite from the classic provider. Its FileKey is the
+// value classic Name/Rundown events publish as their "FileObject", which makes
+// this join documented rather than inferred across providers.
+type classicReadEvent struct {
+	Offset     uint64
+	Irp        uint64
+	FileObject uint64
+	FileKey    uint64
+	IOSize     uint32
+}
+
+// The layout is identical to the manifest Read, which the raw dumps establish
+// directly: for the same operation both providers deliver byte-for-byte the same
+// 48-byte payload. The schema-derived guess of Offset, Irp, TTID, FileObject,
+// FileKey was wrong — it put FileKey at 32, which lands on the thread id and
+// size, not a pointer at all.
+//
+// That equivalence is the interesting part. Consuming the read side from the
+// classic provider "so both halves of the join share a provider" buys nothing,
+// because the two streams are the same data under two GUIDs.
+func decodeClassicRead(b []byte) (classicReadEvent, error) {
+	var c classicReadEvent
+	if len(b) < readFixedLen {
+		return c, errShort
+	}
+	c.Offset = binary.LittleEndian.Uint64(b[0:])
+	c.Irp = binary.LittleEndian.Uint64(b[8:])
+	c.FileObject = binary.LittleEndian.Uint64(b[16:])
+	c.FileKey = binary.LittleEndian.Uint64(b[24:])
+	c.IOSize = binary.LittleEndian.Uint32(b[36:])
+	return c, nil
+}

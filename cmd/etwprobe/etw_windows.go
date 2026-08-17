@@ -322,7 +322,8 @@ func propertiesBuffer(name string, realtime bool) ([]byte, *EVENT_TRACE_PROPERTI
 	}
 	// Disk file I/O is what carries the classic FileRundown; Windows requires
 	// DISK_IO to be enabled alongside it.
-	p.EnableFlags = EVENT_TRACE_FLAG_DISK_IO | EVENT_TRACE_FLAG_DISK_FILE_IO
+	p.EnableFlags = EVENT_TRACE_FLAG_DISK_IO | EVENT_TRACE_FLAG_DISK_FILE_IO |
+		EVENT_TRACE_FLAG_FILE_IO | EVENT_TRACE_FLAG_FILE_IO_INIT
 	return buf, p
 }
 

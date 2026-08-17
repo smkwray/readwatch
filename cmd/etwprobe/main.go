@@ -46,6 +46,9 @@ type counters struct {
 	namedLate              atomic.Uint64
 	unresolvedAtCompletion atomic.Uint64
 	irpCollision           atomic.Uint64
+	classicReads           atomic.Uint64
+	classicResolved        atomic.Uint64
+	classicUnresolved      atomic.Uint64
 }
 
 // pendingRead is a read that has started and not yet been told whether it
@@ -96,6 +99,20 @@ type resolver struct {
 	// completion. These, not the start-time misses, are the real evidence of an
 	// identity that never correlates.
 	unnamedCompletions []pendingRead
+	// classicHits is the same accounting for the classic read stream, kept apart
+	// so the two providers can be compared rather than blended.
+	classicHits map[string]map[uint32]int
+}
+
+func (r *resolver) recordClassic(path string, pid uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := r.classicHits[path]
+	if m == nil {
+		m = make(map[uint32]int)
+		r.classicHits[path] = m
+	}
+	m[pid]++
 }
 
 func (r *resolver) recordUnnamedCompletion(p pendingRead) {
@@ -157,6 +174,7 @@ func newResolver() *resolver {
 		unresolvedByPID: make(map[uint32]int),
 		byRundown:       make(map[uint64]string, 1<<18),
 		pending:         make(map[uint64]pendingRead, 4096),
+		classicHits:     make(map[string]map[uint32]int),
 	}
 }
 
@@ -213,6 +231,7 @@ var (
 	dumpRaw          bool
 	useSessionHandle bool
 	rawDumped        atomic.Uint64
+	classicDumped    atomic.Uint64
 	callback         uintptr
 )
 
@@ -241,6 +260,42 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 				cnt.rundownNames.Add(1)
 			} else {
 				cnt.names.Add(1)
+			}
+		case fileIoRead:
+			// The read side from the SAME provider as the names. Classic FileIo
+			// documents ReadWrite.FileKey as matching Name.FileObject, so this join
+			// is contractual rather than the cross-provider guess. Layout is dumped
+			// rather than assumed - guessing a layout is what produced two wrong
+			// conclusions already.
+			b := payload(rec)
+			if dumpRaw && classicDumped.Add(1) <= 3 {
+				var sb strings.Builder
+				for i, x := range b {
+					if i%8 == 0 && i > 0 {
+						sb.WriteString(" | ")
+					}
+					fmt.Fprintf(&sb, "%02X", x)
+				}
+				fmt.Printf("RAW classic-read v%d len=%d pid=%d: %s\n",
+					rec.EventHeader.EventDescriptor.Version, len(b),
+					rec.EventHeader.ProcessId, sb.String())
+			}
+			cnt.classicReads.Add(1)
+			cr, err := decodeClassicRead(b)
+			if err != nil {
+				cnt.shortEvents.Add(1)
+				return 0
+			}
+			res.mu.Lock()
+			name, ok := res.byRundown[cr.FileKey]
+			res.mu.Unlock()
+			if ok {
+				cnt.classicResolved.Add(1)
+				if filter == "" || strings.Contains(strings.ToLower(name), filter) {
+					res.recordClassic(name, rec.EventHeader.ProcessId)
+				}
+			} else {
+				cnt.classicUnresolved.Add(1)
 			}
 		case fileIoFileDelete:
 			obj, _, err := decodeFileIoName(payload(rec))
@@ -558,6 +613,12 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 	fmt.Printf("  named late         %d  (name arrived between start and completion)\n", cnt.namedLate.Load())
 	fmt.Printf("  unnamed at completion %d  (the only real correlation failures)\n", cnt.unresolvedAtCompletion.Load())
 	fmt.Printf("  IRP collisions     %d\n", cnt.irpCollision.Load())
+	fmt.Println()
+	fmt.Println("=== classic stream (same provider as the names) ===")
+	fmt.Printf("  classic reads      %d\n", cnt.classicReads.Load())
+	fmt.Printf("  resolved via rundown key %d\n", cnt.classicResolved.Load())
+	fmt.Printf("  unresolved         %d\n", cnt.classicUnresolved.Load())
+	fmt.Printf("  distinct paths     %d\n", len(res.classicHits))
 	fmt.Printf("  pending evicted    %d\n", cnt.pendingEvicted.Load())
 
 	fmt.Println()
