@@ -22,36 +22,41 @@ import (
 //   - what does consuming the machine's whole file-read stream actually cost.
 
 type counters struct {
-	total          atomic.Uint64
-	reads          atomic.Uint64
-	resolved       atomic.Uint64
-	unresolved     atomic.Uint64
-	names          atomic.Uint64
-	creates        atomic.Uint64
-	opEnds         atomic.Uint64
-	shortEvents    atomic.Uint64
-	retired        atomic.Uint64
-	rundownNames   atomic.Uint64
-	otherProvider  atomic.Uint64
-	completed      atomic.Uint64
-	failedReads    atomic.Uint64
-	emptyReads     atomic.Uint64
-	pendingEvicted atomic.Uint64
-	closeWouldHit  atomic.Uint64
-	closeWouldMiss atomic.Uint64
-	viaObject      atomic.Uint64
-	viaKey         atomic.Uint64
-	viaRundownKey  atomic.Uint64
-	viaRundownObj  atomic.Uint64
+	total                  atomic.Uint64
+	reads                  atomic.Uint64
+	resolved               atomic.Uint64
+	unresolved             atomic.Uint64
+	names                  atomic.Uint64
+	creates                atomic.Uint64
+	opEnds                 atomic.Uint64
+	shortEvents            atomic.Uint64
+	retired                atomic.Uint64
+	rundownNames           atomic.Uint64
+	otherProvider          atomic.Uint64
+	completed              atomic.Uint64
+	failedReads            atomic.Uint64
+	emptyReads             atomic.Uint64
+	pendingEvicted         atomic.Uint64
+	closeWouldHit          atomic.Uint64
+	closeWouldMiss         atomic.Uint64
+	viaObject              atomic.Uint64
+	viaKey                 atomic.Uint64
+	viaRundownKey          atomic.Uint64
+	viaRundownObj          atomic.Uint64
+	namedLate              atomic.Uint64
+	unresolvedAtCompletion atomic.Uint64
+	irpCollision           atomic.Uint64
 }
 
 // pendingRead is a read that has started and not yet been told whether it
 // worked. Bounded, because an IRP whose completion never arrives must not grow
 // the map without limit.
 type pendingRead struct {
-	path string
-	pid  uint32
-	tid  uint32
+	path       string // empty when the name had not arrived at start
+	fileObject uint64
+	fileKey    uint64
+	pid        uint32
+	tid        uint32
 }
 
 const pendingReadMax = 20000
@@ -87,6 +92,18 @@ type resolver struct {
 	byRundown map[uint64]string
 	// pending holds started reads awaiting their OperationEnd, keyed by IRP.
 	pending map[uint64]pendingRead
+	// unnamedCompletions are reads that succeeded and still had no path even at
+	// completion. These, not the start-time misses, are the real evidence of an
+	// identity that never correlates.
+	unnamedCompletions []pendingRead
+}
+
+func (r *resolver) recordUnnamedCompletion(p pendingRead) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.unnamedCompletions) < unresolvedSampleMax {
+		r.unnamedCompletions = append(r.unnamedCompletions, p)
+	}
 }
 
 // nameSource says which correlation resolved a read, so the probe can report
@@ -104,6 +121,14 @@ const (
 func (r *resolver) pend(irp uint64, p pendingRead) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, dup := r.pending[irp]; dup {
+		// An IRP already in flight means a reused address. Quarantining both is
+		// the only safe answer: publishing either could attach one operation's
+		// outcome to the other's file.
+		delete(r.pending, irp)
+		cnt.irpCollision.Add(1)
+		return
+	}
 	if len(r.pending) >= pendingReadMax {
 		// Drop the whole generation rather than grow without bound or evict
 		// arbitrarily. Counted, so a run that hits this is visibly degraded
@@ -180,14 +205,15 @@ func (r *resolver) record(path string, pid uint32) {
 }
 
 var (
-	cnt       counters
-	res       = newResolver()
-	filter    string
-	expect    string
-	verbose   bool
-	dumpRaw   bool
-	rawDumped atomic.Uint64
-	callback  uintptr
+	cnt              counters
+	res              = newResolver()
+	filter           string
+	expect           string
+	verbose          bool
+	dumpRaw          bool
+	useSessionHandle bool
+	rawDumped        atomic.Uint64
+	callback         uintptr
 )
 
 // eventCallback runs on ETW's thread for every event the session delivers. It
@@ -332,25 +358,24 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		case sourceRundownAsObject:
 			cnt.viaRundownObj.Add(1)
 		}
+		// A read whose name has not arrived yet is NOT discarded. Resolving once
+		// at the start and throwing away the miss is what made an earlier run look
+		// like a Windows identity mismatch when it was really name-stream latency:
+		// the rundown's 140,211 names all landed after the reads that needed them.
+		// Every start is now carried to its completion and resolved again there.
+		res.pend(rd.Irp, pendingRead{
+			path:       path,
+			fileObject: rd.FileObject,
+			fileKey:    rd.FileKey,
+			pid:        rec.EventHeader.ProcessId,
+			tid:        rd.IssuingThreadID,
+		})
 		if src == sourceNone {
-			// Keeping a sample of what did NOT resolve is the difference between
-			// "that file produced no read event" and "its read was among the
-			// unresolved" — two claims an earlier run could not tell apart, and
-			// the whole basis of the pre-open-handle finding.
 			cnt.unresolved.Add(1)
 			res.recordUnresolved(rd, rec.EventHeader.ProcessId)
-			return 0
+		} else {
+			cnt.resolved.Add(1)
 		}
-		cnt.resolved.Add(1)
-		// A Read event is the *start* of an operation. Publishing here would count
-		// requests that go on to fail, be cancelled, or return nothing, and would
-		// report the size asked for rather than the size delivered. Hold it until
-		// OperationEnd says what happened.
-		res.pend(rd.Irp, pendingRead{
-			path: path,
-			pid:  rec.EventHeader.ProcessId,
-			tid:  rd.IssuingThreadID,
-		})
 	case evOperationEnd:
 		cnt.opEnds.Add(1)
 		oe, err := decodeOpEnd(payload(rec))
@@ -371,6 +396,21 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 			return 0
 		}
 		cnt.completed.Add(1)
+		// Second chance: the name may have arrived between start and completion.
+		if p.path == "" {
+			if name, src2 := res.name(p.fileObject, p.fileKey); src2 != sourceNone {
+				p.path = name
+				cnt.namedLate.Add(1)
+				if src2 == sourceRundownAsKey {
+					cnt.viaRundownKey.Add(1)
+				}
+			}
+		}
+		if p.path == "" {
+			cnt.unresolvedAtCompletion.Add(1)
+			res.recordUnnamedCompletion(p)
+			return 0
+		}
 		if filter == "" || strings.Contains(strings.ToLower(p.path), filter) {
 			res.record(p.path, p.pid)
 		}
@@ -384,6 +424,7 @@ func main() {
 	flag.StringVar(&filter, "filter", "", "only report paths containing this (lower-case substring)")
 	flag.BoolVar(&verbose, "v", false, "list every resolved path")
 	flag.BoolVar(&dumpRaw, "dump-raw", false, "print the raw bytes of the first few read payloads")
+	flag.BoolVar(&useSessionHandle, "session-handle", false, "direct the rundown with the StartTrace handle instead of the OpenTrace handle")
 	flag.StringVar(&expect, "expect", "", "report whether this path substring was ever named, and how")
 	rundown := flag.Bool("rundown", true, "trigger the filename rundown after starting")
 	flag.Parse()
@@ -424,22 +465,25 @@ func run(duration time.Duration, rundown bool) error {
 	}
 	fmt.Println("  consumer attached")
 	if rundown {
+		// No fallback to the manifest provider's own capture state: quietly
+		// swapping the mechanism under test turns a failed qualification into a
+		// passing one for a different mechanism.
 		if err := s.requestSystemRundown(); err != nil {
-			fmt.Println("  system rundown FAILED:", err)
-			fmt.Println("  (falling back to the manifest provider's own capture state)")
-			if err := s.captureState(); err != nil {
-				fmt.Println("  provider capture state FAILED too:", err)
-			}
-		} else {
-			fmt.Println("  system rundown requested")
+			return fmt.Errorf("system rundown failed, and there is no substitute for it: %w", err)
 		}
+		fmt.Printf("  system rundown requested (handle=%s)\n", map[bool]string{true: "session/StartTrace", false: "trace/OpenTrace"}[useSessionHandle])
 		if err := s.flush(); err != nil {
 			fmt.Println("  flush FAILED:", err)
 		}
-		// Give the rundown events a moment to be delivered before the workload
-		// starts producing reads that depend on them.
-		time.Sleep(500 * time.Millisecond)
-		fmt.Printf("  names known after rundown: %d\n", cnt.rundownNames.Load()+cnt.names.Load())
+		// Wait for the rundown to be *consumed*, not merely requested. The fixed
+		// sleep this replaces declared readiness with zero names in hand while
+		// 140,211 were still on their way, so every read that followed raced its
+		// own name and was written off as an identity mismatch.
+		if n := waitRundownQuiet(20 * time.Second); n == 0 {
+			return fmt.Errorf("rundown produced no names: nothing to qualify against")
+		} else {
+			fmt.Printf("  rundown consumed: %d names, stream quiet\n", n)
+		}
 	} else {
 		fmt.Println("  rundown SKIPPED (-rundown=false)")
 	}
@@ -460,6 +504,28 @@ func run(duration time.Duration, rundown bool) error {
 
 	report(elapsed, cpuUsed, lostEvents, lostBuffers, lossKnown)
 	return nil
+}
+
+// waitRundownQuiet returns once the rundown name stream has stopped growing for
+// three consecutive intervals, or the deadline passes. Empirical rather than a
+// documented completion signal, but unlike a fixed sleep it is at least a
+// measurement of the thing it is waiting for.
+func waitRundownQuiet(timeout time.Duration) uint64 {
+	deadline := time.Now().Add(timeout)
+	last, quiet := uint64(0), 0
+	for time.Now().Before(deadline) {
+		time.Sleep(250 * time.Millisecond)
+		now := cnt.rundownNames.Load()
+		if now == last && now > 0 {
+			if quiet++; quiet >= 3 {
+				return now
+			}
+		} else {
+			quiet = 0
+		}
+		last = now
+	}
+	return last
 }
 
 func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnown bool) {
@@ -489,6 +555,9 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 	fmt.Printf("  reads completed ok %d\n", cnt.completed.Load())
 	fmt.Printf("  reads that failed  %d\n", cnt.failedReads.Load())
 	fmt.Printf("  reads with 0 bytes %d\n", cnt.emptyReads.Load())
+	fmt.Printf("  named late         %d  (name arrived between start and completion)\n", cnt.namedLate.Load())
+	fmt.Printf("  unnamed at completion %d  (the only real correlation failures)\n", cnt.unresolvedAtCompletion.Load())
+	fmt.Printf("  IRP collisions     %d\n", cnt.irpCollision.Load())
 	fmt.Printf("  pending evicted    %d\n", cnt.pendingEvicted.Load())
 
 	fmt.Println()
@@ -580,13 +649,20 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 				break
 			}
 		}
+		// Show completions that stayed unnamed. The previous version printed the
+		// first four *global* start-time misses, which came from unrelated
+		// processes and could never have said anything about the target — the
+		// claim it was used to support was not evidence.
+		if len(res.unnamedCompletions) == 0 {
+			fmt.Println("  no successful read completed without a name")
+		}
 		shown := 0
-		for _, u := range res.unresolvedSample {
-			if shown >= 4 {
+		for _, u := range res.unnamedCompletions {
+			if shown >= 6 {
 				break
 			}
-			fmt.Printf("  unresolved read:        FileObject=0x%X FileKey=0x%X pid=%d\n",
-				u.FileObject, u.FileKey, u.PID)
+			fmt.Printf("  unnamed completion:     FileObject=0x%X FileKey=0x%X pid=%d\n",
+				u.fileObject, u.fileKey, u.pid)
 			shown++
 		}
 		res.mu.Unlock()
