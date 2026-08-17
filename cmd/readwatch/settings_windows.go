@@ -32,6 +32,7 @@ const (
 	idAddExclude       = 314
 	idRemoveExclude    = 315
 	idAlwaysOnTop      = 316
+	idMechanism        = 317
 	settingsWindowBase = 520
 )
 
@@ -71,6 +72,9 @@ type SettingsUI struct {
 	startLogin  HWND
 	openLogin   HWND
 	alwaysTop   HWND
+	mechLabel   HWND
+	mechCombo   HWND
+	mechHint    HWND
 	saveBtn     HWND
 	cancelBtn   HWND
 
@@ -139,7 +143,7 @@ func (s *SettingsUI) create() error {
 	width := s.scale(520)
 	// Tall enough that the last checkbox still clears the Save row, which the
 	// layout below anchors to the bottom edge.
-	height := s.scale(580)
+	height := s.scale(672)
 	x, y := centeredWindowPosition(s.app.hwnd, width, height)
 	style := uintptr(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN)
 	hwnd, _, e := procCreateWindowExW.Call(
@@ -213,6 +217,12 @@ func (s *SettingsUI) createControls() {
 	// applied by the viewer, so it is the one control here the service knows
 	// nothing about.
 	s.alwaysTop = createControl("BUTTON", "Keep the ReadWatch window on top of other windows", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, 0, s.hwnd, idAlwaysOnTop)
+	// The two mechanisms are a genuine trade rather than an old and a new way,
+	// so the choice is offered - and the consequence of each is stated next to
+	// it, because "markers or ETW" means nothing without it.
+	s.mechLabel = createControl("STATIC", "How reads are detected", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, s.hwnd, 0)
+	s.mechCombo = createControl("COMBOBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_VSCROLL|CBS_DROPDOWNLIST, 0, s.hwnd, idMechanism)
+	s.mechHint = createControl("STATIC", "", WS_CHILD|WS_VISIBLE|SS_LEFT, 0, s.hwnd, 0)
 	s.saveBtn = createControl("BUTTON", "Save", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 0, s.hwnd, IDOK)
 	s.cancelBtn = createControl("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, IDCANCEL)
 
@@ -229,6 +239,11 @@ func (s *SettingsUI) createControls() {
 		formatIndex = 2
 	}
 	sendMessage(s.formatCombo, CB_SETCURSEL, uintptr(formatIndex), 0)
+	for _, text := range []string{"Choose automatically", "Audit markers", "Event tracing"} {
+		sendMessage(s.mechCombo, CB_ADDSTRING, 0, uintptr(unsafe.Pointer(utf16Ptr(text))))
+	}
+	sendMessage(s.mechCombo, CB_SETCURSEL, uintptr(mechanismIndex(s.cfg.Mechanism)), 0)
+	s.updateMechanismHint()
 	setChecked(s.includeDirs, s.cfg.IncludeDirectories)
 	setChecked(s.startLogin, s.cfg.StartAtLogin)
 	setChecked(s.openLogin, s.cfg.OpenAtLogin)
@@ -253,8 +268,58 @@ func (s *SettingsUI) controls() []HWND {
 		s.foldersLabel, s.folderList, s.addBtn, s.removeBtn, s.folderPath, s.addPathBtn, s.foldersHint,
 		s.excludeLabel, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn,
 		s.logLabel, s.logPath, s.browseBtn, s.formatLabel, s.formatCombo,
-		s.includeDirs, s.startLogin, s.openLogin, s.alwaysTop, s.saveBtn, s.cancelBtn,
+		s.includeDirs, s.startLogin, s.openLogin, s.alwaysTop,
+		s.mechLabel, s.mechCombo, s.mechHint, s.saveBtn, s.cancelBtn,
 	}
+}
+
+// mechanismIndex maps the stored preference to the combo's order. An
+// unrecognised stored value selects "choose automatically" rather than leaving
+// the control blank.
+func mechanismIndex(m settings.Mechanism) int {
+	switch m {
+	case settings.MechanismMarkers:
+		return 1
+	case settings.MechanismETW:
+		return 2
+	}
+	return 0
+}
+
+func mechanismAtIndex(i int) settings.Mechanism {
+	switch i {
+	case 1:
+		return settings.MechanismMarkers
+	case 2:
+		return settings.MechanismETW
+	}
+	return settings.MechanismAuto
+}
+
+// mechanismHintText says what the selected choice actually costs and what it
+// can see. Both facts are measured on this machine rather than described in the
+// abstract: the marker figure is from do/evidence/2026-08-17-marker-cost and the
+// tracing figures from do/evidence/2026-08-17-etw-probe.
+func mechanismHintText(m settings.Mechanism) string {
+	switch m {
+	case settings.MechanismMarkers:
+		return "Marks the watched folders, so only they produce events. Takes about a tenth of " +
+			"a millisecond per file to switch on and off again — instant for an ordinary folder, " +
+			"minutes for a whole drive. Sees reads made through a memory mapping. Cannot be used " +
+			"on exFAT or FAT drives, such as most USB sticks."
+	case settings.MechanismETW:
+		return "Writes nothing to the drives and starts instantly on any of them, including exFAT " +
+			"and encrypted volumes. Watches the whole machine's file activity and discards the " +
+			"rest, which costs a little CPU all the time. Does not see a read made purely through " +
+			"a memory mapping."
+	}
+	return "Uses markers when every watched folder can take one, and event tracing otherwise — " +
+		"so a folder on a USB stick is watched rather than refused."
+}
+
+func (s *SettingsUI) updateMechanismHint() {
+	i := int(sendMessage(s.mechCombo, CB_GETCURSEL, 0, 0))
+	setWindowText(s.mechHint, mechanismHintText(mechanismAtIndex(i)))
 }
 
 func (s *SettingsUI) layout() {
@@ -321,6 +386,13 @@ func (s *SettingsUI) layout() {
 	place(s.openLogin, m+s.scale(20), y, w-2*m-s.scale(20), fieldH)
 	y += fieldH + s.scale(2)
 	place(s.alwaysTop, m, y, w-2*m, fieldH)
+	y += fieldH + s.scale(14)
+
+	mechLabelW := s.scale(148)
+	place(s.mechLabel, m, y, mechLabelW, fieldH)
+	place(s.mechCombo, m+mechLabelW+gap, y, s.scale(180), s.scale(180))
+	y += fieldH + s.scale(4)
+	place(s.mechHint, m, y, w-2*m, s.scale(56))
 
 	bottomY := h - m - buttonH
 	procMoveWindow.Call(uintptr(s.cancelBtn), uintptr(w-m-buttonW*2-gap), uintptr(bottomY), uintptr(buttonW), uintptr(buttonH), 1)
@@ -343,7 +415,7 @@ func (s *SettingsUI) applyTheme() {
 	if dark {
 		themeName = "DarkMode_Explorer"
 	}
-	for _, h := range []HWND{s.folderList, s.folderPath, s.addPathBtn, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn, s.logPath, s.formatCombo, s.addBtn, s.removeBtn, s.browseBtn, s.includeDirs, s.startLogin, s.openLogin, s.alwaysTop, s.saveBtn, s.cancelBtn} {
+	for _, h := range []HWND{s.folderList, s.folderPath, s.addPathBtn, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn, s.logPath, s.formatCombo, s.addBtn, s.removeBtn, s.browseBtn, s.includeDirs, s.startLogin, s.openLogin, s.alwaysTop, s.mechCombo, s.saveBtn, s.cancelBtn} {
 		procSetWindowTheme.Call(uintptr(h), uintptr(unsafe.Pointer(utf16Ptr(themeName))), 0)
 	}
 	procInvalidateRect.Call(uintptr(s.hwnd), 0, 1)
@@ -578,6 +650,7 @@ func (s *SettingsUI) collect() (settings.PublicConfig, error) {
 	}
 	cfg.LogFormat = s.selectedFormat()
 	cfg.IncludeDirectories = isChecked(s.includeDirs)
+	cfg.Mechanism = mechanismAtIndex(int(sendMessage(s.mechCombo, CB_GETCURSEL, 0, 0)))
 	cfg.StartAtLogin = isChecked(s.startLogin)
 	cfg.OpenAtLogin = cfg.StartAtLogin && isChecked(s.openLogin)
 	if cfg.MaxRows < 200 || cfg.MaxRows > 5000 {
@@ -727,6 +800,11 @@ func settingsWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.
 			case IDCANCEL:
 				s.close()
 			}
+		}
+		// The hint has to follow the selection, or the owner reads the consequence
+		// of a choice they are no longer making.
+		if code == CBN_SELCHANGE && id == idMechanism {
+			s.updateMechanismHint()
 		}
 		return 0
 	case WM_SETTINGCHANGE, WM_THEMECHANGED:
