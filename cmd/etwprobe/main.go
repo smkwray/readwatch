@@ -39,6 +39,10 @@ type counters struct {
 	pendingEvicted atomic.Uint64
 	closeWouldHit  atomic.Uint64
 	closeWouldMiss atomic.Uint64
+	viaObject      atomic.Uint64
+	viaKey         atomic.Uint64
+	viaRundownKey  atomic.Uint64
+	viaRundownObj  atomic.Uint64
 }
 
 // pendingRead is a read that has started and not yet been told whether it
@@ -74,9 +78,28 @@ type resolver struct {
 	// bounded sample of the raw identities so a specific case can be traced.
 	unresolvedByPID  map[uint32]int
 	unresolvedSample []unresolvedRead
+	// byRundown holds names learned from the classic FileIo rundown. It is kept
+	// apart from byObj on purpose: classic FileIo documents the value on its
+	// Name/Rundown events as the thing a read's *FileKey* matches, which is a
+	// different namespace from the manifest provider's FileObject. Keeping them
+	// separate is what lets a run say which correlation actually resolved a read
+	// rather than leaving it to inference.
+	byRundown map[uint64]string
 	// pending holds started reads awaiting their OperationEnd, keyed by IRP.
 	pending map[uint64]pendingRead
 }
+
+// nameSource says which correlation resolved a read, so the probe can report
+// whether the rundown is pulling its weight.
+type nameSource int
+
+const (
+	sourceNone nameSource = iota
+	sourceObject
+	sourceKey
+	sourceRundownAsKey
+	sourceRundownAsObject
+)
 
 func (r *resolver) pend(irp uint64, p pendingRead) {
 	r.mu.Lock()
@@ -107,6 +130,7 @@ func newResolver() *resolver {
 		byObj:           make(map[uint64]string, 1<<16),
 		hits:            make(map[string]map[uint32]int),
 		unresolvedByPID: make(map[uint32]int),
+		byRundown:       make(map[uint64]string, 1<<18),
 		pending:         make(map[uint64]pendingRead, 4096),
 	}
 }
@@ -123,16 +147,25 @@ func (r *resolver) recordUnresolved(rd readEvent, pid uint32) {
 	}
 }
 
-func (r *resolver) name(obj, key uint64) (string, bool) {
+func (r *resolver) name(obj, key uint64) (string, nameSource) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if n, ok := r.byObj[obj]; ok {
-		return n, true
+		return n, sourceObject
 	}
 	if n, ok := r.byKey[key]; ok {
-		return n, true
+		return n, sourceKey
 	}
-	return "", false
+	// The rundown's value is tried against FileKey first, because that is what
+	// classic FileIo says it corresponds to, then against FileObject so a run can
+	// show which reading is right instead of assuming one.
+	if n, ok := r.byRundown[key]; ok {
+		return n, sourceRundownAsKey
+	}
+	if n, ok := r.byRundown[obj]; ok {
+		return n, sourceRundownAsObject
+	}
+	return "", sourceNone
 }
 
 func (r *resolver) record(path string, pid uint32) {
@@ -174,7 +207,7 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 				return 0
 			}
 			res.mu.Lock()
-			res.byObj[obj] = name
+			res.byRundown[obj] = name
 			res.mu.Unlock()
 			if rec.EventHeader.EventDescriptor.Opcode == fileIoFileRundown {
 				cnt.rundownNames.Add(1)
@@ -188,7 +221,7 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 				return 0
 			}
 			res.mu.Lock()
-			delete(res.byObj, obj)
+			delete(res.byRundown, obj)
 			res.mu.Unlock()
 			cnt.retired.Add(1)
 		}
@@ -271,8 +304,18 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 			return 0
 		}
 		cnt.reads.Add(1)
-		path, ok := res.name(rd.FileObject, rd.FileKey)
-		if !ok {
+		path, src := res.name(rd.FileObject, rd.FileKey)
+		switch src {
+		case sourceObject:
+			cnt.viaObject.Add(1)
+		case sourceKey:
+			cnt.viaKey.Add(1)
+		case sourceRundownAsKey:
+			cnt.viaRundownKey.Add(1)
+		case sourceRundownAsObject:
+			cnt.viaRundownObj.Add(1)
+		}
+		if src == sourceNone {
 			// Keeping a sample of what did NOT resolve is the difference between
 			// "that file produced no read event" and "its read was among the
 			// unresolved" — two claims an earlier run could not tell apart, and
@@ -451,6 +494,11 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 	if reads > 0 {
 		fmt.Printf("  reads resolved to a path   %d/%d = %.1f%%\n", resolved, reads, 100*float64(resolved)/float64(reads))
 		fmt.Printf("  reads with no known name   %d\n", unresolved)
+		fmt.Println("  resolved via:")
+		fmt.Printf("    manifest FileObject      %d\n", cnt.viaObject.Load())
+		fmt.Printf("    manifest FileKey         %d\n", cnt.viaKey.Load())
+		fmt.Printf("    rundown matched as Key   %d\n", cnt.viaRundownKey.Load())
+		fmt.Printf("    rundown matched as Obj   %d\n", cnt.viaRundownObj.Load())
 	}
 	// The decisive diagnostic for the pre-open gap: is the file's name absent
 	// from the maps entirely (the rundown never named it), or present under an
@@ -473,16 +521,43 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 				sample = n
 			}
 		}
+		rundownHits := 0
+		for _, n := range res.byRundown {
+			if strings.Contains(strings.ToLower(n), expect) {
+				rundownHits++
+				sample = n
+			}
+		}
 		res.mu.Unlock()
 		fmt.Println()
 		fmt.Printf("=== expectation: %q ===\n", expect)
 		fmt.Printf("  named by FileObject: %d\n", byObjHits)
 		fmt.Printf("  named by FileKey:    %d\n", byKeyHits)
-		if sample != "" {
+		fmt.Printf("  named by rundown:    %d\n", rundownHits)
+		// Whether the name was learned is only half the question. The half that
+		// decides the gap is whether a read of it was actually published.
+		published, publishedReads := 0, 0
+		res.mu.Lock()
+		for path, pids := range res.hits {
+			if !strings.Contains(strings.ToLower(path), expect) {
+				continue
+			}
+			published++
+			for _, n := range pids {
+				publishedReads += n
+			}
+		}
+		res.mu.Unlock()
+		fmt.Printf("  reads published for it: %d across %d path(s)\n", publishedReads, published)
+		switch {
+		case sample == "":
+			fmt.Println("  → NOT NAMED: nothing ever learned this file's name")
+		case publishedReads > 0:
 			fmt.Printf("  e.g. %s\n", sample)
-			fmt.Println("  → the name WAS known; the read carried an identity that did not match it")
-		} else {
-			fmt.Println("  → the name was never learned at all: the rundown did not cover this file")
+			fmt.Println("  → RESOLVED: the name was learned and a read of it was attributed")
+		default:
+			fmt.Printf("  e.g. %s\n", sample)
+			fmt.Println("  → NAMED BUT UNMATCHED: the name is known, no read of it resolved to it")
 		}
 	}
 
