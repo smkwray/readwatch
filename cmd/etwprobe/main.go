@@ -30,7 +30,20 @@ type counters struct {
 	creates     atomic.Uint64
 	opEnds      atomic.Uint64
 	shortEvents atomic.Uint64
+	retired     atomic.Uint64
 }
+
+// unresolvedRead is one read whose file could not be named. Bounded: this is a
+// diagnostic sample, not a log.
+type unresolvedRead struct {
+	FileObject uint64
+	FileKey    uint64
+	Irp        uint64
+	PID        uint32
+	TID        uint32
+}
+
+const unresolvedSampleMax = 200
 
 type resolver struct {
 	mu    sync.Mutex
@@ -38,13 +51,30 @@ type resolver struct {
 	byObj map[uint64]string
 	// hits records what actually resolved, keyed by path, with the reading PIDs.
 	hits map[string]map[uint32]int
+	// unresolvedByPID counts what could not be named, per reading process, plus a
+	// bounded sample of the raw identities so a specific case can be traced.
+	unresolvedByPID  map[uint32]int
+	unresolvedSample []unresolvedRead
 }
 
 func newResolver() *resolver {
 	return &resolver{
-		byKey: make(map[uint64]string, 1<<16),
-		byObj: make(map[uint64]string, 1<<16),
-		hits:  make(map[string]map[uint32]int),
+		byKey:           make(map[uint64]string, 1<<16),
+		byObj:           make(map[uint64]string, 1<<16),
+		hits:            make(map[string]map[uint32]int),
+		unresolvedByPID: make(map[uint32]int),
+	}
+}
+
+func (r *resolver) recordUnresolved(rd readEvent, pid uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.unresolvedByPID[pid]++
+	if len(r.unresolvedSample) < unresolvedSampleMax {
+		r.unresolvedSample = append(r.unresolvedSample, unresolvedRead{
+			FileObject: rd.FileObject, FileKey: rd.FileKey, Irp: rd.Irp,
+			PID: pid, TID: rd.IssuingThreadID,
+		})
 	}
 }
 
@@ -86,7 +116,7 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 	cnt.total.Add(1)
 	id := rec.EventHeader.EventDescriptor.Id
 	switch id {
-	case evNameCreate, evNameDelete:
+	case evNameCreate:
 		b := payload(rec)
 		n, err := decodeName(b)
 		if err != nil {
@@ -97,6 +127,34 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		res.mu.Lock()
 		res.byKey[n.FileKey] = n.Name
 		res.mu.Unlock()
+	case evNameDelete:
+		// This was being handled as an insertion, which is backwards: a name
+		// event that says a mapping is going away was extending its life. Kernel
+		// pointer values are reused, so a stale entry does not merely go missing,
+		// it attributes a later read of one file to a different file entirely.
+		b := payload(rec)
+		n, err := decodeName(b)
+		if err != nil {
+			cnt.shortEvents.Add(1)
+			return 0
+		}
+		res.mu.Lock()
+		delete(res.byKey, n.FileKey)
+		res.mu.Unlock()
+		cnt.retired.Add(1)
+	case evCleanup, evClose:
+		// The other half of retirement: a FileObject is only valid until the
+		// object is freed, after which the same pointer can name something else.
+		b := payload(rec)
+		c, err := decodeClose(b)
+		if err != nil {
+			cnt.shortEvents.Add(1)
+			return 0
+		}
+		res.mu.Lock()
+		delete(res.byObj, c.FileObject)
+		res.mu.Unlock()
+		cnt.retired.Add(1)
 	case evCreate:
 		b := payload(rec)
 		c, err := decodeCreate(b)
@@ -118,7 +176,12 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		cnt.reads.Add(1)
 		path, ok := res.name(rd.FileObject, rd.FileKey)
 		if !ok {
+			// Keeping a sample of what did NOT resolve is the difference between
+			// "that file produced no read event" and "its read was among the
+			// unresolved" — two claims the previous run could not tell apart, and
+			// the whole basis of the pre-open-handle finding.
 			cnt.unresolved.Add(1)
+			res.recordUnresolved(rd, rec.EventHeader.ProcessId)
 			return 0
 		}
 		cnt.resolved.Add(1)
@@ -183,7 +246,7 @@ func run(duration time.Duration, rundown bool) error {
 	elapsed := time.Since(wall)
 	cpuUsed := processCPU() - cpuStart
 
-	lostEvents, lostBuffers := s.Lost()
+	lostEvents, lostBuffers, lossKnown := s.Lost()
 	s.Stop()
 	select {
 	case <-done:
@@ -191,11 +254,11 @@ func run(duration time.Duration, rundown bool) error {
 		fmt.Println("  ProcessTrace did not return within 5s")
 	}
 
-	report(elapsed, cpuUsed, lostEvents, lostBuffers)
+	report(elapsed, cpuUsed, lostEvents, lostBuffers, lossKnown)
 	return nil
 }
 
-func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32) {
+func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnown bool) {
 	total := cnt.total.Load()
 	reads := cnt.reads.Load()
 	resolved := cnt.resolved.Load()
@@ -210,6 +273,7 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32) {
 	fmt.Printf("  name events        %d\n", cnt.names.Load())
 	fmt.Printf("  create events      %d\n", cnt.creates.Load())
 	fmt.Printf("  operation ends     %d\n", cnt.opEnds.Load())
+	fmt.Printf("  names retired      %d\n", cnt.retired.Load())
 	fmt.Printf("  short/undecodable  %d\n", cnt.shortEvents.Load())
 
 	fmt.Println()
@@ -221,8 +285,12 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32) {
 
 	fmt.Println()
 	fmt.Println("=== loss ===")
-	fmt.Printf("  session EventsLost         %d\n", lostEvents)
-	fmt.Printf("  session RealTimeBuffersLost %d\n", lostBuffers)
+	if !lossKnown {
+		fmt.Println("  UNKNOWN — the session could not be queried, so this run proves nothing about loss")
+	} else {
+		fmt.Printf("  session EventsLost          %d\n", lostEvents)
+		fmt.Printf("  session RealTimeBuffersLost %d\n", lostBuffers)
+	}
 
 	fmt.Println()
 	fmt.Println("=== resolution ===")
@@ -230,6 +298,27 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32) {
 		fmt.Printf("  reads resolved to a path   %d/%d = %.1f%%\n", resolved, reads, 100*float64(resolved)/float64(reads))
 		fmt.Printf("  reads with no known name   %d\n", unresolved)
 	}
+	res.mu.Lock()
+	if len(res.unresolvedByPID) > 0 {
+		type pidCount struct {
+			pid uint32
+			n   int
+		}
+		list := make([]pidCount, 0, len(res.unresolvedByPID))
+		for pid, n := range res.unresolvedByPID {
+			list = append(list, pidCount{pid, n})
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].n > list[j].n })
+		fmt.Println("  unresolved reads by process (top 10):")
+		for i, e := range list {
+			if i >= 10 {
+				break
+			}
+			fmt.Printf("    pid=%-8d %d\n", e.pid, e.n)
+		}
+		fmt.Printf("  unresolved identities sampled: %d\n", len(res.unresolvedSample))
+	}
+	res.mu.Unlock()
 
 	res.mu.Lock()
 	defer res.mu.Unlock()

@@ -43,9 +43,16 @@ type readEvent struct {
 	IOSize          uint32
 }
 
+// readFixedLen is the whole fixed payload of Read v1 on amd64: ByteOffset, Irp,
+// FileObject, FileKey (8 each), then IssuingThreadId, IOSize, IOFlags,
+// ExtraFlags (4 each). Requiring the complete prefix rather than only the part
+// this probe reads is what "fail closed on an unknown version" actually means —
+// accepting 40 would silently parse a different, shorter schema as this one.
+const readFixedLen = 48
+
 func decodeRead(b []byte) (readEvent, error) {
 	var r readEvent
-	if len(b) < 40 {
+	if len(b) < readFixedLen {
 		return r, errShort
 	}
 	r.ByteOffset = binary.LittleEndian.Uint64(b[0:])
@@ -94,8 +101,12 @@ func decodeCreate(b []byte) (createEvent, error) {
 
 // opEndEvent is OperationEnd (24): whether the read actually succeeded.
 type opEndEvent struct {
-	Irp    uint64
-	Status uint32
+	Irp uint64
+	// ExtraInformation is the bytes actually transferred. The Read event carries
+	// only the size that was *asked* for, so reporting that as the read would
+	// overstate a short read and invent one for a request that returned nothing.
+	ExtraInformation uint64
+	Status           uint32
 }
 
 func decodeOpEnd(b []byte) (opEndEvent, error) {
@@ -104,6 +115,7 @@ func decodeOpEnd(b []byte) (opEndEvent, error) {
 		return o, errShort
 	}
 	o.Irp = binary.LittleEndian.Uint64(b[0:])
+	o.ExtraInformation = binary.LittleEndian.Uint64(b[8:])
 	o.Status = binary.LittleEndian.Uint32(b[16:])
 	return o, nil
 }
