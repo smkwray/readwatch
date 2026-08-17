@@ -95,7 +95,26 @@ type resolver struct {
 	hits map[string]map[uint32]int
 	// unresolvedByPID counts what could not be named, per reading process, plus a
 	// bounded sample of the raw identities so a specific case can be traced.
-	unresolvedByPID  map[uint32]int
+	unresolvedByPID map[uint32]int
+	readsByPID      map[uint32]int
+	publishedByPID  map[uint32]int
+	statusByPID     map[uint32]map[uint32]int
+	noStartByPID    map[uint32]int
+	pathsByPID      map[uint32]map[string]int
+	emptyByPID      map[uint32]int
+	failedByPID     map[uint32]int
+	unnamedByPID    map[uint32]int
+	unnamedKeyByPID map[uint32]map[uint64]int
+	// deferred holds reads that completed before anything had published a name
+	// for their FileKey. A read of a handle opened before the session starts is
+	// the normal case for this: the only thing that can name it is the rundown,
+	// and the rundown record for that handle is not delivered when CAPTURE_STATE
+	// is requested - it arrives later, in this host's runs at session teardown.
+	// Dropping such a read is a false negative on a file that really was read, so
+	// it is parked here by FileKey and emitted if a name ever turns up.
+	deferred         map[uint64][]pendingRead
+	deferredHeld     int
+	emptySample      []pendingRead
 	unresolvedSample []unresolvedRead
 	// byRundown holds names learned from the classic FileIo rundown. It is kept
 	// apart from byObj on purpose: classic FileIo documents the value on its
@@ -126,12 +145,70 @@ func (r *resolver) recordClassic(path string, pid uint32) {
 	m[pid]++
 }
 
+// recordUnnamedCompletion keeps both a full count and a bounded sample. Those
+// are different things, and conflating them is what made an earlier run report
+// "0 unnamed completions" for the target: the sample had filled with other
+// processes, so its length said nothing about this one.
 func (r *resolver) recordUnnamedCompletion(p pendingRead) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.unnamedByPID[p.pid]++
+	km := r.unnamedKeyByPID[p.pid]
+	if km == nil {
+		km = make(map[uint64]int)
+		r.unnamedKeyByPID[p.pid] = km
+	}
+	km[p.fileKey]++
 	if len(r.unnamedCompletions) < unresolvedSampleMax {
 		r.unnamedCompletions = append(r.unnamedCompletions, p)
 	}
+}
+
+// parkUnnamed holds a completed read whose file nothing had named yet, so a
+// name arriving later can still claim it. Bounded: a run that parks more than
+// this is reporting a broken correlation, not accumulating a backlog worth
+// keeping.
+const deferredMax = 50000
+
+func (r *resolver) parkUnnamed(p pendingRead) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.deferredHeld >= deferredMax {
+		return
+	}
+	r.deferred[p.fileKey] = append(r.deferred[p.fileKey], p)
+	r.deferredHeld++
+}
+
+// sweepDeferred retries every parked read once the stream has been consumed to
+// its end. This is the whole point of parking: on this host the rundown record
+// for a handle opened before the session is not delivered when CAPTURE_STATE is
+// requested, so a read of it can only be named after the fact.
+func (r *resolver) sweepDeferred() (resolved, stillUnnamed int) {
+	r.mu.Lock()
+	parked := r.deferred
+	r.deferred = make(map[uint64][]pendingRead)
+	r.mu.Unlock()
+	for key, reads := range parked {
+		for _, p := range reads {
+			name, src := r.name(p.fileObject, key)
+			if src == sourceNone {
+				stillUnnamed++
+				continue
+			}
+			resolved++
+			r.mu.Lock()
+			pm := r.pathsByPID[p.pid]
+			if pm == nil {
+				pm = make(map[string]int)
+				r.pathsByPID[p.pid] = pm
+			}
+			pm[name]++
+			r.mu.Unlock()
+			r.record(name, p.pid)
+		}
+	}
+	return resolved, stillUnnamed
 }
 
 // nameSource says which correlation resolved a read, so the probe can report
@@ -183,6 +260,16 @@ func newResolver() *resolver {
 		byObj:           make(map[uint64]string, 1<<16),
 		hits:            make(map[string]map[uint32]int),
 		unresolvedByPID: make(map[uint32]int),
+		readsByPID:      make(map[uint32]int),
+		publishedByPID:  make(map[uint32]int),
+		statusByPID:     make(map[uint32]map[uint32]int),
+		noStartByPID:    make(map[uint32]int),
+		pathsByPID:      make(map[uint32]map[string]int),
+		emptyByPID:      make(map[uint32]int),
+		failedByPID:     make(map[uint32]int),
+		unnamedByPID:    make(map[uint32]int),
+		unnamedKeyByPID: make(map[uint32]map[uint64]int),
+		deferred:        make(map[uint64][]pendingRead),
 		byRundown:       make(map[uint64]string, 1<<18),
 		pending:         make(map[uint64]pendingRead, 4096),
 		classicHits:     make(map[string]map[uint32]int),
@@ -225,6 +312,7 @@ func (r *resolver) name(obj, key uint64) (string, nameSource) {
 func (r *resolver) record(path string, pid uint32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.publishedByPID[pid]++
 	m := r.hits[path]
 	if m == nil {
 		m = make(map[uint32]int)
@@ -238,6 +326,7 @@ var (
 	res           = newResolver()
 	filter        string
 	expect        string
+	expectPID     int
 	verbose       bool
 	dumpRaw       bool
 	rawDumped     atomic.Uint64
@@ -427,6 +516,9 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 			return 0
 		}
 		cnt.reads.Add(1)
+		res.mu.Lock()
+		res.readsByPID[rec.EventHeader.ProcessId]++
+		res.mu.Unlock()
 		path, src := res.name(rd.FileObject, rd.FileKey)
 		switch src {
 		case sourceObject:
@@ -465,14 +557,34 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		}
 		p, ok := res.takePending(oe.Irp)
 		if !ok {
+			res.mu.Lock()
+			res.noStartByPID[rec.EventHeader.ProcessId]++
+			res.mu.Unlock()
 			return 0
 		}
+		res.mu.Lock()
+		m := res.statusByPID[p.pid]
+		if m == nil {
+			m = make(map[uint32]int)
+			res.statusByPID[p.pid] = m
+		}
+		m[oe.Status]++
+		res.mu.Unlock()
 		if oe.Status != 0 {
 			cnt.failedReads.Add(1)
+			res.mu.Lock()
+			res.failedByPID[p.pid]++
+			res.mu.Unlock()
 			return 0
 		}
 		if oe.ExtraInformation == 0 {
 			cnt.emptyReads.Add(1)
+			res.mu.Lock()
+			res.emptyByPID[p.pid]++
+			if len(res.emptySample) < 40 {
+				res.emptySample = append(res.emptySample, p)
+			}
+			res.mu.Unlock()
 			return 0
 		}
 		cnt.completed.Add(1)
@@ -489,8 +601,17 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		if p.path == "" {
 			cnt.unresolvedAtCompletion.Add(1)
 			res.recordUnnamedCompletion(p)
+			res.parkUnnamed(p)
 			return 0
 		}
+		res.mu.Lock()
+		pm := res.pathsByPID[p.pid]
+		if pm == nil {
+			pm = make(map[string]int)
+			res.pathsByPID[p.pid] = pm
+		}
+		pm[p.path]++
+		res.mu.Unlock()
 		if filter == "" || strings.Contains(strings.ToLower(p.path), filter) {
 			res.record(p.path, p.pid)
 		}
@@ -505,6 +626,7 @@ func main() {
 	flag.BoolVar(&verbose, "v", false, "list every resolved path")
 	flag.BoolVar(&dumpRaw, "dump-raw", false, "print the raw bytes of the first few read payloads")
 	flag.StringVar(&expect, "expect", "", "report whether this path substring was ever named, and how")
+	flag.IntVar(&expectPID, "expect-pid", 0, "bind the expectation report to this process only")
 	rundown := flag.Bool("rundown", true, "trigger the filename rundown after starting")
 	flag.Parse()
 	filter = strings.ToLower(filter)
@@ -584,6 +706,12 @@ func run(duration time.Duration, rundown bool) error {
 	case <-time.After(5 * time.Second):
 		fmt.Println("  ProcessTrace did not return within 5s")
 	}
+
+	// Every event, including whatever the rundown delivers at teardown, has now
+	// been consumed. Reads parked for want of a name get their one retry here.
+	lateResolved, stillUnnamed := res.sweepDeferred()
+	fmt.Printf("  deferred sweep: %d reads named after the fact, %d still unnamed\n",
+		lateResolved, stillUnnamed)
 
 	report(elapsed, cpuUsed, lostEvents, lostBuffers, lossKnown)
 	return nil
@@ -748,14 +876,109 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 		if len(res.unnamedCompletions) == 0 {
 			fmt.Println("  no successful read completed without a name")
 		}
-		shown := 0
+		// Bound to the target process. Printing global unnamed completions said
+		// nothing about the target and was how an earlier conclusion got made from
+		// other processes' traffic.
+		shown, targetUnnamed := 0, 0
+		seen := map[uint64]int{}
 		for _, u := range res.unnamedCompletions {
-			if shown >= 6 {
-				break
+			if expectPID != 0 && int(u.pid) != expectPID {
+				continue
 			}
-			fmt.Printf("  unnamed completion:     FileObject=0x%X FileKey=0x%X pid=%d\n",
-				u.fileObject, u.fileKey, u.pid)
-			shown++
+			targetUnnamed++
+			seen[u.fileKey]++
+			if shown < 6 {
+				fmt.Printf("  target unnamed completion: FileObject=0x%X FileKey=0x%X pid=%d\n",
+					u.fileObject, u.fileKey, u.pid)
+				shown++
+			}
+		}
+		if expectPID != 0 {
+			pid := uint32(expectPID)
+			stillPending := 0
+			for _, pr := range res.pending {
+				if pr.pid == pid {
+					stillPending++
+				}
+			}
+			fmt.Printf("  target pid %d: %d read starts, %d published, %d unnamed completions, %d still pending\n",
+				expectPID, res.readsByPID[pid], res.publishedByPID[pid], targetUnnamed, stillPending)
+			fmt.Printf("  target completion statuses (NTSTATUS -> count):\n")
+			for st, n := range res.statusByPID[pid] {
+				fmt.Printf("    0x%08X  %d\n", st, n)
+			}
+			if n := res.noStartByPID[pid]; n > 0 {
+				fmt.Printf("  completions with no matching start: %d (writes and other ops, not loss)\n", n)
+			}
+			// What did the target's successful reads actually get named? If a read
+			// of the pre-open file is named as something else, that is
+			// mis-attribution, which matters far more than a miss.
+			type pc struct {
+				path string
+				n    int
+			}
+			var list []pc
+			for path, n := range res.pathsByPID[pid] {
+				list = append(list, pc{path, n})
+			}
+			sort.Slice(list, func(i, j int) bool { return list[i].n > list[j].n })
+			if n := res.emptyByPID[pid]; n > 0 {
+				fmt.Printf("  target reads dropped as zero-byte: %d\n", n)
+				shownE := 0
+				for _, e := range res.emptySample {
+					if e.pid != pid || shownE >= 4 {
+						continue
+					}
+					name := e.path
+					if name == "" {
+						name = fmt.Sprintf("(unnamed) FileKey=0x%X", e.fileKey)
+					}
+					fmt.Printf("    zero-byte read: %s\n", name)
+					shownE++
+				}
+			}
+			sum := 0
+			for _, e := range list {
+				sum += e.n
+			}
+			fmt.Printf("  target accounting: starts=%d completions=%d named=%d published=%d\n",
+				res.readsByPID[pid], func() int {
+					t := 0
+					for _, n := range res.statusByPID[pid] {
+						t += n
+					}
+					return t
+				}(),
+				sum, res.publishedByPID[pid])
+			fmt.Printf("  target failed=%d zero-byte=%d unnamed=%d (bounded sample held %d of them)\n",
+				res.failedByPID[pid], res.emptyByPID[pid], res.unnamedByPID[pid], targetUnnamed)
+			type kc struct {
+				k uint64
+				n int
+			}
+			var keys []kc
+			for k, n := range res.unnamedKeyByPID[pid] {
+				keys = append(keys, kc{k, n})
+			}
+			sort.Slice(keys, func(i, j int) bool { return keys[i].n > keys[j].n })
+			fmt.Printf("  target's unnamed reads carry %d distinct FileKeys (top 6):\n", len(keys))
+			for i, e := range keys {
+				if i >= 6 {
+					break
+				}
+				_, inRundown := res.byRundown[e.k]
+				_, inKeys := res.byKey[e.k]
+				fmt.Printf("    %5d  FileKey=0x%X  in-rundown=%v  in-namemap=%v\n", e.n, e.k, inRundown, inKeys)
+			}
+			fmt.Printf("  target collisions=%d evicted-generations=%d\n",
+				cnt.irpCollision.Load(), cnt.pendingEvicted.Load())
+			fmt.Printf("  target's named reads, %d distinct paths (top 8 by count):\n", len(list))
+			for i, e := range list {
+				if i >= 8 {
+					break
+				}
+				fmt.Printf("    %5d  %s\n", e.n, e.path)
+			}
 		}
 		res.mu.Unlock()
 		switch {
