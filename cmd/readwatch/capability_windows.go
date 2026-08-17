@@ -767,7 +767,7 @@ func openLogAsClient(raw string) (HANDLE, settings.ObjectIdentity, string, error
 	}
 	guards, err := walkAncestors(volumeGUID, internal, traits)
 	if err != nil {
-		return 0, zero, "", fmt.Errorf("log folder: %w", err)
+		return 0, zero, "", fmt.Errorf("log folder: %w", ownerFacing(err, volumeGUID, lexical))
 	}
 	defer releaseGuards(guards)
 
@@ -852,6 +852,25 @@ func captureIdentity(h HANDLE, volumeGUID string, traits volumeTraits, allowVolu
 		FileIndex64:  uint64(basic.FileIndexHigh)<<32 | uint64(basic.FileIndexLow),
 		CreationTime: basic.CreationTime.Uint64(),
 	}, nil
+}
+
+// ownerFacing rewrites an internal volume path back into the drive letter the
+// owner typed. The walk addresses folders by volume GUID so a drive-letter
+// reassignment cannot redirect it midway, which is right - but a refusal that
+// reads "\\?\Volume{6ee44c6e-...}\Photos: ..." tells the person reading it
+// nothing, and that is what one actually said.
+func ownerFacing(err error, volumeGUID, lexical string) error {
+	if err == nil || volumeGUID == "" || len(lexical) < 3 {
+		return err
+	}
+	text := err.Error()
+	replaced := strings.ReplaceAll(text, strings.TrimRight(volumeGUID, `\`)+`\`, lexical[:3])
+	if replaced == text {
+		return err
+	}
+	// Rebuilt rather than wrapped: the substitution is inside the message, and
+	// keeping the original as a cause would show the owner both versions.
+	return errors.New(replaced)
 }
 
 // volumeOnlyIdentity is everything a volume with no file identity can offer:
