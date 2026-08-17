@@ -2,12 +2,39 @@
 
 ## Unreleased
 
-Watched folders may now live on drives that are not always attached — a USB stick, a card reader.
+**ReadWatch can now watch drives it previously refused, including exFAT USB sticks.** It has two
+ways of detecting reads and picks between them, because neither is better than the other in every
+case.
+
+Watched folders may also live on drives that are not always attached — a USB stick, a card reader.
 Before this, one unreachable folder stopped monitoring for every folder, and a path on a drive that
 was out could not even be added.
 
+### Two ways of detecting reads
+
+- **Audit markers** — the original mechanism. ReadWatch marks the watched folders, so only those
+  folders produce events. Switching a marker on and off costs about a tenth of a millisecond per
+  file: imperceptible for an ordinary folder, minutes for a whole drive. Sees a read made through a
+  memory mapping. Cannot be used on exFAT or FAT, which is how most USB sticks ship.
+- **Event tracing** — new. Writes nothing to the drives and starts instantly on any of them,
+  including exFAT and encrypted volumes. It watches the whole machine's file activity and discards
+  what was not asked for, which costs a little CPU continuously. Does not report a read made purely
+  through a memory mapping.
+- **ReadWatch chooses**, unless told otherwise: markers when every watched folder can carry one,
+  event tracing when any folder cannot. Never both at once — an event-tracing session already
+  reports reads on volumes that could carry a marker, so running both would report those reads
+  twice. A folder whose drive is out does not influence the choice.
+- The window's summary names the mechanism in use. If you asked for markers and a watched folder
+  made that impossible, ReadWatch says so rather than quietly running the other one.
+- Settings offers the choice, with what each option costs and what each can see written next to it.
+
 ### Changed behaviour
 
+- **A folder on an exFAT or FAT drive can now be watched.** It is watched with event tracing, since
+  no audit rule can attach to such a volume. One limitation comes with it, and ReadWatch cannot
+  avoid it: those filesystems record no durable identity for a folder, so ReadWatch can tell that a
+  path now points at a *different drive*, but cannot tell that a folder was deleted and recreated at
+  the same path on the same drive. On NTFS and ReFS the full check is unchanged.
 - **A folder on a drive that is not attached can be added.** Settings checks the shape of the path,
   the same way the service does, and no longer requires the folder to exist.
 - **One unreachable folder no longer stops the others.** Each configured folder is now reported
@@ -46,6 +73,14 @@ was out could not even be added.
 
 ### Security
 
+- **An event-tracing session is cleared whenever ReadWatch gets the chance.** Such a session is a
+  Windows object that keeps running even if the program that created it is killed, so a service that
+  was force-killed could otherwise leave one running with nothing consuming it. ReadWatch clears any
+  session of its own at service start, at monitoring start and at uninstall, by name, so it can
+  never stop a session belonging to another program.
+- **Event tracing is only allowed to relax the folder identity check where the filesystem offers no
+  identity at all**, and only because it writes nothing to the volume and so has nothing it must
+  find again to undo. Audit markers still refuse such a volume outright, and so does the log file.
 - A folder that could not be opened keeps the identity it was last authorised with. Without this,
   skipping an unreachable folder would have erased its recorded identity, and an unrecorded folder is
   treated as one being authorised for the first time — so the next volume to claim that drive letter
