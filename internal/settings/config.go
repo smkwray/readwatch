@@ -83,22 +83,26 @@ type AuditPolicySnapshot struct {
 // version 2 it is also the recovery journal: every privileged change is written
 // here before it is made, so a crash leaves a record of what to undo.
 type Config struct {
-	Version            int                      `json:"version"`
-	OwnerSID           string                   `json:"owner_sid"`
-	OwnerName          string                   `json:"owner_name,omitempty"`
-	Enabled            bool                     `json:"enabled"`
-	StartAtLogin       bool                     `json:"start_at_login"`
-	OpenAtLogin        bool                     `json:"open_at_login"`
-	IncludeDirectories bool                     `json:"include_directory_listings"`
-	LogPath            string                   `json:"log_path"`
-	LogFormat          string                   `json:"log_format"`
-	MaxRows            int                      `json:"max_rows"`
-	Folders            []string                 `json:"folders"`
-	ExcludedProcesses  []string                 `json:"excluded_processes"`
-	FolderBindings     map[string]ObjectBinding `json:"folder_bindings,omitempty"`
-	LogBinding         *ObjectBinding           `json:"log_binding,omitempty"`
-	Snapshots          map[string]AuditSnapshot `json:"audit_snapshots,omitempty"`
-	AuditPolicy        *AuditPolicySnapshot     `json:"audit_policy,omitempty"`
+	Version            int      `json:"version"`
+	OwnerSID           string   `json:"owner_sid"`
+	OwnerName          string   `json:"owner_name,omitempty"`
+	Enabled            bool     `json:"enabled"`
+	StartAtLogin       bool     `json:"start_at_login"`
+	OpenAtLogin        bool     `json:"open_at_login"`
+	IncludeDirectories bool     `json:"include_directory_listings"`
+	LogPath            string   `json:"log_path"`
+	LogFormat          string   `json:"log_format"`
+	MaxRows            int      `json:"max_rows"`
+	Folders            []string `json:"folders"`
+	// Mechanism is the owner's preference, not the decision. What actually runs
+	// is ChooseMechanism's answer, because a folder that cannot carry a marker
+	// overrides a preference for markers rather than refusing to monitor.
+	Mechanism         Mechanism                `json:"mechanism,omitempty"`
+	ExcludedProcesses []string                 `json:"excluded_processes"`
+	FolderBindings    map[string]ObjectBinding `json:"folder_bindings,omitempty"`
+	LogBinding        *ObjectBinding           `json:"log_binding,omitempty"`
+	Snapshots         map[string]AuditSnapshot `json:"audit_snapshots,omitempty"`
+	AuditPolicy       *AuditPolicySnapshot     `json:"audit_policy,omitempty"`
 
 	// Version-1 policy fields, read only so the migration gate can refuse to
 	// upgrade a configuration that still owns machine state it cannot identify.

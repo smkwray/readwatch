@@ -36,6 +36,10 @@ type ServiceEngine struct {
 	// a fault, and a warning nothing can clear is worse than a plain statement.
 	folders      []protocol.FolderStatus
 	pendingRules []string
+	// mechanism is what the last start decided and why. Reported to the viewer so
+	// the owner is told which mechanism is running, and told when the one they
+	// asked for could not be used, rather than left to infer it.
+	mechanism    settings.MechanismChoice
 	ready        bool
 	shuttingDown atomic.Bool
 }
@@ -53,6 +57,12 @@ func NewServiceEngine() (*ServiceEngine, error) {
 	e.watcher = NewEventWatcher(e.onEvent, e.onWatcherError)
 	e.ipc = NewIPCServer(cfg.OwnerSID, e)
 	return e, nil
+}
+
+func (e *ServiceEngine) setMechanism(c settings.MechanismChoice) {
+	e.mu.Lock()
+	e.mechanism = c
+	e.mu.Unlock()
 }
 
 func loadServiceConfig(path, defaultLog string) (settings.Config, error) {
@@ -211,17 +221,22 @@ func (e *ServiceEngine) CurrentState() protocol.State {
 	ready := e.ready
 	folders := append([]protocol.FolderStatus(nil), e.folders...)
 	pending := append([]string(nil), e.pendingRules...)
+	mechanism := e.mechanism
 	e.mu.RUnlock()
 	return protocol.State{
-		Running:      e.watcher.Running(),
-		Config:       cfg.Public(),
-		LastError:    last,
-		LogDropped:   e.watcher.Dropped(),
-		LiveDropped:  e.ipc.Dropped(),
-		Suppressed:   e.watcher.Suppressed(),
-		ServiceReady: ready,
-		Folders:      folders,
-		PendingRules: pending,
+		Running:     e.watcher.Running(),
+		Config:      cfg.Public(),
+		LastError:   last,
+		LogDropped:  e.watcher.Dropped(),
+		LiveDropped: e.ipc.Dropped(),
+		Suppressed:  e.watcher.Suppressed(),
+
+		Mechanism:           string(mechanism.Use),
+		MechanismReason:     mechanism.Reason,
+		MechanismOverridden: mechanism.Overridden,
+		ServiceReady:        ready,
+		Folders:             folders,
+		PendingRules:        pending,
 	}
 }
 

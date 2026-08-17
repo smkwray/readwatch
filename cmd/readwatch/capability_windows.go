@@ -947,3 +947,43 @@ func tokenUserSID(token HANDLE) (string, error) {
 	defer procLocalFree.Call(uintptr(unsafe.Pointer(sidText)))
 	return utf16FromPtr(sidText), nil
 }
+
+// markerCapableFolder answers only one question: can this folder's volume carry
+// an audit rule? It is deliberately separate from binding, because the answer
+// decides which mechanism runs and that decision has to be made before anything
+// privileged happens.
+//
+// known is false when the question cannot be answered right now - a drive that
+// is not attached is the ordinary case. An unanswerable folder must not decide
+// the mechanism for the whole session: which volumes happen to be plugged in
+// would otherwise change how everything else is watched.
+func markerCapableFolder(path string) (capable, known bool) {
+	if len(path) < 2 || path[1] != ':' {
+		// A UNC or otherwise unlettered path. Neither mechanism supports it, and
+		// the bind step refuses it with a specific message; nothing to decide here.
+		return false, false
+	}
+	root := strings.ToUpper(path[:1]) + `:\`
+	switch driveType(root) {
+	case DRIVE_NO_ROOT_DIR, DRIVE_REMOTE:
+		return false, false
+	}
+	fs, err := volumeFileSystem(root)
+	if err != nil {
+		return false, false
+	}
+	return strings.EqualFold(fs, "NTFS") || strings.EqualFold(fs, "ReFS"), true
+}
+
+// markerCapability reports, for each watched folder, whether it can carry a
+// marker. Folders whose answer is unknown are left out entirely, which
+// ChooseMechanism treats as capable.
+func markerCapability(folders []string) map[string]bool {
+	out := make(map[string]bool, len(folders))
+	for _, f := range folders {
+		if capable, known := markerCapableFolder(f); known {
+			out[f] = capable
+		}
+	}
+	return out
+}

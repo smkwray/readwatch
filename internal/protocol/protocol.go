@@ -112,6 +112,15 @@ type State struct {
 	// case where stopping cannot leave nothing behind, so it is reported rather
 	// than quietly forgotten.
 	PendingRules []string `json:"pending_rules,omitempty"`
+	// Mechanism is which of the two ways of observing reads is in use, and the
+	// sentence explaining why. The owner is told rather than left to infer it:
+	// the two differ in what they cost and in what they can see, so which one is
+	// running is part of what the reading means.
+	Mechanism string `json:"mechanism,omitempty"`
+	// MechanismReason is that sentence. MechanismOverridden is true when the
+	// owner asked for markers and could not have them.
+	MechanismReason     string `json:"mechanism_reason,omitempty"`
+	MechanismOverridden bool   `json:"mechanism_overridden,omitempty"`
 }
 
 // Counts summarises the folder states for the status line.
