@@ -295,10 +295,11 @@ func (e *ServiceEngine) startMonitoringBound(pipe HANDLE, clearError bool) error
 	// Which mechanism runs is decided before anything privileged happens, because
 	// it decides whether anything privileged happens at all: event tracing writes
 	// no marker and needs no audit-policy change.
-	choice := settings.ChooseMechanism(cfg.Mechanism, markerCapability(cfg.Folders))
+	public := cfg.Public()
+	choice := mechanismFor(public)
 	e.setMechanism(choice)
 
-	bound, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, cfg.Public(), choice.Use == settings.MechanismETW)
+	bound, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, public, choice.Use == settings.MechanismETW)
 	if err != nil {
 		return err
 	}
@@ -317,6 +318,30 @@ func (e *ServiceEngine) startMonitoringBound(pipe HANDLE, clearError bool) error
 	if err := e.startWithCapabilities(&cfg, bound, choice, clearError); err != nil {
 		bound.Close()
 		return err
+	}
+	return nil
+}
+
+// mechanismFor is the single place the mechanism is decided. It takes the
+// PublicConfig that is about to be bound, so the answer and the binding can
+// never come from different folder lists - which is the defect it exists to
+// prevent, not a hypothetical one.
+func mechanismFor(public settings.PublicConfig) settings.MechanismChoice {
+	return settings.ChooseMechanism(public.Mechanism, markerCapability(public.Folders))
+}
+
+// refuseMarkersWithoutIdentity is the invariant that makes the derivation defect
+// impossible to repeat silently. Markers and a binding with no file identity are
+// incompatible by construction: an audit rule has to be findable again by
+// identity in order to be removed. ChooseMechanism cannot return markers for
+// such a folder, so reaching here means the mechanism and the binding came from
+// different folder lists - which is exactly what happened once, and surfaced as
+// a cryptic reopen failure several layers away.
+func refuseMarkersWithoutIdentity(bound *BoundConfig) error {
+	for _, folder := range bound.Folders {
+		if folder.Identity.VolumeOnly() {
+			return fmt.Errorf("%s is on a volume with no file identity and cannot carry an audit marker; this configuration should have selected event tracing, so the mechanism and the folders it was chosen for have gone out of step", folder.Path)
+		}
 	}
 	return nil
 }
@@ -427,9 +452,22 @@ func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *Bound
 	}
 
 	// Under event tracing nothing is written to any volume and the machine-wide
-	// audit policy is not touched, so there is nothing to apply and nothing to
-	// unwind. Skipping it is the point of the mechanism, not an optimisation.
+	// audit policy is not needed, so there is nothing to apply. Skipping it is the
+	// point of the mechanism, not an optimisation.
+	//
+	// A policy change ReadWatch already owns is given back rather than carried
+	// along. Switching mechanism keeps monitoring on, so nothing else would
+	// release it until the owner exits - and an owned machine-wide setting that no
+	// longer serves anything is residue, whatever it is left over from.
+	if choice.Use == settings.MechanismETW {
+		if err := restoreFileSystemAuditPolicy(cfg, e.saveConfig); err != nil {
+			return err
+		}
+	}
 	if choice.Use == settings.MechanismMarkers {
+		if err := refuseMarkersWithoutIdentity(bound); err != nil {
+			return err
+		}
 		if err := ensureFileSystemAuditPolicy(cfg, e.saveConfig); err != nil {
 			return err
 		}
@@ -612,11 +650,13 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 		}
 	}
 
-	// The candidate's own folders decide the candidate's mechanism, and that
-	// decides whether a volume with no file identity may be admitted. Using the
-	// running configuration's answer here would let a folder be admitted under a
-	// mechanism the apply is about to replace.
-	candidateChoice := settings.ChooseMechanism(public.Mechanism, markerCapability(public.Folders))
+	// The candidate's own folders decide the candidate's mechanism, and that same
+	// answer has to travel all the way to the start below. Deriving it twice is
+	// what produced the defect this comment now guards: the bind used the
+	// candidate's answer and the start recomputed one from the configuration being
+	// replaced, so a folder was admitted for event tracing and then had an audit
+	// marker applied to it.
+	candidateChoice := mechanismFor(public)
 	candidate, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, public, candidateChoice.Use == settings.MechanismETW)
 	if err != nil {
 		return err
@@ -710,12 +750,13 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 		return removeErr
 	}
 
+	// cfg starts as the configuration being replaced and takes the candidate's
+	// public settings inside startWithCapabilities. Its folder list is therefore
+	// the *old* one here, which is exactly why the mechanism must be the one
+	// already derived from the candidate rather than computed from cfg.
 	cfg = cloneConfig(oldCfg)
-	// Recomputed rather than carried over: an apply can add or remove a folder,
-	// and a folder on a volume that cannot carry a marker changes the answer.
-	choice := settings.ChooseMechanism(cfg.Mechanism, markerCapability(cfg.Folders))
-	e.setMechanism(choice)
-	err = e.startWithCapabilities(&cfg, candidate, choice, true)
+	e.setMechanism(candidateChoice)
+	err = e.startWithCapabilities(&cfg, candidate, candidateChoice, true)
 	if errors.Is(err, errNoFolderAvailable) {
 		// The change itself is fine; there is just nothing reachable left to
 		// watch. Go idle with the desired state still on, so the folders are
@@ -789,10 +830,10 @@ func (e *ServiceEngine) restoreRunning(old *BoundConfig, oldCfg *settings.Config
 	if old == nil {
 		return nil
 	}
-	// The configuration being restored is the old one, so its mechanism is
-	// decided from the old one too. Reusing the rejected candidate's answer could
-	// put the previous folders under a mechanism they were never started with.
-	choice := settings.ChooseMechanism(oldCfg.Mechanism, markerCapability(oldCfg.Folders))
+	// The configuration being restored is the old one, so its mechanism comes from
+	// the old one too. Reusing the rejected candidate's answer would put the
+	// previous folders under a mechanism they were never started with.
+	choice := mechanismFor(oldCfg.Public())
 	e.setMechanism(choice)
 	err := e.startWithCapabilities(oldCfg, old, choice, false)
 	if err == nil {
