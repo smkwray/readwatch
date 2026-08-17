@@ -272,8 +272,46 @@ func TestLookupFindsNamesInEitherGeneration(t *testing.T) {
 	if _, ok := w.lookup(0, 0xAA); !ok {
 		t.Fatal("a name was lost by one rotation; it must survive into the previous generation")
 	}
+	// An *unused* name goes after two rotations, or the maps never shrink.
+	w.learn(&w.byRunCur, 0xBB, `\Device\HarddiskVolume3\b.txt`)
 	w.rotate()
-	if _, ok := w.lookup(0, 0xAA); ok {
-		t.Fatal("a name survived two rotations; the maps would grow without bound")
+	w.rotate()
+	if _, ok := w.lookup(0, 0xBB); ok {
+		t.Fatal("an unused name survived two rotations; the maps would grow without bound")
+	}
+}
+
+func TestAUsedNameSurvivesRotationIndefinitely(t *testing.T) {
+	// A file's name is published once, when its handle is created. A handle held
+	// open for hours - a database, a log, a mapped library - is never named
+	// again, so without promotion the busiest readers on the machine would be
+	// exactly the ones ReadWatch stopped being able to name.
+	w := newTestWatcher(t, nil, nil)
+	const key = 0xC0FFEE
+	const want = `\Device\HarddiskVolume3\long-lived.dat`
+	w.learn(&w.byRunCur, key, want)
+	for i := 0; i < 10; i++ {
+		w.rotate()
+		name, ok := w.lookup(0, key)
+		if !ok {
+			t.Fatalf("name lost after %d rotations despite being used between each", i+1)
+		}
+		if name != want {
+			t.Fatalf("name changed to %q", name)
+		}
+	}
+}
+
+func TestPromotionAppliesToFileObjectNamesToo(t *testing.T) {
+	w := newTestWatcher(t, nil, nil)
+	const obj = 0xABCD
+	w.learn(&w.byObjCur, obj, `\Device\HarddiskVolume3\by-object.txt`)
+	w.rotate()
+	if _, ok := w.lookup(obj, 0); !ok {
+		t.Fatal("a FileObject name did not survive one rotation")
+	}
+	w.rotate()
+	if _, ok := w.lookup(obj, 0); !ok {
+		t.Fatal("a FileObject name used between rotations was still dropped")
 	}
 }

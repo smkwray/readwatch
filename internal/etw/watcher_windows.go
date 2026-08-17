@@ -55,8 +55,10 @@ const (
 	// naming path rather than a fallback: on a qualification run 3,893 of 4,965
 	// resolved reads were named by a sweep, not at completion.
 	sweepInterval = 2 * time.Second
-	// retireInterval is how often a name generation is rotated out.
-	retireInterval = 60 * time.Second
+	// The size bound is checked on every sweep rather than on a slow timer of its
+	// own. A minute is a long time at this event rate: the maps could take on
+	// millions of entries between checks, which is not a bound in any useful
+	// sense.
 )
 
 // pendingRead is a read that has started and not yet been told whether it
@@ -263,14 +265,11 @@ func (w *Watcher) Stop() {
 func (w *Watcher) housekeeping(consumerDone chan struct{}) {
 	defer close(w.done)
 	sweep := time.NewTicker(sweepInterval)
-	retire := time.NewTicker(retireInterval)
 	defer sweep.Stop()
-	defer retire.Stop()
 	for {
 		select {
 		case <-sweep.C:
 			w.sweepDeferred(false)
-		case <-retire.C:
 			w.rotateNames()
 		case <-w.stop:
 			// The stream is still being drained: the rundown a system logger emits
@@ -345,20 +344,39 @@ func (w *Watcher) rotate() {
 	w.byRunPrev, w.byRunCur = w.byRunCur, make(map[uint64]string, 1<<12)
 }
 
+// lookup finds a name in either generation, and promotes a hit in the older one
+// back into the current one.
+//
+// The promotion is the point. A file's name is published once, when its handle
+// is created; a handle held open for hours - a database, a log, a mapped
+// library - is never named again. Without promotion, two rotations would drop
+// that name and every later read of it would go unattributed, so the busiest
+// readers on the machine would be exactly the ones ReadWatch stopped naming.
 func (w *Watcher) lookup(obj, key uint64) (string, bool) {
 	w.rmu.Lock()
 	defer w.rmu.Unlock()
-	for _, m := range []map[uint64]string{w.byObjCur, w.byObjPrev} {
-		if n, ok := m[obj]; ok {
-			return n, true
-		}
+	if n, ok := w.byObjCur[obj]; ok {
+		return n, true
+	}
+	if n, ok := w.byObjPrev[obj]; ok {
+		w.byObjCur[obj] = n
+		return n, true
 	}
 	// The rundown's value is matched against FileKey, which is what classic
 	// FileIo documents it as and what a qualification run confirmed exactly.
-	for _, m := range []map[uint64]string{w.byKeyCur, w.byKeyPrev, w.byRunCur, w.byRunPrev} {
-		if n, ok := m[key]; ok {
-			return n, true
-		}
+	if n, ok := w.byKeyCur[key]; ok {
+		return n, true
+	}
+	if n, ok := w.byRunCur[key]; ok {
+		return n, true
+	}
+	if n, ok := w.byKeyPrev[key]; ok {
+		w.byKeyCur[key] = n
+		return n, true
+	}
+	if n, ok := w.byRunPrev[key]; ok {
+		w.byRunCur[key] = n
+		return n, true
 	}
 	return "", false
 }
