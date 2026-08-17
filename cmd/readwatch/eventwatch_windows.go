@@ -34,6 +34,11 @@ type source interface {
 	Start(cfg settings.Config, selfPID uint32, deliver func(model.Event), onError func(error)) error
 	Stop()
 	Running() bool
+	// Enrich fills in anything the mechanism could not carry cheaply, and runs on
+	// the pipeline's own goroutine rather than wherever the event was delivered
+	// from. It must run before the exclusion filter, which matches on the process
+	// image.
+	Enrich(*model.Event)
 	// Dropped counts what this mechanism failed to deliver. It is surfaced rather
 	// than absorbed: a monitor that quietly misses reads is worse than one that
 	// says how many it missed.
@@ -131,6 +136,10 @@ func (s *saclSource) Running() bool {
 }
 
 func (s *saclSource) Dropped() uint64 { return s.dropped.Load() }
+
+// Enrich has nothing to do: event 4663 already carries the process, its image
+// path and the user.
+func (s *saclSource) Enrich(*model.Event) {}
 
 // EventWatcher is the pipeline every mechanism feeds: it decides what is
 // reported, writes the log and drives the live feed.
@@ -234,7 +243,7 @@ func (w *EventWatcher) Start(cfg settings.Config, logFile *os.File, mechanism se
 		return err
 	}
 	w.src = src
-	go w.worker(writer)
+	go w.worker(writer, src)
 	return nil
 }
 
@@ -254,7 +263,7 @@ func (w *EventWatcher) Stop() {
 	<-done
 }
 
-func (w *EventWatcher) worker(writer *logsink.Writer) {
+func (w *EventWatcher) worker(writer *logsink.Writer, src source) {
 	defer close(w.done)
 	defer writer.Close()
 	var flushTimer *time.Timer
@@ -277,6 +286,9 @@ func (w *EventWatcher) worker(writer *logsink.Writer) {
 			if event.PID == w.selfPID || !matchesAnyFolder(event.Path, w.cfg.Folders) {
 				continue
 			}
+			// Before the exclusion filter, which matches on the image path, and on
+			// this goroutine rather than on whatever thread delivered the event.
+			src.Enrich(&event)
 			// Filtered here, in the service, before the event reaches the log or
 			// the pipe: routine background readers can dominate this signal and
 			// should cost neither IPC nor UI work.
