@@ -9,13 +9,16 @@ import (
 	"unsafe"
 )
 
-// The manifest provider's own EVENT_CONTROL_CODE_CAPTURE_STATE documents no
-// promise to enumerate every live file object, and measured here it did not name
-// a file that was already open. The documented mechanism that does is the
-// directed system rundown: run the session as a SystemTraceProvider logger with
-// disk file I/O enabled, then ask SystemTraceControlGuid to capture state with a
-// filter naming this session's own trace handle. That emits classic FileIo
-// FileRundown events, each carrying FileObject and the file's name.
+// Directed system rundown: run the session as a private SystemTraceProvider
+// logger with disk file I/O enabled, then ask SystemTraceControlGuid to capture
+// state with a filter naming this session.
+//
+// Whether that actually emits anything here is UNRESOLVED. An earlier version of
+// this file claimed it produced ~140,000 names; those were the end-of-session
+// enumeration arriving at teardown, and the claim is retracted. With a barrier
+// that measures the stream, the request returns ERROR_SUCCESS and no opcode-36
+// event is seen during the session — but see the barrier's own caveat: opcode 36
+// is only one of the forms a name can arrive in.
 
 const (
 	EVENT_TRACE_SYSTEM_LOGGER_MODE = 0x02000000
@@ -76,45 +79,52 @@ func (g GUID) equals(o GUID) bool {
 // this returns; that is not yet proof the events have been consumed, which is
 // what the flush below is for.
 func (s *session) requestSystemRundown() error {
-	if s.handle == 0 || s.trace == 0 {
-		return fmt.Errorf("rundown requested without both a live session and an attached consumer")
+	if s.handle == 0 {
+		return fmt.Errorf("rundown requested without a live session")
 	}
-	// Which handle EVENT_FILTER_TYPE_TRACEHANDLE wants is settled by measurement
-	// here, not by argument. The documented reading is the session handle from
-	// StartTrace; a review made that point and it is a reasonable reading. But on
-	// this host the session handle produces **zero** rundown events while the
-	// OpenTrace processing handle produces ~140,000, and a rundown that emits
-	// nothing cannot be the correct configuration whatever the prose says.
+	// The filter carries the address of a TRACEHANDLE, and that address is handed
+	// to Windows as an integer. Go's rules say a uintptr holds no pointer
+	// semantics: it keeps nothing alive and is not updated if the object moves.
+	// The earlier version took the address of a stack local, and the compiler
+	// agreed it was one — `go build -gcflags=-m=2` reported "handle does not
+	// escape" — so Windows was given an address on a stack that Go may grow and
+	// relocate. runtime.KeepAlive does not fix that; it governs finalization, not
+	// address validity.
 	//
-	// Both are selectable so the run reports which one works rather than either
-	// of us asserting it. The handle must stay alive and unmoved for the call:
-	// the filter holds its address, not a copy.
-	handle := s.trace
-	if useSessionHandle {
-		handle = s.handle
-	}
-	desc := EVENT_FILTER_DESCRIPTOR{
-		Ptr:  uint64(uintptr(unsafe.Pointer(&handle))),
-		Size: uint32(unsafe.Sizeof(handle)),
+	// runtime.Pinner exists for exactly this: a pointer stored inside a structure
+	// passed to native code. The whole argument graph is pinned for the call.
+	//
+	// The handle is the one from StartTrace. The OpenTrace processing handle is
+	// the consumer's own and means nothing to the provider; the earlier evidence
+	// that it "worked" was a teardown artefact, so that experiment is gone rather
+	// than left in as a switch.
+	target := new(uint64)
+	*target = s.handle
+	desc := &EVENT_FILTER_DESCRIPTOR{
+		Ptr:  uint64(uintptr(unsafe.Pointer(target))),
+		Size: uint32(unsafe.Sizeof(*target)),
 		Type: EVENT_FILTER_TYPE_TRACEHANDLE,
 	}
-	params := ENABLE_TRACE_PARAMETERS{
+	params := &ENABLE_TRACE_PARAMETERS{
 		Version:          2,
-		EnableFilterDesc: unsafe.Pointer(&desc),
+		EnableFilterDesc: unsafe.Pointer(desc),
 		FilterDescCount:  1,
 	}
+	var pin runtime.Pinner
+	pin.Pin(target)
+	pin.Pin(desc)
+	pin.Pin(params)
+	defer pin.Unpin()
+
 	r, _, _ := procEnableTraceEx2.Call(
 		uintptr(s.handle),
 		uintptr(unsafe.Pointer(&systemTraceControlGUID)),
 		EVENT_CONTROL_CODE_CAPTURE_STATE,
-		0, // level: the SDK-directed request takes zero level and keywords
+		0, // the SDK-directed request takes zero level and keywords
 		0, 0,
-		10_000, // ms; synchronous so the provider has finished when this returns
-		uintptr(unsafe.Pointer(&params)),
+		10_000, // ms, so the provider callback has finished when this returns
+		uintptr(unsafe.Pointer(params)),
 	)
-	runtime.KeepAlive(handle)
-	runtime.KeepAlive(desc)
-	runtime.KeepAlive(params)
 	if r != ERROR_SUCCESS {
 		return fmt.Errorf("EnableTraceEx2(system rundown): %w", syscall.Errno(r))
 	}

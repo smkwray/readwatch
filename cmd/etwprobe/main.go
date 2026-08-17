@@ -49,6 +49,9 @@ type counters struct {
 	classicReads           atomic.Uint64
 	classicResolved        atomic.Uint64
 	classicUnresolved      atomic.Uint64
+	namesBeforeRequest     atomic.Uint64
+	namesAfterRequest      atomic.Uint64
+	namesAtTeardown        atomic.Uint64
 }
 
 // pendingRead is a read that has started and not yet been told whether it
@@ -63,6 +66,14 @@ type pendingRead struct {
 }
 
 const pendingReadMax = 20000
+
+// Phases exist so a name that arrives at shutdown can never be mistaken for one
+// that answered the request. Conflating those produced a retracted conclusion.
+const (
+	phaseBeforeRequest int32 = 0
+	phaseAfterRequest  int32 = 1
+	phaseTeardown      int32 = 2
+)
 
 // unresolvedRead is one read whose file could not be named. Bounded: this is a
 // diagnostic sample, not a log.
@@ -223,16 +234,16 @@ func (r *resolver) record(path string, pid uint32) {
 }
 
 var (
-	cnt              counters
-	res              = newResolver()
-	filter           string
-	expect           string
-	verbose          bool
-	dumpRaw          bool
-	useSessionHandle bool
-	rawDumped        atomic.Uint64
-	classicDumped    atomic.Uint64
-	callback         uintptr
+	cnt           counters
+	res           = newResolver()
+	filter        string
+	expect        string
+	verbose       bool
+	dumpRaw       bool
+	rawDumped     atomic.Uint64
+	classicDumped atomic.Uint64
+	phase         atomic.Int32
+	callback      uintptr
 )
 
 // eventCallback runs on ETW's thread for every event the session delivers. It
@@ -256,6 +267,20 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 			res.mu.Lock()
 			res.byRundown[obj] = name
 			res.mu.Unlock()
+			// Count by PHASE, not by opcode. The previous version drove the
+			// readiness barrier from opcode 36 alone, so "the rundown produced no
+			// names" only ever meant "no opcode-36 events" — capture state could
+			// have answered with type 0 or type 32 and gone uncounted. Same class
+			// of error as the teardown reading: measuring one thing and concluding
+			// about another.
+			switch phase.Load() {
+			case phaseBeforeRequest:
+				cnt.namesBeforeRequest.Add(1)
+			case phaseAfterRequest:
+				cnt.namesAfterRequest.Add(1)
+			default:
+				cnt.namesAtTeardown.Add(1)
+			}
 			if rec.EventHeader.EventDescriptor.Opcode == fileIoFileRundown {
 				cnt.rundownNames.Add(1)
 			} else {
@@ -479,7 +504,6 @@ func main() {
 	flag.StringVar(&filter, "filter", "", "only report paths containing this (lower-case substring)")
 	flag.BoolVar(&verbose, "v", false, "list every resolved path")
 	flag.BoolVar(&dumpRaw, "dump-raw", false, "print the raw bytes of the first few read payloads")
-	flag.BoolVar(&useSessionHandle, "session-handle", false, "direct the rundown with the StartTrace handle instead of the OpenTrace handle")
 	flag.StringVar(&expect, "expect", "", "report whether this path substring was ever named, and how")
 	rundown := flag.Bool("rundown", true, "trigger the filename rundown after starting")
 	flag.Parse()
@@ -523,10 +547,11 @@ func run(duration time.Duration, rundown bool) error {
 		// No fallback to the manifest provider's own capture state: quietly
 		// swapping the mechanism under test turns a failed qualification into a
 		// passing one for a different mechanism.
+		phase.Store(phaseAfterRequest)
 		if err := s.requestSystemRundown(); err != nil {
 			return fmt.Errorf("system rundown failed, and there is no substitute for it: %w", err)
 		}
-		fmt.Printf("  system rundown requested (handle=%s)\n", map[bool]string{true: "session/StartTrace", false: "trace/OpenTrace"}[useSessionHandle])
+		fmt.Println("  system rundown requested (pinned StartTrace handle)")
 		if err := s.flush(); err != nil {
 			fmt.Println("  flush FAILED:", err)
 		}
@@ -534,10 +559,12 @@ func run(duration time.Duration, rundown bool) error {
 		// sleep this replaces declared readiness with zero names in hand while
 		// 140,211 were still on their way, so every read that followed raced its
 		// own name and was written off as an identity mismatch.
-		if n := waitRundownQuiet(20 * time.Second); n == 0 {
-			return fmt.Errorf("rundown produced no names: nothing to qualify against")
-		} else {
-			fmt.Printf("  rundown consumed: %d names, stream quiet\n", n)
+		n := waitRundownQuiet(20 * time.Second)
+		fmt.Printf("  names before request: %d | after request: %d\n",
+			cnt.namesBeforeRequest.Load(), n)
+		if n == 0 {
+			fmt.Println("  WARNING: capture state answered with no name event of any form.")
+			fmt.Println("  Continuing so the run still reports what the ordinary streams resolve.")
 		}
 	} else {
 		fmt.Println("  rundown SKIPPED (-rundown=false)")
@@ -549,6 +576,7 @@ func run(duration time.Duration, rundown bool) error {
 	elapsed := time.Since(wall)
 	cpuUsed := processCPU() - cpuStart
 
+	phase.Store(phaseTeardown)
 	lostEvents, lostBuffers, lossKnown := s.Lost()
 	s.Stop()
 	select {
@@ -570,7 +598,7 @@ func waitRundownQuiet(timeout time.Duration) uint64 {
 	last, quiet := uint64(0), 0
 	for time.Now().Before(deadline) {
 		time.Sleep(250 * time.Millisecond)
-		now := cnt.rundownNames.Load()
+		now := cnt.namesAfterRequest.Load()
 		if now == last && now > 0 {
 			if quiet++; quiet >= 3 {
 				return now
@@ -600,6 +628,9 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 	fmt.Printf("  operation ends     %d\n", cnt.opEnds.Load())
 	fmt.Printf("  names retired      %d\n", cnt.retired.Load())
 	fmt.Printf("  rundown names      %d\n", cnt.rundownNames.Load())
+	fmt.Printf("  names before req   %d\n", cnt.namesBeforeRequest.Load())
+	fmt.Printf("  names AFTER req    %d  (what capture state actually answered)\n", cnt.namesAfterRequest.Load())
+	fmt.Printf("  names at teardown  %d  (must never resolve a startup test)\n", cnt.namesAtTeardown.Load())
 	fmt.Printf("  close retire hit   %d  (layout confirmed by hit rate)\n", cnt.closeWouldHit.Load())
 	fmt.Printf("  close retire miss  %d\n", cnt.closeWouldMiss.Load())
 	fmt.Printf("  other providers    %d\n", cnt.otherProvider.Load())
