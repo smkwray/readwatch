@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,5 +128,28 @@ func TestVolumeOnlyIdentityCannotBeReopenedByIdentity(t *testing.T) {
 	id := volumeOnlyIdentity(guid, traits)
 	if _, err := openByIdentity(id); err == nil {
 		t.Fatal("a volume-only identity was reopened by identity; there is no identity to reopen by")
+	}
+}
+
+func TestOwnerFacingRewritesTheInternalPath(t *testing.T) {
+	// The owner saw a refusal reading "\\?\Volume{6ee44c6e-...}\... : reason".
+	// The walk has to address folders by volume GUID so a drive-letter
+	// reassignment cannot redirect it, but the message has to come back.
+	guid := `\\?\Volume{6ee44c6e-0974-4cb8-bf7d-24806a0930fc}\`
+	err := errors.New(guid + `ReadWatch-USB-Test: this is a file, not a folder`)
+	got := ownerFacing(err, guid, `D:\ReadWatch-USB-Test`)
+	want := `D:\ReadWatch-USB-Test: this is a file, not a folder`
+	if got.Error() != want {
+		t.Errorf("ownerFacing = %q, want %q", got.Error(), want)
+	}
+
+	// A message that names no internal path is returned untouched, cause chain
+	// and all, rather than being flattened for no reason.
+	plain := errors.New("your account cannot open this folder")
+	if ownerFacing(plain, guid, `D:\x`) != plain {
+		t.Error("a message with no internal path in it should be returned unchanged")
+	}
+	if ownerFacing(nil, guid, `D:\x`) != nil {
+		t.Error("nil must stay nil")
 	}
 }
