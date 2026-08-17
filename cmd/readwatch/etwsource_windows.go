@@ -21,10 +21,40 @@ type etwSource struct {
 }
 
 func (s *etwSource) Start(cfg settings.Config, selfPID uint32, deliver func(model.Event), onError func(error)) error {
+	// Only what the provider hands over. Naming the process costs two syscalls
+	// and this callback runs on ETW's own thread, where anything slow shows up as
+	// lost events rather than as latency. The rest is filled in by Enrich.
 	s.w = etw.New(cfg.Folders, selfPID, func(r etw.Read) {
-		deliver(eventFromRead(r))
+		deliver(model.Event{Time: r.Time, Path: r.Path, PID: r.PID})
 	}, onError)
 	return s.w.Start()
+}
+
+// Enrich names the process behind a read. ETW reports a process id and nothing
+// else about the process, so the image and the user are resolved here - on the
+// pipeline's goroutine, after the folder filter, so the cost is paid only for
+// reads the owner asked about and never for the machine-wide stream.
+//
+// Resolved per event rather than cached by pid on purpose. Windows reuses
+// process ids, and a stale cache entry would attribute a read to whatever
+// process previously held that number. Naming the wrong process is the one
+// mistake this tool must not make.
+func (s *etwSource) Enrich(e *model.Event) {
+	if e.PID == 0 {
+		return
+	}
+	if path, ok := processImagePath(e.PID); ok {
+		e.ProcessPath = path
+		if i := strings.LastIndexAny(path, `\/`); i >= 0 {
+			e.Process = path[i+1:]
+		} else {
+			e.Process = path
+		}
+	}
+	if name, sid, ok := processUser(e.PID); ok {
+		e.User = name
+		e.UserSID = sid
+	}
 }
 
 func (s *etwSource) Stop() {
@@ -45,36 +75,6 @@ func (s *etwSource) Dropped() uint64 {
 	}
 	c := s.w.Counters()
 	return c.Dropped + c.NeverNamed + c.SessionLost
-}
-
-// eventFromRead fills in what ETW does not carry. The provider reports a process
-// id and nothing else about the process, so the image and the user are resolved
-// here - at publication, after the folder filter, so this cost is paid only for
-// reads the owner actually asked about and never for the machine-wide stream.
-//
-// Resolved per event rather than cached by pid on purpose. Windows reuses
-// process ids, and a stale cache entry would attribute a read to whatever
-// process previously held that number. Naming the wrong process is the one
-// mistake this tool must not make.
-func eventFromRead(r etw.Read) model.Event {
-	e := model.Event{
-		Time: r.Time,
-		Path: r.Path,
-		PID:  r.PID,
-	}
-	if path, ok := processImagePath(r.PID); ok {
-		e.ProcessPath = path
-		if i := strings.LastIndexAny(path, `\/`); i >= 0 {
-			e.Process = path[i+1:]
-		} else {
-			e.Process = path
-		}
-	}
-	if name, sid, ok := processUser(r.PID); ok {
-		e.User = name
-		e.UserSID = sid
-	}
-	return e
 }
 
 // sidLen measures a null-terminated wide string LocalAlloc'd by Windows, so it
