@@ -52,6 +52,8 @@ type counters struct {
 	namesBeforeRequest     atomic.Uint64
 	namesAfterRequest      atomic.Uint64
 	namesAtTeardown        atomic.Uint64
+	namedDeferred          atomic.Uint64
+	neverNamed             atomic.Uint64
 }
 
 // pendingRead is a read that has started and not yet been told whether it
@@ -194,9 +196,11 @@ func (r *resolver) sweepDeferred() (resolved, stillUnnamed int) {
 			name, src := r.name(p.fileObject, key)
 			if src == sourceNone {
 				stillUnnamed++
+				cnt.neverNamed.Add(1)
 				continue
 			}
 			resolved++
+			cnt.namedDeferred.Add(1)
 			r.mu.Lock()
 			pm := r.pathsByPID[p.pid]
 			if pm == nil {
@@ -743,7 +747,6 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 	total := cnt.total.Load()
 	reads := cnt.reads.Load()
 	resolved := cnt.resolved.Load()
-	unresolved := cnt.unresolved.Load()
 	secs := elapsed.Seconds()
 
 	fmt.Println()
@@ -799,8 +802,15 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 	fmt.Println()
 	fmt.Println("=== resolution ===")
 	if reads > 0 {
-		fmt.Printf("  reads resolved to a path   %d/%d = %.1f%%\n", resolved, reads, 100*float64(resolved)/float64(reads))
-		fmt.Printf("  reads with no known name   %d\n", unresolved)
+		// A read is resolved if it was ever named, whether at completion or by the
+		// deferred sweep. Quoting only the completion-time figure understates the
+		// mechanism by everything the rundown names late, which is most of it.
+		late := cnt.namedDeferred.Load()
+		total := resolved + late
+		fmt.Printf("  reads resolved to a path   %d/%d = %.1f%%\n", total, reads, 100*float64(total)/float64(reads))
+		fmt.Printf("    at completion            %d\n", resolved)
+		fmt.Printf("    by deferred sweep        %d\n", late)
+		fmt.Printf("  reads never named          %d\n", cnt.neverNamed.Load())
 		fmt.Println("  resolved via:")
 		fmt.Printf("    manifest FileObject      %d\n", cnt.viaObject.Load())
 		fmt.Printf("    manifest FileKey         %d\n", cnt.viaKey.Load())
