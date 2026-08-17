@@ -625,9 +625,12 @@ func (u *AppUI) applySettings(cfg settings.PublicConfig) bool {
 				rollback.StartAtLogin = oldStart
 				rollback.OpenAtLogin = oldOpen
 				rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 8*time.Second)
-				// Part of the same Save the owner just made, so it carries the same
-				// authority; it only puts the sign-in setting back.
-				_ = client.Command(rollbackCtx, protocol.CmdApply, &rollback, true)
+				// Not authorising, even though a Save started it. Time has passed
+				// since the owner looked at the folder list - setStartup had to run
+				// and fail first - and this message only puts the sign-in setting
+				// back. Re-authorising every configured path on the way past would
+				// approve whatever those paths happen to name by now.
+				_ = client.Command(rollbackCtx, protocol.CmdApply, &rollback, false)
 				rollbackCancel()
 				err = fmt.Errorf("save startup setting: %w", err)
 			}

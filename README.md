@@ -22,7 +22,7 @@ install, and it's running.
   out. It is watched whenever the drive is there and reported as waiting when it isn't, and the
   folders that are present carry on being watched either way.
 - **Cheap to leave running.** It's an event subscription, not a polling loop: no folder scanning,
-  no timers, nothing to do between reads.
+  nothing to do between reads. The only timer is a one-shot that lets drive arrivals settle.
 
 ## How it works
 
@@ -92,13 +92,15 @@ status line with the reason: a junction, a permission you don't have, a network 
 that now refers to a different folder than the one you approved. Those need you; a waiting folder
 does not, which is why it never becomes a warning.
 
-Two things to know. **Safely Remove Hardware will refuse while the drive is being watched** —
-ReadWatch holds the watched folder open, deliberately, so it cannot be renamed away from its own
-audit rule. Press **Stop** first, or just pull the drive: Windows 10 and 11 default to quick removal
-and ReadWatch recovers on its own. And if a drive is pulled while monitoring, **the audit rule stays
-on that disk until it comes back** — nothing can reach it in the meantime. ReadWatch says so, in the
-summary line, and removes it the next time the drive is attached. It will not forget it: uninstalling
-with such a rule outstanding tells you which drive to attach rather than silently abandoning it.
+**Press Stop before you eject.** ReadWatch holds each watched folder open on purpose — that is what
+stops it being renamed away from its own audit rule — so Safely Remove Hardware will refuse while
+the folder is being watched. Stop, then eject the drive the normal way.
+
+If a drive is disconnected without that, ReadWatch is built to recover rather than to break: the
+folders on other drives keep being watched. But **the audit rule stays on the disconnected disk**,
+because nothing can reach it to remove it. ReadWatch says so in the summary line, keeps the record,
+and removes the rule when that drive is next attached. It will not quietly forget it — uninstalling
+with such a rule outstanding tells you which drive to attach rather than abandoning it silently.
 
 Closing the window hides it to the tray; **Exit** quits, stops monitoring and stops the service —
 opening ReadWatch again starts idle, waiting for you to press Start. **Start ReadWatch at sign-in**
@@ -139,6 +141,10 @@ path, event record ID, and access mask.
 - Antivirus, indexing, preview handlers and backup tools read files legitimately and will appear.
   That's what the exclusion list is for.
 - The build is unsigned, so SmartScreen warns on first run.
+
+**Removable-drive support has not been exercised on a real removable drive.** The Windows error
+codes it turns on are measured on the development host and held in place by tests, but a physical
+disconnect while ReadWatch holds the folder open has not been run. Treat that path as new.
 
 Install, the demand-start lifecycle, the service DACL boundary, SACL apply/remove and 4663 capture
 are exercised on Windows 11. The path-binding rules have tests that run against the real filesystem:

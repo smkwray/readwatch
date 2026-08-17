@@ -174,18 +174,27 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 	if !haveCurrent {
 		opened, err := openByIdentity(snapshot.Identity)
 		if err != nil {
+			// Three outcomes, and only one of them may forget the record.
+			//
 			// A condition that will clear on its own is worth waiting for: the
 			// folder is still there and so is the rule.
 			if transientOpenFailure(err) {
 				return fmt.Errorf("%s: %w", snapshot.Path, err)
 			}
-			// Otherwise the object is gone, and an audit rule lives on the object,
-			// so it went with it. There is nothing to restore and nothing that
-			// will ever make this record actionable - keeping it blocks Stop,
-			// Apply and uninstall permanently, which is exactly what it did.
-			writeServiceDiagnostic(fmt.Errorf("%s: forgetting the audit record, the folder could not be found: %w", snapshot.Path, err))
-			delete(cfg.Snapshots, key)
-			return save(cfg)
+			if errors.Is(err, errObjectGone) {
+				// An audit rule lives on the object, so it went with it. There is
+				// nothing to restore and nothing that will ever make this record
+				// actionable - keeping it blocks Stop, Apply and uninstall
+				// permanently, which is exactly what it used to do.
+				writeServiceDiagnostic(fmt.Errorf("%s: forgetting the audit record, the folder no longer exists: %w", snapshot.Path, err))
+				delete(cfg.Snapshots, key)
+				return save(cfg)
+			}
+			// Anything else is indeterminate: the volume is attached and the object
+			// could not be reached, but nothing here establishes that it is gone.
+			// Keep the record and report it. Being visibly stuck is recoverable;
+			// silently abandoning a rule that is still applied is not.
+			return fmt.Errorf("%s: %w", snapshot.Path, err)
 		}
 		defer closeHandle(opened)
 		h = opened
@@ -330,6 +339,37 @@ func refuseChangedIdentities(cfg *settings.Config, bound *BoundConfig) {
 		}
 		bound.markUnavailable(i, errors.New("this path now refers to a different folder than the one ReadWatch was set up to watch; open Settings and press Save to authorise the folder that is there now"), false)
 	}
+}
+
+// refuseIdentityBearingChange rejects an apply that did not claim to be an owner
+// decision but would change which objects ReadWatch is pointed at. The watched
+// folders and the log are the only two settings that name an object; everything
+// else is a preference and may be changed by anything.
+//
+// Without this, an apply sent for some unrelated reason - excluding a process,
+// putting a sign-in setting back - could introduce a path that has no recorded
+// binding, and a path with no binding is treated as one being authorised for the
+// first time. The owner would have approved a process exclusion and got a new
+// watched object.
+func refuseIdentityBearingChange(cfg *settings.Config, public *settings.PublicConfig) error {
+	normalized := *cfg
+	normalized.Folders = append([]string(nil), public.Folders...)
+	normalized.LogPath = public.LogPath
+	normalized.Normalize()
+
+	current := cfg.Public()
+	if !strings.EqualFold(normalized.LogPath, current.LogPath) {
+		return errors.New("this change would point ReadWatch at a different log file; open Settings and press Save to make it")
+	}
+	if len(normalized.Folders) != len(current.Folders) {
+		return errors.New("this change would alter the watched folders; open Settings and press Save to make it")
+	}
+	for i := range normalized.Folders {
+		if !strings.EqualFold(normalized.Folders[i], current.Folders[i]) {
+			return errors.New("this change would alter the watched folders; open Settings and press Save to make it")
+		}
+	}
+	return nil
 }
 
 // logIdentityMatches keeps the log all or nothing. There is no partial state for
@@ -551,6 +591,16 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 	e.mu.RUnlock()
 	wasRunning := e.watcher.Running()
 
+	// The flag says what the sender meant; this says what the service will let
+	// that mean. A message is not authority on its own, so an apply that does not
+	// claim to be an owner decision may not carry one: it may change settings, and
+	// it may not change which objects ReadWatch is pointed at.
+	if !authorise {
+		if err := refuseIdentityBearingChange(&cfg, &public); err != nil {
+			return err
+		}
+	}
+
 	candidate, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, public)
 	if err != nil {
 		return err
@@ -577,14 +627,24 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 		// is the moment to remove it - a refresh while stopped is otherwise the
 		// one path that reaches the service with a drive newly attached and does
 		// nothing about it.
+		var recoverErr error
 		if len(cfg.Snapshots) > 0 || cfg.AuditPolicy != nil {
-			deferred, recoverErr := recoverJournal(&cfg, e.saveConfig)
+			var deferred []string
+			deferred, recoverErr = recoverJournal(&cfg, e.saveConfig)
 			e.setPendingRules(deferred)
 			if recoverErr != nil {
 				writeServiceDiagnostic(recoverErr)
 			}
 		}
-		return e.recordBound(&cfg, candidate)
+		recordErr := e.recordBound(&cfg, candidate)
+		// A rule that could not be withdrawn outranks a successful save. Returning
+		// the save's success here would tell the viewer the new configuration is
+		// cleanly in force while ReadWatch still owns a change it failed to undo.
+		if recoverErr != nil {
+			e.setLastError(recoverErr)
+			return recoverErr
+		}
+		return recordErr
 	}
 
 	e.mu.RLock()
@@ -628,7 +688,9 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 	e.setPendingRules(deferred)
 	if removeErr != nil {
 		candidate.Close()
-		e.restoreRunning(old, &oldCfg)
+		if restoreErr := e.restoreRunning(old, &oldCfg); restoreErr != nil {
+			return fmt.Errorf("%w (and restoring the previous settings failed too: %v)", removeErr, restoreErr)
+		}
 		return removeErr
 	}
 
@@ -642,7 +704,9 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 	}
 	if err != nil {
 		candidate.Close()
-		e.restoreRunning(old, &oldCfg)
+		if restoreErr := e.restoreRunning(old, &oldCfg); restoreErr != nil {
+			return fmt.Errorf("%w (and restoring the previous settings failed too: %v)", err, restoreErr)
+		}
 		return err
 	}
 	return nil
@@ -654,11 +718,23 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 // expectation that new rules were about to replace them. None arrived, so the
 // policy has to go back - otherwise ReadWatch would sit idle owning a
 // machine-wide change with no folder carrying a rule to show for it.
+// A failure to put the policy back is returned, not just logged. Recording the
+// idle configuration afterwards usually succeeds, and returning that success
+// would report a clean stop while a machine-wide change ReadWatch owns is still
+// in force - the one thing the contract here does not allow.
 func (e *ServiceEngine) goIdle(cfg *settings.Config, bound *BoundConfig) error {
-	if err := restoreFileSystemAuditPolicy(cfg, e.saveConfig); err != nil {
-		writeServiceDiagnostic(err)
+	restoreErr := restoreFileSystemAuditPolicy(cfg, e.saveConfig)
+	if restoreErr != nil {
+		writeServiceDiagnostic(restoreErr)
 	}
-	return e.recordBound(cfg, bound)
+	// Release the handles and persist the journal regardless: a stuck policy is no
+	// reason to hold folders open as well.
+	recordErr := e.recordBound(cfg, bound)
+	if restoreErr != nil {
+		e.setLastError(restoreErr)
+		return restoreErr
+	}
+	return recordErr
 }
 
 // recordBound stores a configuration whose objects are known but not being
@@ -686,26 +762,31 @@ func (e *ServiceEngine) recordBound(cfg *settings.Config, bound *BoundConfig) er
 // using the handles it was applied with. If that fails too, monitoring stays off
 // and the journal keeps whatever is unresolved: claiming the old configuration
 // is running when it is not would be worse than saying so.
-func (e *ServiceEngine) restoreRunning(old *BoundConfig, oldCfg *settings.Config) {
+// It returns what went wrong so the caller can combine it with the failure that
+// sent it here. Swallowing it would let a transition report only its first
+// problem while a second one silently left the machine changed.
+func (e *ServiceEngine) restoreRunning(old *BoundConfig, oldCfg *settings.Config) error {
 	if old == nil {
-		return
+		return nil
 	}
 	err := e.startWithCapabilities(oldCfg, old, false)
 	if err == nil {
 		// The status recorded for the rejected candidate would otherwise keep
 		// describing folders this configuration does not have.
 		e.setFolderStatus(old)
-		return
+		return nil
 	}
 	if errors.Is(err, errNoFolderAvailable) {
 		// There is nothing to put back: the folders the previous configuration
 		// watched are not reachable any more either. Monitoring is off because of
-		// where the drives are, which is a state, not a fault.
-		_ = e.goIdle(oldCfg, old)
-		return
+		// where the drives are, which is a state, not a fault - unless going idle
+		// could not undo the machine-wide change, which is.
+		return e.goIdle(oldCfg, old)
 	}
 	writeServiceDiagnostic(fmt.Errorf("restore the previous configuration: %w", err))
-	e.setLastError(fmt.Errorf("monitoring is stopped: the change failed and the previous settings could not be restored (%v)", err))
+	restoreErr := fmt.Errorf("monitoring is stopped: the change failed and the previous settings could not be restored (%v)", err)
+	e.setLastError(restoreErr)
+	return restoreErr
 }
 
 // recoverJournalOffline resolves outstanding records with no running engine,

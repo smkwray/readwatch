@@ -116,15 +116,24 @@ func (e *ServiceEngine) OnViewerHello(pipe HANDLE) error {
 	enabled := cfg.Enabled
 	folders := len(cfg.Folders)
 	e.mu.RUnlock()
+	var recoverErr error
 	if len(cfg.Snapshots) > 0 || cfg.AuditPolicy != nil {
-		deferred, err := recoverJournal(&cfg, e.saveConfig)
+		var deferred []string
+		deferred, recoverErr = recoverJournal(&cfg, e.saveConfig)
 		e.setPendingRules(deferred)
-		if err != nil {
-			writeServiceDiagnostic(err)
+		if recoverErr != nil {
+			writeServiceDiagnostic(recoverErr)
 		}
 		e.mu.Lock()
 		e.cfg = cfg
 		e.mu.Unlock()
+	}
+	// A change ReadWatch owns and could not undo is reported even though the
+	// viewer only said hello. Publishing a clean state here would hide it behind
+	// whatever happens next.
+	if recoverErr != nil {
+		e.setLastError(recoverErr)
+		return recoverErr
 	}
 	if !enabled || folders == 0 {
 		return nil
