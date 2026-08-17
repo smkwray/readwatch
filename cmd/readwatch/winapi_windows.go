@@ -778,6 +778,10 @@ const (
 	// file ID cannot carry an audit rule ReadWatch could later find again.
 	FILE_PERSISTENT_ACLS          = 0x00000008
 	FILE_SUPPORTS_OPEN_BY_FILE_ID = 0x01000000
+	// Whether the volume can hold a junction, symbolic link or mount point at
+	// all. On a volume that cannot, the walk that checks for one has nothing to
+	// find and is skipped rather than failed.
+	FILE_SUPPORTS_REPARSE_POINTS = 0x00000080
 
 	VOLUME_NAME_GUID = 0x00000001
 

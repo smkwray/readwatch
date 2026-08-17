@@ -151,7 +151,7 @@ var errRevertFailed = errors.New("ReadWatch could not drop the client's identity
 
 // bindPublicConfigAsPipeClient opens every configured object under the token of
 // the client on the far end of the pipe, and returns handles rather than paths.
-func bindPublicConfigAsPipeClient(pipe HANDLE, ownerSID string, public settings.PublicConfig) (*BoundConfig, error) {
+func bindPublicConfigAsPipeClient(pipe HANDLE, ownerSID string, public settings.PublicConfig, allowVolumeOnly bool) (*BoundConfig, error) {
 	type result struct {
 		bound *BoundConfig
 		err   error
@@ -161,7 +161,7 @@ func bindPublicConfigAsPipeClient(pipe HANDLE, ownerSID string, public settings.
 		// The impersonation token is a property of the OS thread, so the whole
 		// bind runs on one locked thread and nothing else is scheduled onto it.
 		runtime.LockOSThread()
-		bound, err, fatal := bindOnLockedThread(pipe, ownerSID, public)
+		bound, err, fatal := bindOnLockedThread(pipe, ownerSID, public, allowVolumeOnly)
 		ch <- result{bound, err}
 		if fatal {
 			// Returning without UnlockOSThread terminates this thread rather
@@ -179,7 +179,7 @@ func bindPublicConfigAsPipeClient(pipe HANDLE, ownerSID string, public settings.
 	return r.bound, r.err
 }
 
-func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConfig) (bound *BoundConfig, err error, fatal bool) {
+func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConfig, allowVolumeOnly bool) (bound *BoundConfig, err error, fatal bool) {
 	if r, _, e := procImpersonateNamedPipeClient.Call(uintptr(pipe)); r == 0 {
 		return nil, winErr("ImpersonateNamedPipeClient", e), false
 	}
@@ -233,7 +233,7 @@ func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConf
 	// problem from becoming every folder's problem.
 	configured := make([]string, 0, len(public.Folders))
 	for _, raw := range public.Folders {
-		handle, identity, normalized, openErr := openWatchedFolderAsClient(raw)
+		handle, identity, normalized, openErr := openWatchedFolderAsClient(raw, allowVolumeOnly)
 		if openErr != nil {
 			// Keep the owner's path in the configuration. Persisting only what
 			// opened would delete a folder from Settings the first time its drive
@@ -460,7 +460,8 @@ func validateLexicalPath(raw string) (string, error) {
 
 // volumeGUIDPath turns C:\a\b into \\?\Volume{...}\a\b. The walk uses the
 // volume's own name so a drive-letter reassignment cannot redirect it midway.
-func volumeGUIDPath(driveAbsolute string) (string, string, error) {
+func volumeGUIDPath(driveAbsolute string) (string, string, volumeTraits, error) {
+	var traits volumeTraits
 	root := strings.ToUpper(driveAbsolute[:1]) + `:\`
 	// Ask what kind of drive this is before asking the filesystem anything. A
 	// letter with no volume behind it is the ordinary state of a drive that is
@@ -469,9 +470,9 @@ func volumeGUIDPath(driveAbsolute string) (string, string, error) {
 	// that might come back and would sit in "waiting" forever.
 	switch driveType(root) {
 	case DRIVE_NO_ROOT_DIR:
-		return "", "", fmt.Errorf("%w (%s)", errDriveNotAttached, root)
+		return "", "", traits, fmt.Errorf("%w (%s)", errDriveNotAttached, root)
 	case DRIVE_REMOTE:
-		return "", "", errors.New("network drives are not supported; monitor a local folder on the machine that holds it")
+		return "", "", traits, errors.New("network drives are not supported; monitor a local folder on the machine that holds it")
 	}
 	// Ask what the volume is formatted as before walking into it. Windows audits
 	// file access through the security descriptor, and exFAT and FAT have no
@@ -480,8 +481,9 @@ func volumeGUIDPath(driveAbsolute string) (string, string, error) {
 	// the volume root with "GetFileInformationByHandleEx(FileAttributeTagInfo):
 	// The parameter is incorrect", which tells the owner nothing. Most USB sticks
 	// ship formatted exFAT, so this is the common case, not the exotic one.
-	if fs, err := volumeFileSystem(root); err == nil && !strings.EqualFold(fs, "NTFS") && !strings.EqualFold(fs, "ReFS") {
-		return "", "", fmt.Errorf("%s is formatted %s, and Windows can only audit reads on NTFS or ReFS; reformat the drive as NTFS to watch it", root, fs)
+	traits, err := volumeTraitsFor(root)
+	if err != nil {
+		return "", "", traits, err
 	}
 	buf := make([]uint16, 64)
 	r, _, e := procGetVolumeNameForVolumeMountPntW.Call(
@@ -490,11 +492,65 @@ func volumeGUIDPath(driveAbsolute string) (string, string, error) {
 		uintptr(len(buf)),
 	)
 	if r == 0 {
-		return "", "", fmt.Errorf("identify the volume holding %s: %w", root, e)
+		return "", "", traits, fmt.Errorf("identify the volume holding %s: %w", root, e)
 	}
 	guid := syscall.UTF16ToString(buf)
 	rest := strings.TrimPrefix(driveAbsolute, driveAbsolute[:3])
-	return guid, guid + rest, nil
+	return guid, guid + rest, traits, nil
+}
+
+// volumeTraits are the filesystem capabilities that decide which of ReadWatch's
+// admission checks are meaningful on a volume. They are asked of Windows rather
+// than inferred from the filesystem's name: the point is what this volume can
+// do, not what its format is usually assumed to do.
+type volumeTraits struct {
+	FileSystem     string
+	Serial         uint32
+	PersistentACLs bool
+	OpenByFileID   bool
+	ReparsePoints  bool
+}
+
+// MarkerCapable reports whether an audit rule can be put on this volume and
+// found again afterwards. Both halves matter: applying a rule that cannot later
+// be located by identity would leave a change ReadWatch could not undo.
+func (t volumeTraits) MarkerCapable() bool {
+	return t.PersistentACLs && t.OpenByFileID &&
+		(strings.EqualFold(t.FileSystem, "NTFS") || strings.EqualFold(t.FileSystem, "ReFS"))
+}
+
+// IdentityCapable reports whether an object on this volume can be identified
+// durably enough to be recognised again.
+func (t volumeTraits) IdentityCapable() bool { return t.OpenByFileID }
+
+func volumeTraitsFor(root string) (volumeTraits, error) {
+	var t volumeTraits
+	name := make([]uint16, 32)
+	var serial, maxComponent, flags uint32
+	r, _, e := procGetVolumeInformationW.Call(
+		uintptr(unsafe.Pointer(utf16Ptr(root))),
+		0, 0,
+		uintptr(unsafe.Pointer(&serial)),
+		uintptr(unsafe.Pointer(&maxComponent)),
+		uintptr(unsafe.Pointer(&flags)),
+		uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)),
+	)
+	if r == 0 {
+		return t, winErr("GetVolumeInformation", e)
+	}
+	return traitsFromFlags(syscall.UTF16ToString(name), serial, flags), nil
+}
+
+// traitsFromFlags is separated so the capability rules can be tested against the
+// flag words this host actually reports, without needing the volume present.
+func traitsFromFlags(filesystem string, serial, flags uint32) volumeTraits {
+	return volumeTraits{
+		FileSystem:     filesystem,
+		Serial:         serial,
+		PersistentACLs: flags&FILE_PERSISTENT_ACLS != 0,
+		OpenByFileID:   flags&FILE_SUPPORTS_OPEN_BY_FILE_ID != 0,
+		ReparsePoints:  flags&FILE_SUPPORTS_REPARSE_POINTS != 0,
+	}
 }
 
 func driveType(root string) uint32 {
@@ -522,7 +578,7 @@ func volumeFileSystem(root string) (string, error) {
 // component itself rather than silently following it somewhere else, and the
 // narrow share mode holds the checked namespace still: nothing can rename this
 // component or turn it into a junction while the walk continues below it.
-func openDirectoryComponent(path string) (HANDLE, error) {
+func openDirectoryComponent(path string, traits volumeTraits) (HANDLE, error) {
 	r, _, e := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(path))),
 		FILE_READ_ATTRIBUTES|FILE_TRAVERSE,
@@ -535,14 +591,40 @@ func openDirectoryComponent(path string) (HANDLE, error) {
 		return 0, fmt.Errorf("open %s: %w", path, e)
 	}
 	h := HANDLE(r)
-	if err := requireOrdinaryDirectory(h); err != nil {
+	if err := requireOrdinaryDirectory(h, traits); err != nil {
 		closeHandle(h)
 		return 0, fmt.Errorf("%s: %w", path, err)
 	}
 	return h, nil
 }
 
-func requireOrdinaryDirectory(h HANDLE) error {
+// requireOrdinaryDirectory proves the handle refers to a real directory and not
+// to something that redirects elsewhere.
+//
+// On a volume that cannot hold a reparse point the redirection question does not
+// arise, and the call that would answer it is not available either: measured on
+// this host, FileAttributeTagInfo fails outright on exFAT
+// (do/evidence/2026-08-17-exfat-capability). The check is then satisfied from
+// the plain attributes instead. That is a narrowing justified by the volume's
+// own reported capability, not by an assumption about the format - a volume that
+// claims reparse-point support is checked the strict way whatever it is called.
+func requireOrdinaryDirectory(h HANDLE, traits volumeTraits) error {
+	if !traits.ReparsePoints {
+		var basic BY_HANDLE_FILE_INFORMATION
+		r, _, e := procGetFileInformationByHandle.Call(uintptr(h), uintptr(unsafe.Pointer(&basic)))
+		if r == 0 {
+			return winErr("GetFileInformationByHandle", e)
+		}
+		if basic.FileAttributes&FILE_ATTRIBUTE_DIRECTORY == 0 {
+			return errors.New("this is a file, not a folder")
+		}
+		if basic.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			// The volume said it cannot hold one and an object on it says it is one.
+			// Refuse rather than reconcile: one of the two is lying.
+			return errors.New("this path goes through a junction, symbolic link, mount point or cloud placeholder, which ReadWatch does not follow")
+		}
+		return nil
+	}
 	var info FILE_ATTRIBUTE_TAG_INFO
 	r, _, e := procGetFileInformationByHandleEx.Call(
 		uintptr(h), FileAttributeTagInfo,
@@ -581,14 +663,14 @@ func requireNotReparsePoint(h HANDLE) error {
 // walkAncestors pins every directory from the volume root down to (but not
 // including) the leaf. The returned handles must stay open until the leaf is
 // open and verified; releasing them earlier reopens the race they exist to shut.
-func walkAncestors(volumeGUID, internalPath string) ([]HANDLE, error) {
+func walkAncestors(volumeGUID, internalPath string, traits volumeTraits) ([]HANDLE, error) {
 	guards := make([]HANDLE, 0, 8)
 	release := func() {
 		for _, h := range guards {
 			closeHandle(h)
 		}
 	}
-	root, err := openDirectoryComponent(volumeGUID)
+	root, err := openDirectoryComponent(volumeGUID, traits)
 	if err != nil {
 		return nil, err
 	}
@@ -599,7 +681,7 @@ func walkAncestors(volumeGUID, internalPath string) ([]HANDLE, error) {
 	prefix := volumeGUID
 	for i := 0; i < len(components)-1; i++ {
 		prefix = prefix + components[i] + `\`
-		h, err := openDirectoryComponent(prefix)
+		h, err := openDirectoryComponent(prefix, traits)
 		if err != nil {
 			release()
 			return nil, err
@@ -618,17 +700,20 @@ func releaseGuards(guards []HANDLE) {
 // openWatchedFolderAsClient is the whole admission check for one folder: it runs
 // under impersonation, so a folder the owner cannot open is refused here rather
 // than being opened later by SYSTEM on their behalf.
-func openWatchedFolderAsClient(raw string) (HANDLE, settings.ObjectIdentity, string, error) {
+// allowVolumeOnly says whether a folder on a volume with no durable file
+// identity may be admitted. It is true only under event tracing, where ReadWatch
+// writes nothing to the volume and so has nothing it must find again to undo.
+func openWatchedFolderAsClient(raw string, allowVolumeOnly bool) (HANDLE, settings.ObjectIdentity, string, error) {
 	var zero settings.ObjectIdentity
 	lexical, err := validateLexicalPath(raw)
 	if err != nil {
 		return 0, zero, "", err
 	}
-	volumeGUID, internal, err := volumeGUIDPath(lexical)
+	volumeGUID, internal, traits, err := volumeGUIDPath(lexical)
 	if err != nil {
 		return 0, zero, "", err
 	}
-	guards, err := walkAncestors(volumeGUID, internal)
+	guards, err := walkAncestors(volumeGUID, internal, traits)
 	if err != nil {
 		return 0, zero, "", err
 	}
@@ -648,11 +733,11 @@ func openWatchedFolderAsClient(raw string) (HANDLE, settings.ObjectIdentity, str
 		return 0, zero, "", fmt.Errorf("your account cannot open this folder: %w", e)
 	}
 	h := HANDLE(r)
-	if err := requireOrdinaryDirectory(h); err != nil {
+	if err := requireOrdinaryDirectory(h, traits); err != nil {
 		closeHandle(h)
 		return 0, zero, "", err
 	}
-	identity, err := captureIdentity(h, volumeGUID)
+	identity, err := captureIdentity(h, volumeGUID, traits, allowVolumeOnly)
 	if err != nil {
 		closeHandle(h)
 		return 0, zero, "", err
@@ -673,14 +758,14 @@ func openLogAsClient(raw string) (HANDLE, settings.ObjectIdentity, string, error
 	if err != nil {
 		return 0, zero, "", fmt.Errorf("log file: %w", err)
 	}
-	volumeGUID, internal, err := volumeGUIDPath(lexical)
+	volumeGUID, internal, traits, err := volumeGUIDPath(lexical)
 	if err != nil {
 		// Say it is the log. A watched folder on the same unplugged drive
 		// produces word-for-word the same message, and that one is annotated with
 		// the folder it belongs to while this one would not be.
 		return 0, zero, "", fmt.Errorf("log file %s: %w", lexical, err)
 	}
-	guards, err := walkAncestors(volumeGUID, internal)
+	guards, err := walkAncestors(volumeGUID, internal, traits)
 	if err != nil {
 		return 0, zero, "", fmt.Errorf("log folder: %w", err)
 	}
@@ -702,7 +787,10 @@ func openLogAsClient(raw string) (HANDLE, settings.ObjectIdentity, string, error
 		closeHandle(h)
 		return 0, zero, "", err
 	}
-	identity, err := captureIdentity(h, volumeGUID)
+	// The log is where every event is written, and a log ReadWatch cannot
+	// recognise again is not something to be relaxed about whatever mechanism is
+	// running. It keeps the strict requirement.
+	identity, err := captureIdentity(h, volumeGUID, traits, false)
 	if err != nil {
 		closeHandle(h)
 		return 0, zero, "", err
@@ -712,8 +800,14 @@ func openLogAsClient(raw string) (HANDLE, settings.ObjectIdentity, string, error
 
 // captureIdentity records what this handle refers to, and refuses volumes that
 // cannot carry the audit rule or be searched by identity afterwards.
-func captureIdentity(h HANDLE, volumeGUID string) (settings.ObjectIdentity, error) {
+func captureIdentity(h HANDLE, volumeGUID string, traits volumeTraits, allowVolumeOnly bool) (settings.ObjectIdentity, error) {
 	var zero settings.ObjectIdentity
+	if !traits.IdentityCapable() {
+		if !allowVolumeOnly {
+			return zero, fmt.Errorf("%s volumes cannot carry Windows audit rules; watch this folder with event tracing instead, or use an NTFS or ReFS folder", traits.FileSystem)
+		}
+		return volumeOnlyIdentity(volumeGUID, traits), nil
+	}
 	var idInfo FILE_ID_INFO
 	r, _, e := procGetFileInformationByHandleEx.Call(
 		uintptr(h), FileIdInfo,
@@ -760,6 +854,18 @@ func captureIdentity(h HANDLE, volumeGUID string) (settings.ObjectIdentity, erro
 	}, nil
 }
 
+// volumeOnlyIdentity is everything a volume with no file identity can offer:
+// which volume, and what it is formatted as. Enough to catch the path being
+// pointed at a different volume, not enough to catch a folder replaced on this
+// one.
+func volumeOnlyIdentity(volumeGUID string, traits volumeTraits) settings.ObjectIdentity {
+	return settings.ObjectIdentity{
+		VolumeGUID:   volumeGUID,
+		VolumeSerial: uint64(traits.Serial),
+		FileSystem:   traits.FileSystem,
+	}
+}
+
 // requireFinalPath confirms the object the handle reached is the one the walk
 // addressed, catching any redirection the attribute checks would not.
 func requireFinalPath(h HANDLE, expected string) error {
@@ -793,6 +899,13 @@ func openByIdentity(id settings.ObjectIdentity) (HANDLE, error) {
 // openByIdentityWithAccess exists so the Windows filesystem tests can exercise
 // the identity/share handoff without requiring SeSecurityPrivilege.
 func openByIdentityWithAccess(id settings.ObjectIdentity, desiredAccess uintptr) (HANDLE, error) {
+	if id.VolumeOnly() {
+		// Nothing to open by identity: the volume offered none. This path exists to
+		// find an object ReadWatch changed, and it never changes an object on such
+		// a volume, so reaching here at all means a record was written that should
+		// not have been.
+		return 0, fmt.Errorf("%s carries no file identity, so ReadWatch cannot reopen an object on it by identity", id.VolumeGUID)
+	}
 	volume, _, e := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(strings.TrimRight(id.VolumeGUID, `\`)))),
 		FILE_READ_ATTRIBUTES,
@@ -841,7 +954,12 @@ func openByIdentityWithAccess(id settings.ObjectIdentity, desiredAccess uintptr)
 		return 0, fmt.Errorf("open the recorded folder by identity: %w", winErr("OpenFileById", e))
 	}
 	h := HANDLE(r)
-	current, err := captureIdentity(h, id.VolumeGUID)
+	traits, err := volumeTraitsFor(strings.TrimRight(id.VolumeGUID, `\`) + `\`)
+	if err != nil {
+		closeHandle(h)
+		return 0, err
+	}
+	current, err := captureIdentity(h, id.VolumeGUID, traits, false)
 	if err != nil {
 		closeHandle(h)
 		return 0, err
