@@ -65,12 +65,23 @@ func (g GUID) equals(o GUID) bool {
 // this returns; that is not yet proof the events have been consumed, which is
 // what the flush below is for.
 func (s *session) requestSystemRundown() error {
-	if s.trace == 0 {
-		return fmt.Errorf("rundown requested before the consumer attached")
+	if s.handle == 0 || s.trace == 0 {
+		return fmt.Errorf("rundown requested without both a live session and an attached consumer")
 	}
-	// The handle has to stay alive and unmoved for the duration of the call: the
-	// filter holds its address, not a copy.
+	// Which handle EVENT_FILTER_TYPE_TRACEHANDLE wants is settled by measurement
+	// here, not by argument. The documented reading is the session handle from
+	// StartTrace; a review made that point and it is a reasonable reading. But on
+	// this host the session handle produces **zero** rundown events while the
+	// OpenTrace processing handle produces ~140,000, and a rundown that emits
+	// nothing cannot be the correct configuration whatever the prose says.
+	//
+	// Both are selectable so the run reports which one works rather than either
+	// of us asserting it. The handle must stay alive and unmoved for the call:
+	// the filter holds its address, not a copy.
 	handle := s.trace
+	if useSessionHandle {
+		handle = s.handle
+	}
 	desc := EVENT_FILTER_DESCRIPTOR{
 		Ptr:  uint64(uintptr(unsafe.Pointer(&handle))),
 		Size: uint32(unsafe.Sizeof(handle)),
