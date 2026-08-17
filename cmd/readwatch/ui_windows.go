@@ -852,6 +852,11 @@ func (u *AppUI) updateStatus() {
 		// folders are counted in the summary and deliberately kept out of here: a
 		// warning that nothing can clear stops being read as a warning.
 		setWindowText(u.status, "⚠  "+refused.Path+" — "+refused.Detail)
+	} else if state.MechanismOverridden && idle {
+		// Running something other than what was asked for is worth the status
+		// line once. It is not a fault - monitoring is working - so it sits below
+		// both of the above and says what is happening rather than warning.
+		setWindowText(u.status, "●  "+state.MechanismReason)
 	}
 }
 
@@ -975,6 +980,12 @@ func (u *AppUI) updateSummary() {
 	if n := len(u.state.PendingRules); n > 0 {
 		text += fmt.Sprintf(" · %d audit %s awaiting %s drive", n, plural(n, "rule", "rules"), plural(n, "its", "their"))
 	}
+	// Which mechanism is running is part of what the reading means: the two
+	// differ in what they cost and in what they can see. Named in the summary so
+	// it is always visible, explained in Settings rather than here.
+	if name := mechanismLabel(u.state.Mechanism); name != "" && u.state.Running {
+		text += " · " + name
+	}
 	setWindowText(u.summary, text)
 }
 
@@ -990,6 +1001,18 @@ func since(current uint64, base *uint64) uint64 {
 		*base = 0
 	}
 	return current - *base
+}
+
+// mechanismLabel is the short name shown in the summary. Plain words rather
+// than the stored value: "etw" means nothing to the person reading it.
+func mechanismLabel(m string) string {
+	switch settings.Mechanism(m) {
+	case settings.MechanismETW:
+		return "event tracing"
+	case settings.MechanismMarkers:
+		return "audit markers"
+	}
+	return ""
 }
 
 func plural(n int, one, many string) string {
