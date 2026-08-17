@@ -180,12 +180,14 @@ func (r *resolver) record(path string, pid uint32) {
 }
 
 var (
-	cnt      counters
-	res      = newResolver()
-	filter   string
-	expect   string
-	verbose  bool
-	callback uintptr
+	cnt       counters
+	res       = newResolver()
+	filter    string
+	expect    string
+	verbose   bool
+	dumpRaw   bool
+	rawDumped atomic.Uint64
+	callback  uintptr
 )
 
 // eventCallback runs on ETW's thread for every event the session delivers. It
@@ -298,6 +300,21 @@ func eventCallback(rec *EVENT_RECORD) uintptr {
 		res.mu.Unlock()
 	case evRead:
 		b := payload(rec)
+		// Dump the first few raw payloads. The decoded FileKey lands in a
+		// different kernel pool from the one a tracerpt-rendered FileKey shows,
+		// which means a field offset here is wrong; the bytes settle it where
+		// reasoning about the schema did not.
+		if dumpRaw && rawDumped.Add(1) <= 3 {
+			var sb strings.Builder
+			for i, x := range b {
+				if i%8 == 0 && i > 0 {
+					sb.WriteString(" | ")
+				}
+				fmt.Fprintf(&sb, "%02X", x)
+			}
+			fmt.Printf("RAW read v%d len=%d: %s\n",
+				rec.EventHeader.EventDescriptor.Version, len(b), sb.String())
+		}
 		rd, err := decodeRead(b)
 		if err != nil {
 			cnt.shortEvents.Add(1)
@@ -366,6 +383,7 @@ func main() {
 	flag.DurationVar(&duration, "duration", 8*time.Second, "how long to consume")
 	flag.StringVar(&filter, "filter", "", "only report paths containing this (lower-case substring)")
 	flag.BoolVar(&verbose, "v", false, "list every resolved path")
+	flag.BoolVar(&dumpRaw, "dump-raw", false, "print the raw bytes of the first few read payloads")
 	flag.StringVar(&expect, "expect", "", "report whether this path substring was ever named, and how")
 	rundown := flag.Bool("rundown", true, "trigger the filename rundown after starting")
 	flag.Parse()
@@ -549,6 +567,29 @@ func report(elapsed, cpu time.Duration, lostEvents, lostBuffers uint32, lossKnow
 		}
 		res.mu.Unlock()
 		fmt.Printf("  reads published for it: %d across %d path(s)\n", publishedReads, published)
+
+		// Put the identities side by side. If the rundown's key and the reads'
+		// identities are similar-but-shifted, this decoder has an offset wrong; if
+		// they are unrelated values, the two streams genuinely do not share a
+		// namespace and no amount of decoding fixes it. Those need opposite work,
+		// and nothing so far has told them apart.
+		res.mu.Lock()
+		for k, n := range res.byRundown {
+			if strings.Contains(strings.ToLower(n), expect) {
+				fmt.Printf("  rundown key for it:     0x%X\n", k)
+				break
+			}
+		}
+		shown := 0
+		for _, u := range res.unresolvedSample {
+			if shown >= 4 {
+				break
+			}
+			fmt.Printf("  unresolved read:        FileObject=0x%X FileKey=0x%X pid=%d\n",
+				u.FileObject, u.FileKey, u.PID)
+			shown++
+		}
+		res.mu.Unlock()
 		switch {
 		case sample == "":
 			fmt.Println("  → NOT NAMED: nothing ever learned this file's name")
