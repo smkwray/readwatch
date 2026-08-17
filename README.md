@@ -21,14 +21,35 @@ install, and it's running.
 - **Drives that come and go.** A folder on a USB stick or a card can be added while the drive is
   out. It is watched whenever the drive is there and reported as waiting when it isn't, and the
   folders that are present carry on being watched either way.
+- **Any drive, including exFAT sticks and encrypted volumes.** Windows cannot put an audit marker on
+  exFAT or FAT, so ReadWatch switches to event tracing for those and tells you it has.
 - **Cheap to leave running.** It's an event subscription, not a polling loop: no folder scanning,
   nothing to do between reads. The only timer is a one-shot that lets drive arrivals settle.
 
 ## How it works
 
-Windows can already audit file reads — ReadWatch drives that machinery for you. It enables the
-*Audit File System (success)* policy, applies a narrowly scoped audit entry (SACL) to your chosen
-folders, subscribes to Security event **4663**, and turns the raw XML into a readable line.
+Windows can tell you which process read a file in two quite different ways, and neither is better
+than the other in every case, so ReadWatch does both and picks.
+
+**Audit markers.** It enables the *Audit File System (success)* policy, applies a narrowly scoped
+audit entry (SACL) to your chosen folders, subscribes to Security event **4663**, and turns the raw
+XML into a readable line. Only the marked folders generate events. Putting a marker on and taking it
+off again costs about a tenth of a millisecond per file, so an ordinary folder is instant and a whole
+drive takes minutes. It sees a read made through a memory mapping. It cannot be used on exFAT or FAT,
+because those filesystems have no security descriptors for an audit entry to live in — which is how
+most USB sticks ship.
+
+**Event tracing.** It runs an Event Tracing for Windows session on the kernel's file provider. This
+writes nothing to your drives and starts instantly on any of them, including exFAT and encrypted
+volumes. The provider cannot be filtered by folder, so ReadWatch sees the whole machine's file
+activity and discards what you did not ask for — which costs a little CPU continuously, whether you
+watch one folder or twenty. It does not report a read made purely through a memory mapping.
+
+**Which one runs.** Markers when every watched folder can carry one, event tracing when any folder
+cannot — so a folder on a USB stick is watched rather than refused. Never both at once, since a
+tracing session already reports reads on volumes that could carry a marker. You can force either from
+Settings; if you ask for markers and a watched folder makes that impossible, ReadWatch says so rather
+than silently running the other one. The window's summary always names the mechanism in use.
 
 A **LocalSystem service** owns everything privileged; a **non-elevated viewer** talks to it over a
 local named pipe admitting only LocalSystem and the installing account. The service is
@@ -41,6 +62,13 @@ Your folders and log file are opened under **your** account when you press Start
 service keeps those handles: every privileged operation goes through them rather than looking the
 path up a second time, so nothing can be swapped for something else in between. Each folder is
 recorded by volume and file identity, not by name.
+
+On exFAT and FAT there is no file identity to record — Windows offers none — so a folder there is
+recorded by volume only. ReadWatch can still tell that a path now points at a different drive; it
+cannot tell that a folder was deleted and recreated at the same path on the same drive. That
+reduction is accepted only under event tracing, which writes nothing to the volume and so has nothing
+it must find again in order to undo it. Audit markers still refuse such a volume, and so does the log
+file.
 
 Before/after SACL snapshots mean a folder is restored only if the live SACL is still what
 ReadWatch applied, and each change is written down before it is made, so an interrupted one can be
