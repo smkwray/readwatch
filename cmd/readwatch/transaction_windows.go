@@ -298,7 +298,7 @@ func (e *ServiceEngine) startMonitoringBound(pipe HANDLE, clearError bool) error
 	choice := settings.ChooseMechanism(cfg.Mechanism, markerCapability(cfg.Folders))
 	e.setMechanism(choice)
 
-	bound, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, cfg.Public())
+	bound, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, cfg.Public(), choice.Use == settings.MechanismETW)
 	if err != nil {
 		return err
 	}
@@ -612,7 +612,12 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, au
 		}
 	}
 
-	candidate, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, public)
+	// The candidate's own folders decide the candidate's mechanism, and that
+	// decides whether a volume with no file identity may be admitted. Using the
+	// running configuration's answer here would let a folder be admitted under a
+	// mechanism the apply is about to replace.
+	candidateChoice := settings.ChooseMechanism(public.Mechanism, markerCapability(public.Folders))
+	candidate, err := bindPublicConfigAsPipeClient(pipe, cfg.OwnerSID, public, candidateChoice.Use == settings.MechanismETW)
 	if err != nil {
 		return err
 	}

@@ -55,7 +55,7 @@ func TestUnattachedDriveLetterIsWaiting(t *testing.T) {
 	if dt := driveType(root); dt != DRIVE_NO_ROOT_DIR {
 		t.Fatalf("GetDriveType(%s) = %d, want DRIVE_NO_ROOT_DIR(%d); the letter is not actually free", root, dt, DRIVE_NO_ROOT_DIR)
 	}
-	_, _, err := volumeGUIDPath(letter + `\Photos`)
+	_, _, _, err := volumeGUIDPath(letter + `\Photos`)
 	if err == nil {
 		t.Fatalf("%s\\Photos resolved to a volume although %s is not attached", letter, letter)
 	}
@@ -77,7 +77,7 @@ func TestOpenWatchedFolderClassifiesUnreachableFolders(t *testing.T) {
 		"a folder that does not exist": filepath.Join(t.TempDir(), "missing", "deeper"),
 	}
 	for why, path := range cases {
-		h, _, _, err := openWatchedFolderAsClient(path)
+		h, _, _, err := openWatchedFolderAsClient(path, false)
 		if err == nil {
 			closeHandle(h)
 			t.Errorf("%s (%s) opened successfully", path, why)
@@ -101,7 +101,7 @@ func TestPermanentRefusalsAreNotWaiting(t *testing.T) {
 	if err := makeJunction(link, target); err != nil {
 		t.Skipf("could not create a junction on this host: %v", err)
 	}
-	h, _, _, err := openWatchedFolderAsClient(link)
+	h, _, _, err := openWatchedFolderAsClient(link, false)
 	if err == nil {
 		closeHandle(h)
 		t.Fatal("a junction was accepted as a watched folder")
@@ -146,7 +146,7 @@ func TestDeletedFolderOnAnAttachedVolumeIsGone(t *testing.T) {
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	handle, identity, _, err := openWatchedFolderAsClient(dir)
+	handle, identity, _, err := openWatchedFolderAsClient(dir, false)
 	if err != nil {
 		t.Fatalf("open %s: %v", dir, err)
 	}
@@ -245,7 +245,7 @@ func TestNonAuthorisingApplyCannotRepointReadWatch(t *testing.T) {
 // unplugged drive must not read the same as a path that was mistyped.
 func TestWaitingReasonIsReadable(t *testing.T) {
 	letter := freeDriveLetter(t)
-	_, _, driveErr := volumeGUIDPath(letter + `\Photos`)
+	_, _, _, driveErr := volumeGUIDPath(letter + `\Photos`)
 	if driveErr == nil {
 		t.Fatalf("%s resolved although it is not attached", letter)
 	}
@@ -253,7 +253,7 @@ func TestWaitingReasonIsReadable(t *testing.T) {
 		t.Errorf("an unattached drive reads as %q", got)
 	}
 
-	_, _, _, missingErr := openWatchedFolderAsClient(filepath.Join(t.TempDir(), "missing", "deeper"))
+	_, _, _, missingErr := openWatchedFolderAsClient(filepath.Join(t.TempDir(), "missing", "deeper"), false)
 	if missingErr == nil {
 		t.Fatal("a folder that does not exist was opened")
 	}

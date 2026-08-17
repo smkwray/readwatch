@@ -38,6 +38,18 @@ func (id ObjectIdentity) Zero() bool {
 	return id.VolumeGUID == "" && id.FileID128 == [16]byte{} && id.FileIndex64 == 0
 }
 
+// VolumeOnly reports an identity that names a volume but not an object on it.
+// Some filesystems - exFAT and FAT among them - offer no durable file identity
+// at all: measured on this host, both FileIdInfo and the by-handle file index
+// come back empty or fail outright (do/evidence/2026-08-17-exfat-capability).
+// A binding on such a volume can still catch the path being pointed at a
+// different volume, and cannot catch a folder deleted and recreated at the same
+// path. It is only acceptable where ReadWatch writes nothing to the volume and
+// so has nothing it must find again to undo.
+func (id ObjectIdentity) VolumeOnly() bool {
+	return id.VolumeGUID != "" && id.FileID128 == [16]byte{} && id.FileIndex64 == 0
+}
+
 // Key identifies a snapshot by the object it describes rather than by a path
 // that can be pointed somewhere else.
 func (id ObjectIdentity) Key() string {
@@ -146,6 +158,10 @@ type PublicConfig struct {
 	MaxRows            int      `json:"max_rows"`
 	Folders            []string `json:"folders"`
 	ExcludedProcesses  []string `json:"excluded_processes"`
+	// Mechanism is the owner's preference. It is a preference and not a command:
+	// a folder that cannot carry a marker overrides a preference for markers
+	// rather than refusing to monitor, and the override is reported.
+	Mechanism Mechanism `json:"mechanism,omitempty"`
 }
 
 // Excludes reports whether a reader matches the suppression list.
@@ -238,6 +254,7 @@ func (c Config) Public() PublicConfig {
 		LogFormat:          c.LogFormat,
 		MaxRows:            c.MaxRows,
 		Folders:            folders,
+		Mechanism:          c.Mechanism,
 	}
 }
 
@@ -250,6 +267,7 @@ func (c *Config) ApplyPublic(p PublicConfig) {
 	c.MaxRows = p.MaxRows
 	c.Folders = append(c.Folders[:0], p.Folders...)
 	c.ExcludedProcesses = append(c.ExcludedProcesses[:0], p.ExcludedProcesses...)
+	c.Mechanism = p.Mechanism
 	c.Normalize()
 }
 
@@ -260,6 +278,9 @@ func (c *Config) Normalize() {
 	c.LogPath = filepath.Clean(strings.TrimSpace(c.LogPath))
 	if c.LogFormat != "text" && c.LogFormat != "jsonl" && c.LogFormat != "csv" {
 		c.LogFormat = "text"
+	}
+	if !c.Mechanism.Valid() {
+		c.Mechanism = MechanismAuto
 	}
 	if c.MaxRows < 200 || c.MaxRows > 5000 {
 		c.MaxRows = 1000

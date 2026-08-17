@@ -87,14 +87,14 @@ func TestWalkAncestorsOnRealDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("temp dir %s was rejected: %v", dir, err)
 	}
-	volumeGUID, internal, err := volumeGUIDPath(lexical)
+	volumeGUID, internal, traits, err := volumeGUIDPath(lexical)
 	if err != nil {
 		t.Fatalf("resolve volume for %s: %v", lexical, err)
 	}
 	if !strings.HasPrefix(volumeGUID, `\\?\Volume{`) {
 		t.Fatalf("volume name = %q, want a \\\\?\\Volume{...} path", volumeGUID)
 	}
-	guards, err := walkAncestors(volumeGUID, internal)
+	guards, err := walkAncestors(volumeGUID, internal, traits)
 	if err != nil {
 		t.Fatalf("walk ancestors of %s: %v", internal, err)
 	}
@@ -124,11 +124,11 @@ func TestWalkRefusesJunction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	volumeGUID, internal, err := volumeGUIDPath(lexical)
+	volumeGUID, internal, traits, err := volumeGUIDPath(lexical)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := openDirectoryComponent(internal)
+	h, err := openDirectoryComponent(internal, traits)
 	if err == nil {
 		closeHandle(h)
 		t.Error("opening a junction as a path component succeeded, want refusal")
@@ -145,11 +145,11 @@ func TestWalkRefusesJunction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	volumeGUID, internal, err = volumeGUIDPath(lexical)
+	volumeGUID, internal, traits, err = volumeGUIDPath(lexical)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if guards, err := walkAncestors(volumeGUID, internal); err == nil {
+	if guards, err := walkAncestors(volumeGUID, internal, traits); err == nil {
 		releaseGuards(guards)
 		t.Error("walking through a junction succeeded, want refusal")
 	}
@@ -275,7 +275,7 @@ func TestOpenByIdentityHandoffKeepsRootPinned(t *testing.T) {
 // impersonation, which is what a test can do: the tests here are about what the
 // walk and identity capture accept, not about whose token is in force.
 func openWatchedFolderAsClientForTest(path string) (HANDLE, settings.ObjectIdentity, string, error) {
-	return openWatchedFolderAsClient(path)
+	return openWatchedFolderAsClient(path, false)
 }
 
 // makeJunction shells out to mklink because creating a reparse point through
