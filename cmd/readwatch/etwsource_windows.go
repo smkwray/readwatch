@@ -4,6 +4,7 @@ package main
 
 import (
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -17,17 +18,32 @@ import (
 // feed cannot behave differently depending on which mechanism is running: one
 // conceptual change edits one place.
 type etwSource struct {
-	w *etw.Watcher
+	// mu guards w. Stop clears it while the window may be asking for counters,
+	// and those two run on different goroutines.
+	mu sync.Mutex
+	w  *etw.Watcher
+}
+
+func (s *etwSource) watcher() *etw.Watcher {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w
 }
 
 func (s *etwSource) Start(cfg settings.Config, selfPID uint32, deliver func(model.Event), onError func(error)) error {
 	// Only what the provider hands over. Naming the process costs two syscalls
 	// and this callback runs on ETW's own thread, where anything slow shows up as
 	// lost events rather than as latency. The rest is filled in by Enrich.
-	s.w = etw.New(cfg.Folders, selfPID, func(r etw.Read) {
+	w := etw.New(cfg.Folders, selfPID, func(r etw.Read) {
 		deliver(model.Event{Time: r.Time, Path: r.Path, PID: r.PID})
 	}, onError)
-	return s.w.Start()
+	if err := w.Start(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.w = w
+	s.mu.Unlock()
+	return nil
 }
 
 // Enrich names the process behind a read. ETW reports a process id and nothing
@@ -58,22 +74,29 @@ func (s *etwSource) Enrich(e *model.Event) {
 }
 
 func (s *etwSource) Stop() {
-	if s.w != nil {
-		s.w.Stop()
-		s.w = nil
+	s.mu.Lock()
+	w := s.w
+	s.w = nil
+	s.mu.Unlock()
+	if w != nil {
+		w.Stop()
 	}
 }
 
-func (s *etwSource) Running() bool { return s.w != nil && s.w.Running() }
+func (s *etwSource) Running() bool {
+	w := s.watcher()
+	return w != nil && w.Running()
+}
 
 // Dropped reports everything this mechanism failed to deliver, from either side:
 // what the session lost and what correlation could not name. Reporting only one
 // would make a monitor that is missing reads look healthy.
 func (s *etwSource) Dropped() uint64 {
-	if s.w == nil {
+	w := s.watcher()
+	if w == nil {
 		return 0
 	}
-	c := s.w.Counters()
+	c := w.Counters()
 	return c.Dropped + c.NeverNamed + c.SessionLost
 }
 
