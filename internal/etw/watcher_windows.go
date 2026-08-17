@@ -31,6 +31,12 @@ type Counters struct {
 	NeverNamed  uint64 // a read whose file nothing ever named
 	SessionLost uint64 // the session itself lost events
 	LostKnown   bool
+	// Observed and Published are not losses; they are what distinguishes "nothing
+	// was read" from "reads are arriving and something downstream is eating
+	// them". Without both, a broken filter and a quiet machine look identical.
+	Observed  uint64 // read events decoded, machine-wide
+	Named     uint64 // of those, resolved to a path
+	Published uint64 // of those, inside a watched folder and handed on
 }
 
 const (
@@ -96,6 +102,9 @@ type Watcher struct {
 	volumesAt             time.Time
 	dropped               atomic.Uint64
 	neverNamed            atomic.Uint64
+	observed              atomic.Uint64
+	named                 atomic.Uint64
+	published             atomic.Uint64
 	sessionLost, lostBufs uint32
 	lostKnown             bool
 	running               atomic.Bool
@@ -149,6 +158,9 @@ func (w *Watcher) initState() {
 	w.deferredHeld = 0
 	w.dropped.Store(0)
 	w.neverNamed.Store(0)
+	w.observed.Store(0)
+	w.named.Store(0)
+	w.published.Store(0)
 }
 
 func (w *Watcher) Running() bool { return w.running.Load() }
@@ -162,6 +174,9 @@ func (w *Watcher) Counters() Counters {
 		NeverNamed:  w.neverNamed.Load(),
 		SessionLost: uint64(lost),
 		LostKnown:   known,
+		Observed:    w.observed.Load(),
+		Named:       w.named.Load(),
+		Published:   w.published.Load(),
 	}
 }
 
@@ -403,10 +418,12 @@ func (w *Watcher) publish(ntPath string, p pendingRead) {
 	if p.pid == w.selfPID {
 		return
 	}
+	w.named.Add(1)
 	dos := w.toDOS(ntPath)
 	if dos == "" || !w.wanted(dos) {
 		return
 	}
+	w.published.Add(1)
 	if w.emit != nil {
 		w.emit(Read{Path: dos, PID: p.pid, TID: p.tid, Bytes: p.bytes, Time: p.at})
 	}
@@ -475,6 +492,7 @@ func onEvent(rec *EVENT_RECORD) uintptr {
 		if err != nil {
 			return 0
 		}
+		w.observed.Add(1)
 		p := pendingRead{
 			fileObject: r.FileObject,
 			fileKey:    r.FileKey,
