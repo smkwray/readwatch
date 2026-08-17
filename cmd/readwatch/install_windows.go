@@ -14,6 +14,7 @@ import (
 	"time"
 	"unsafe"
 
+	"readwatch/internal/etw"
 	"readwatch/internal/protocol"
 	"readwatch/internal/settings"
 )
@@ -300,6 +301,11 @@ func uninstallElevated(quiet bool) error {
 			return err
 		}
 	}
+	// An ETW session survives the process that made it, so a service that was
+	// killed at some point could have left one running. Nothing else clears it
+	// once the service is deleted, and uninstall is the last moment ReadWatch has
+	// to leave the machine as it found it.
+	etw.StopStale()
 	if err := deleteInstalledService(); err != nil {
 		return err
 	}

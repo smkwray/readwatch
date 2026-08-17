@@ -15,6 +15,7 @@ import (
 	"time"
 	"unsafe"
 
+	"readwatch/internal/etw"
 	"readwatch/internal/model"
 	"readwatch/internal/protocol"
 	"readwatch/internal/settings"
@@ -95,6 +96,11 @@ func loadServiceConfig(path, defaultLog string) (settings.Config, error) {
 // and the authority for that is a connected owner's token, which does not exist
 // yet. The resume happens on the first viewer hello instead.
 func (e *ServiceEngine) Start() error {
+	// An ETW session outlives the process that created it, so a service that was
+	// killed rather than stopped leaves one running with nobody consuming it.
+	// Clear it here as well as at monitoring start: the service can sit idle for
+	// a long time before anything else would notice.
+	etw.StopStale()
 	e.ipc.Start()
 	e.mu.Lock()
 	e.ready = true

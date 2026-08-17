@@ -72,8 +72,18 @@ func writeLoggerName(buf []byte, offset uint32, name string) {
 	copy(dst, n)
 }
 
-// stopStaleSession clears an orphan from a previous run of this service. It
-// names the session explicitly, so it can never stop anything else's.
+// StopStale clears an ETW session left behind by a previous run.
+//
+// This matters more than it looks. An ETW session is a kernel object that
+// outlives the process that created it: a service killed rather than stopped
+// leaves the session running, buffering the whole machine's file activity with
+// nobody consuming it. Nothing in ETW ties a session's lifetime to its creator,
+// so the only defence is to clear an orphan at every point ReadWatch gets
+// control - service start as well as monitoring start.
+func StopStale() { stopStaleSession() }
+
+// stopStaleSession names the session explicitly, so it can never stop a session
+// belonging to anything else.
 func stopStaleSession() {
 	buf, _ := propertiesBuffer(SessionName)
 	writeLoggerName(buf, uint32(unsafe.Sizeof(EVENT_TRACE_PROPERTIES{})), SessionName)
