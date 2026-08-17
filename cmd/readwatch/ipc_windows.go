@@ -25,7 +25,8 @@ import (
 type serviceCommandHandler interface {
 	CurrentState() protocol.State
 	OnViewerHello(pipe HANDLE) error
-	ApplyFromClient(pipe HANDLE, cfg settings.PublicConfig) error
+	ApplyFromClient(pipe HANDLE, cfg settings.PublicConfig, authorise bool) error
+	RefreshFromClient(pipe HANDLE) error
 	StartMonitoringFromClient(pipe HANDLE) error
 	StopMonitoring(removeRules bool) error
 	Cleanup() error
@@ -463,8 +464,10 @@ func (c *serverPipeClient) handleMessage(msg protocol.Message) bool {
 		if msg.Config == nil {
 			err = errors.New("configuration is missing")
 		} else {
-			err = c.server.handler.ApplyFromClient(c.handle, *msg.Config)
+			err = c.server.handler.ApplyFromClient(c.handle, *msg.Config, msg.Authorise)
 		}
+	case protocol.CmdRefresh:
+		err = c.server.handler.RefreshFromClient(c.handle)
 	case protocol.CmdStart:
 		err = c.server.handler.StartMonitoringFromClient(c.handle)
 	case protocol.CmdStop:
@@ -573,13 +576,13 @@ func (c *IPCClient) send(msg protocol.Message) error {
 	return json.NewEncoder(c.file).Encode(msg)
 }
 
-func (c *IPCClient) Command(ctx context.Context, command string, cfg *settings.PublicConfig) error {
+func (c *IPCClient) Command(ctx context.Context, command string, cfg *settings.PublicConfig, authorise bool) error {
 	id := c.nextID.Add(1)
 	ch := make(chan protocol.Message, 1)
 	c.pendingMu.Lock()
 	c.pending[id] = ch
 	c.pendingMu.Unlock()
-	msg := protocol.Message{Version: protocol.Version, Type: protocol.TypeCommand, ID: id, Command: command, Config: cfg}
+	msg := protocol.Message{Version: protocol.Version, Type: protocol.TypeCommand, ID: id, Command: command, Config: cfg, Authorise: authorise}
 	if err := c.send(msg); err != nil {
 		c.pendingMu.Lock()
 		delete(c.pending, id)

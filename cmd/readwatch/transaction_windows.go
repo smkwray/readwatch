@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -156,7 +157,21 @@ func (e *ServiceEngine) predictRule(h HANDLE, protected bool) (string, error) {
 // from when the rule was applied, or reopened by identity after a restart.
 func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSnapshot, held HANDLE, save func(*settings.Config) error) error {
 	h := held
-	if h == 0 {
+	var current saclState
+	haveCurrent := false
+	if h != 0 {
+		state, err := readSACLState(h)
+		if err == nil {
+			current, haveCurrent = state, true
+		} else {
+			// The handle the rule was applied through has stopped working, which is
+			// exactly what a drive being pulled out looks like from in here. Fall
+			// through to the reopen: it is the only path that can tell "not attached"
+			// from "gone", so a stale handle used to be worse than no handle at all.
+			h = 0
+		}
+	}
+	if !haveCurrent {
 		opened, err := openByIdentity(snapshot.Identity)
 		if err != nil {
 			// A condition that will clear on its own is worth waiting for: the
@@ -174,10 +189,9 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 		}
 		defer closeHandle(opened)
 		h = opened
-	}
-	current, err := readSACLState(h)
-	if err != nil {
-		return fmt.Errorf("%s: %w", snapshot.Path, err)
+		if current, err = readSACLState(h); err != nil {
+			return fmt.Errorf("%s: %w", snapshot.Path, err)
+		}
 	}
 	applied, err := parseSACLState(snapshot.Applied)
 	if err != nil {
@@ -218,29 +232,40 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 // recoverJournal resolves records left by a previous process. It runs before any
 // new monitoring starts, and reaches every object by identity because the paths
 // in those records are the one thing that may have changed underneath.
-func recoverJournal(cfg *settings.Config, save func(*settings.Config) error) error {
+// It returns the records it could not resolve because the disk holding them is
+// not in the machine. Those are kept, not forgotten: the audit rule is still on
+// that disk, and forgetting the record would abandon it there for good.
+func recoverJournal(cfg *settings.Config, save func(*settings.Config) error) ([]string, error) {
 	var first error
+	var deferred []string
 	err := withPrivilege("SeSecurityPrivilege", func() error {
 		for key, snapshot := range cfg.Snapshots {
 			if snapshot.Identity.Zero() {
 				// Nothing identifies this object; a path is not enough to act on.
 				continue
 			}
-			if err := removeAuditRule(cfg, key, snapshot, 0, save); err != nil && first == nil {
-				first = err
+			if err := removeAuditRule(cfg, key, snapshot, 0, save); err != nil {
+				if deferredRemoval(err) {
+					deferred = append(deferred, snapshot.Path)
+					continue
+				}
+				if first == nil {
+					first = err
+				}
 			}
 		}
 		return nil
 	})
+	sort.Strings(deferred)
 	if err != nil {
-		return err
+		return deferred, err
 	}
 	if cfg.AuditPolicy != nil {
 		if err := restoreFileSystemAuditPolicy(cfg, save); err != nil && first == nil {
 			first = err
 		}
 	}
-	return first
+	return deferred, first
 }
 
 // startMonitoringBound is the whole Start transaction. Nothing privileged
@@ -262,11 +287,15 @@ func (e *ServiceEngine) startMonitoringBound(pipe HANDLE, clearError bool) error
 	if err != nil {
 		return err
 	}
-	if err := e.resumeIdentitiesMatch(&cfg, bound); err != nil {
+	refuseChangedIdentities(&cfg, bound)
+	e.setFolderStatus(bound)
+	if err := logIdentityMatches(&cfg, bound); err != nil {
 		bound.Close()
 		return err
 	}
-	if err := recoverJournal(&cfg, e.saveConfig); err != nil {
+	deferred, err := recoverJournal(&cfg, e.saveConfig)
+	e.setPendingRules(deferred)
+	if err != nil {
 		bound.Close()
 		return err
 	}
@@ -277,24 +306,43 @@ func (e *ServiceEngine) startMonitoringBound(pipe HANDLE, clearError bool) error
 	return nil
 }
 
-// resumeIdentitiesMatch refuses to reuse an authorisation for a different
-// object. A folder that has been replaced since the owner last approved it gets
-// a fresh decision from them, not an automatic one from a stored pathname.
-func (e *ServiceEngine) resumeIdentitiesMatch(cfg *settings.Config, bound *BoundConfig) error {
-	if len(cfg.FolderBindings) == 0 && cfg.LogBinding == nil {
-		return nil
-	}
-	for _, folder := range bound.Folders {
-		expected, ok := cfg.FolderBindings[strings.ToLower(folder.Path)]
-		if !ok || expected.Identity.Zero() {
+// errNoFolderAvailable means every configured folder is somewhere ReadWatch
+// cannot reach at the moment. With a watched folder on a drive that is not
+// always plugged in this is a resting state rather than a fault, so it is a
+// value callers can recognise instead of one more error string.
+var errNoFolderAvailable = errors.New("none of the watched folders are available right now")
+
+// refuseChangedIdentities takes out of the attached set any folder that no
+// longer refers to the object the owner authorised. It is per folder rather than
+// fatal: a substituted folder must not be watched, and it must not stop the
+// folders that are still what they were from being watched either.
+//
+// A folder with no recorded binding has never been opened successfully - it was
+// added while its drive was out, which is now a supported way to add one - and
+// this bind is its authorisation. That is only safe because a binding survives
+// its folder being unreachable (BoundConfig.MergeBindings), so "no binding" can
+// never mean "the binding was lost while the drive was out".
+func refuseChangedIdentities(cfg *settings.Config, bound *BoundConfig) {
+	for i := len(bound.Folders) - 1; i >= 0; i-- {
+		expected, ok := cfg.FolderBindings[strings.ToLower(bound.Folders[i].Path)]
+		if !ok || expected.Identity.Zero() || expected.Identity.Equal(bound.Folders[i].Identity) {
 			continue
 		}
-		if !expected.Identity.Equal(folder.Identity) {
-			return fmt.Errorf("%s now refers to a different folder than the one ReadWatch was set up to watch; review Settings and press Start to authorise it", folder.Path)
-		}
+		bound.markUnavailable(i, errors.New("this path now refers to a different folder than the one ReadWatch was set up to watch; open Settings and press Save to authorise the folder that is there now"), false)
 	}
-	if cfg.LogBinding != nil && !cfg.LogBinding.Identity.Zero() && !cfg.LogBinding.Identity.Equal(bound.Log.Identity) {
-		return fmt.Errorf("%s is not the log file ReadWatch was set up to write to; review Settings and press Start to authorise it", bound.Log.Path)
+}
+
+// logIdentityMatches keeps the log all or nothing. There is no partial state for
+// the one file every event has to be written to, so a substituted log is refused
+// outright rather than skipped.
+func logIdentityMatches(cfg *settings.Config, bound *BoundConfig) error {
+	if cfg.LogBinding == nil || cfg.LogBinding.Identity.Zero() {
+		return nil
+	}
+	if !cfg.LogBinding.Identity.Equal(bound.Log.Identity) {
+		// Save is what re-authorises, here as for a folder. Telling the owner to
+		// press Start would send them round the same refusal every time.
+		return fmt.Errorf("%s is not the log file ReadWatch was set up to write to; open Settings and press Save to authorise the file that is there now", bound.Log.Path)
 	}
 	return nil
 }
@@ -302,7 +350,17 @@ func (e *ServiceEngine) resumeIdentitiesMatch(cfg *settings.Config, bound *Bound
 // startWithCapabilities applies the machine changes and starts the watcher. On
 // any failure it unwinds through the same handles it applied with.
 func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *BoundConfig, clearError bool) error {
-	roots := effectiveAuditRoots(bound.Public.Folders)
+	// Only folders that were actually opened get a rule. Driving this from the
+	// configured list instead would ask for a handle that does not exist, and
+	// would do so after the audit policy had already been changed.
+	roots := effectiveAuditRoots(bound.AttachedPaths())
+	if len(roots) == 0 {
+		// Nothing reachable to watch. Stopping here is what keeps the machine-wide
+		// audit policy from being switched on with no folder carrying a rule: a
+		// change to the machine, a live Security-log subscription, and nothing
+		// being watched to show for either.
+		return errNoFolderAvailable
+	}
 	applied := make([]FolderCapability, 0, len(roots))
 
 	rollback := func() {
@@ -344,7 +402,7 @@ func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *Bound
 	}
 
 	cfg.ApplyPublic(bound.Public)
-	cfg.FolderBindings, cfg.LogBinding = bound.Bindings()
+	cfg.FolderBindings, cfg.LogBinding = bound.MergeBindings(cfg.FolderBindings)
 	cfg.Enabled = true
 	if err := e.saveConfig(cfg); err != nil {
 		rollback()
@@ -356,7 +414,13 @@ func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *Bound
 		rollback()
 		return err
 	}
-	if err := e.watcher.Start(*cfg, logFile); err != nil {
+	// The watcher matches event paths textually, so it is given the folders that
+	// carry a rule rather than every configured one. Otherwise a drive letter
+	// reclaimed by some other volume while its own folder is unreachable would
+	// have reads under it reported as if they came from the watched folder.
+	watchCfg := cloneConfig(*cfg)
+	watchCfg.Folders = append([]string(nil), bound.AttachedPaths()...)
+	if err := e.watcher.Start(watchCfg, logFile); err != nil {
 		rollback()
 		cfg.Enabled = false
 		_ = e.saveConfig(cfg)
@@ -371,7 +435,12 @@ func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *Bound
 		e.lastError = ""
 	}
 	e.mu.Unlock()
-	previous.Close()
+	// restoreRunning reinstates the capability set that is already active, so the
+	// two can be the same value; closing it then would drop the handles that hold
+	// the watched folders still.
+	if previous != bound {
+		previous.Close()
+	}
 	return nil
 }
 
@@ -404,6 +473,7 @@ func (e *ServiceEngine) stopMonitoringLocked(removeRules bool, clearEnabled bool
 	e.mu.RUnlock()
 
 	var first error
+	var deferred []string
 	if removeRules {
 		err := withPrivilege("SeSecurityPrivilege", func() error {
 			for key, snapshot := range cfg.Snapshots {
@@ -413,8 +483,19 @@ func (e *ServiceEngine) stopMonitoringLocked(removeRules bool, clearEnabled bool
 						held = capability.Security
 					}
 				}
-				if err := removeAuditRule(&cfg, key, snapshot, held, e.saveConfig); err != nil && first == nil {
-					first = err
+				if err := removeAuditRule(&cfg, key, snapshot, held, e.saveConfig); err != nil {
+					// A rule on a disk that is not in the machine cannot be removed
+					// now and will be removable later. Reporting it as a failure would
+					// leave a warning on screen that nothing can clear, and clearing it
+					// silently would abandon a rule ReadWatch still owns. It is kept,
+					// counted and named instead.
+					if deferredRemoval(err) {
+						deferred = append(deferred, snapshot.Path)
+						continue
+					}
+					if first == nil {
+						first = err
+					}
 				}
 			}
 			return nil
@@ -429,12 +510,14 @@ func (e *ServiceEngine) stopMonitoringLocked(removeRules bool, clearEnabled bool
 			cfg.Enabled = false
 		}
 	}
+	sort.Strings(deferred)
 	if err := e.saveConfig(&cfg); err != nil && first == nil {
 		first = err
 	}
 
 	e.mu.Lock()
 	e.cfg = cfg
+	e.pendingRules = deferred
 	released := e.active
 	e.active = nil
 	if first == nil {
@@ -451,7 +534,11 @@ func (e *ServiceEngine) stopMonitoringLocked(removeRules bool, clearEnabled bool
 // full before the running one is disturbed, and the old capabilities are kept
 // until the new ones are live so a failed transition can be undone through
 // handles rather than names.
-func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig) error {
+// authorise says whether this is the owner making a decision. A Save is: it
+// records whatever object each configured path names now. A refresh triggered by
+// a drive appearing is not, so an identity that has changed under a path is
+// refused there rather than quietly approved by a device event nobody asked for.
+func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig, authorise bool) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	if err := e.rejectIfStopping(); err != nil {
@@ -467,23 +554,36 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig) er
 	if err != nil {
 		return err
 	}
+	if !authorise {
+		refuseChangedIdentities(&cfg, candidate)
+		// Before anything is disturbed. The log has no per-folder state to fall
+		// back on, and going any further would overwrite the recorded identity
+		// with the substitute's - after which nothing could ever notice it again.
+		if err := logIdentityMatches(&cfg, candidate); err != nil {
+			candidate.Close()
+			return err
+		}
+	}
+	e.setFolderStatus(candidate)
 
 	if !wasRunning {
 		// Nothing privileged is in force, so this only records the choice. The
 		// log file may have been created during binding, under the owner's own
 		// authority.
-		cfg.ApplyPublic(candidate.Public)
-		cfg.FolderBindings, cfg.LogBinding = candidate.Bindings()
-		if err := e.saveConfig(&cfg); err != nil {
-			candidate.Close()
-			return err
+		//
+		// Monitoring being off also means any record still in the journal is a
+		// rule that should not exist. If the drive carrying it has come back, this
+		// is the moment to remove it - a refresh while stopped is otherwise the
+		// one path that reaches the service with a drive newly attached and does
+		// nothing about it.
+		if len(cfg.Snapshots) > 0 || cfg.AuditPolicy != nil {
+			deferred, recoverErr := recoverJournal(&cfg, e.saveConfig)
+			e.setPendingRules(deferred)
+			if recoverErr != nil {
+				writeServiceDiagnostic(recoverErr)
+			}
 		}
-		candidate.Close()
-		e.mu.Lock()
-		e.cfg = cfg
-		e.lastError = ""
-		e.mu.Unlock()
-		return nil
+		return e.recordBound(&cfg, candidate)
 	}
 
 	e.mu.RLock()
@@ -494,8 +594,9 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig) er
 	e.watcher.Stop()
 	// Withdraw the old rules through the old handles before applying the new
 	// ones, keeping the audit policy in place across the swap.
-	removeErr := withPrivilege("SeSecurityPrivilege", func() error {
-		var first error
+	var removeErr error
+	var deferred []string
+	privErr := withPrivilege("SeSecurityPrivilege", func() error {
 		for key, snapshot := range oldCfg.Snapshots {
 			var held HANDLE
 			if old != nil {
@@ -503,12 +604,27 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig) er
 					held = capability.Security
 				}
 			}
-			if err := removeAuditRule(&oldCfg, key, snapshot, held, e.saveConfig); err != nil && first == nil {
-				first = err
+			if err := removeAuditRule(&oldCfg, key, snapshot, held, e.saveConfig); err != nil {
+				// The drive this rule is on left. That must not abandon the change:
+				// refusing here is what stopped the owner removing the dead folder
+				// from the list, since keeping it failed at bind and dropping it
+				// failed here.
+				if deferredRemoval(err) {
+					deferred = append(deferred, snapshot.Path)
+					continue
+				}
+				if removeErr == nil {
+					removeErr = err
+				}
 			}
 		}
-		return first
+		return nil
 	})
+	if privErr != nil && removeErr == nil {
+		removeErr = privErr
+	}
+	sort.Strings(deferred)
+	e.setPendingRules(deferred)
 	if removeErr != nil {
 		candidate.Close()
 		e.restoreRunning(old, &oldCfg)
@@ -516,12 +632,53 @@ func (e *ServiceEngine) applyBound(pipe HANDLE, public settings.PublicConfig) er
 	}
 
 	cfg = cloneConfig(oldCfg)
-	if err := e.startWithCapabilities(&cfg, candidate, true); err != nil {
+	err = e.startWithCapabilities(&cfg, candidate, true)
+	if errors.Is(err, errNoFolderAvailable) {
+		// The change itself is fine; there is just nothing reachable left to
+		// watch. Go idle with the desired state still on, so the folders are
+		// picked up when their drives come back.
+		return e.goIdle(&cfg, candidate)
+	}
+	if err != nil {
 		candidate.Close()
 		e.restoreRunning(old, &oldCfg)
 		return err
 	}
 	return nil
+}
+
+// goIdle takes monitoring down because nothing reachable is left to watch. It is
+// not the same as recording a configuration change: the swap above withdrew the
+// old rules but deliberately kept the machine-wide audit policy, on the
+// expectation that new rules were about to replace them. None arrived, so the
+// policy has to go back - otherwise ReadWatch would sit idle owning a
+// machine-wide change with no folder carrying a rule to show for it.
+func (e *ServiceEngine) goIdle(cfg *settings.Config, bound *BoundConfig) error {
+	if err := restoreFileSystemAuditPolicy(cfg, e.saveConfig); err != nil {
+		writeServiceDiagnostic(err)
+	}
+	return e.recordBound(cfg, bound)
+}
+
+// recordBound stores a configuration whose objects are known but not being
+// watched, releases the capabilities, and leaves monitoring off. It is the
+// shared tail of "the owner changed settings while stopped" and "the change is
+// valid but every folder's drive is out".
+func (e *ServiceEngine) recordBound(cfg *settings.Config, bound *BoundConfig) error {
+	cfg.ApplyPublic(bound.Public)
+	cfg.FolderBindings, cfg.LogBinding = bound.MergeBindings(cfg.FolderBindings)
+	err := e.saveConfig(cfg)
+	bound.Close()
+	e.mu.Lock()
+	e.cfg = *cfg
+	released := e.active
+	e.active = nil
+	if err == nil {
+		e.lastError = ""
+	}
+	e.mu.Unlock()
+	released.Close()
+	return err
 }
 
 // restoreRunning puts the previous configuration back after a failed swap,
@@ -532,16 +689,28 @@ func (e *ServiceEngine) restoreRunning(old *BoundConfig, oldCfg *settings.Config
 	if old == nil {
 		return
 	}
-	if err := e.startWithCapabilities(oldCfg, old, false); err != nil {
-		writeServiceDiagnostic(fmt.Errorf("restore the previous configuration: %w", err))
-		e.setLastError(fmt.Errorf("monitoring is stopped: the change failed and the previous settings could not be restored (%v)", err))
+	err := e.startWithCapabilities(oldCfg, old, false)
+	if err == nil {
+		// The status recorded for the rejected candidate would otherwise keep
+		// describing folders this configuration does not have.
+		e.setFolderStatus(old)
+		return
 	}
+	if errors.Is(err, errNoFolderAvailable) {
+		// There is nothing to put back: the folders the previous configuration
+		// watched are not reachable any more either. Monitoring is off because of
+		// where the drives are, which is a state, not a fault.
+		_ = e.goIdle(oldCfg, old)
+		return
+	}
+	writeServiceDiagnostic(fmt.Errorf("restore the previous configuration: %w", err))
+	e.setLastError(fmt.Errorf("monitoring is stopped: the change failed and the previous settings could not be restored (%v)", err))
 }
 
 // recoverJournalOffline resolves outstanding records with no running engine,
 // which is the uninstall path when the service cannot be reached. It reaches
 // every object by identity for the same reason the online path does.
-func recoverJournalOffline(cfg *settings.Config) error {
+func recoverJournalOffline(cfg *settings.Config) ([]string, error) {
 	save := func(c *settings.Config) error { return settings.Save(paths().Config, *c) }
 	return recoverJournal(cfg, save)
 }
@@ -553,6 +722,16 @@ func recoverJournalOffline(cfg *settings.Config) error {
 // can never act on strands the whole application - a deleted watched folder did
 // exactly that.
 func transientOpenFailure(err error) bool {
+	// A drive that is not in the machine is the clearest "not now" there is, and
+	// it does not announce itself with a device-shaped error code: measured on
+	// this host, an unattached volume GUID fails with ERROR_FILE_NOT_FOUND, which
+	// by number alone is indistinguishable from a folder that was deleted.
+	// openByIdentity tells the two apart by which of its two opens failed and
+	// says so with this value rather than with a number, which is what makes an
+	// unplugged drive keep its record instead of being written off as gone.
+	if errors.Is(err, errVolumeUnavailable) {
+		return true
+	}
 	var errno syscall.Errno
 	if !errors.As(err, &errno) {
 		return false
@@ -563,3 +742,10 @@ func transientOpenFailure(err error) bool {
 	}
 	return false
 }
+
+// deferredRemoval is the subset of transient failures that need no attention:
+// the disk is elsewhere, so there is nothing wrong and nothing to do but plug it
+// back in. It is not silence either - ReadWatch still owns an audit rule it has
+// not removed - so callers report it as its own state rather than as an error or
+// as success.
+func deferredRemoval(err error) bool { return errors.Is(err, errVolumeUnavailable) }

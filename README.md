@@ -18,6 +18,9 @@ install, and it's running.
 - **Filters the noise.** Shell thumbnailing, search indexing and antivirus can easily outnumber
   the reads you're looking for. Exclude them by process name or exact image path — dropped inside
   the service, with a running count of what was suppressed so nothing hides silently.
+- **Drives that come and go.** A folder on a USB stick or a card can be added while the drive is
+  out. It is watched whenever the drive is there and reported as waiting when it isn't, and the
+  folders that are present carry on being watched either way.
 - **Cheap to leave running.** It's an event subscription, not a polling loop: no folder scanning,
   no timers, nothing to do between reads.
 
@@ -77,6 +80,26 @@ Prefer the exact path for anything you have several copies of; a machine typical
 `python.exe` installs, and a filename is easy to imitate, which matters for a tool whose job is
 noticing an unexpected reader. Nothing is excluded until you say so — the list lives in Settings.
 
+### Removable drives
+
+A watched folder does not have to be on a drive that is always attached. Paste the path while the
+drive is out and ReadWatch writes it down; the summary line then reads *"2 folders (1 waiting for a
+drive)"* until it turns up. Plug the drive in and ReadWatch picks the folder up on its own — it
+watches for volumes arriving and asks the service to look again, so there is nothing to press.
+
+A folder that ReadWatch will not watch, as opposed to one it is waiting for, is called out in the
+status line with the reason: a junction, a permission you don't have, a network drive, or a path
+that now refers to a different folder than the one you approved. Those need you; a waiting folder
+does not, which is why it never becomes a warning.
+
+Two things to know. **Safely Remove Hardware will refuse while the drive is being watched** —
+ReadWatch holds the watched folder open, deliberately, so it cannot be renamed away from its own
+audit rule. Press **Stop** first, or just pull the drive: Windows 10 and 11 default to quick removal
+and ReadWatch recovers on its own. And if a drive is pulled while monitoring, **the audit rule stays
+on that disk until it comes back** — nothing can reach it in the meantime. ReadWatch says so, in the
+summary line, and removes it the next time the drive is attached. It will not forget it: uninstalling
+with such a rule outstanding tells you which drive to attach rather than silently abandoning it.
+
 Closing the window hides it to the tray; **Exit** quits, stops monitoring and stops the service —
 opening ReadWatch again starts idle, waiting for you to press Start. **Start ReadWatch at sign-in**
 puts it in the tray on login, also idle. **Keep the window on top** is in Settings, and
@@ -105,8 +128,11 @@ path, event record ID, and access mask.
 - **Cleanup is best-effort when a folder has gone.** ReadWatch removes its audit rule from every
   folder it applied one to. If a watched folder is deleted, or its rules are changed by something
   else, ReadWatch says so once and stops tracking it rather than refusing to continue — an
-  unfinishable cleanup used to block Stop, Save and uninstall permanently. A folder that is only
-  temporarily unreachable is retried, not forgotten.
+  unfinishable cleanup used to block Stop, Save and uninstall permanently. A folder whose *drive* is
+  merely unplugged is a different case and is kept, counted and named until the drive returns.
+- **Nothing to watch is not an error.** If every configured folder is on a drive that is out,
+  monitoring stays off rather than switching the machine-wide audit policy on with no folder
+  carrying a rule. It starts by itself when a drive arrives.
 - Event 4663 reports an exercised access right, not which bytes were read.
 - Applying the audit entry rewrites the security descriptor of every file already in the folder —
   reversible, but not instant on a large tree.

@@ -41,11 +41,27 @@ type LogCapability struct {
 	Master   HANDLE // duplicated per watcher start; closed when the binding is replaced
 }
 
-// BoundConfig is a configuration whose objects are held open.
+// FolderUnavailable is a configured folder this bind did not open. It is a
+// status, not a failure: the owner asked for it, so it keeps its place in the
+// configuration and is reported, and the folders that did open are watched.
+type FolderUnavailable struct {
+	Path   string
+	Reason string
+	// Waiting distinguishes a folder that will come back on its own - a drive
+	// that is not plugged in - from one that needs the owner to do something.
+	Waiting bool
+}
+
+// BoundConfig is a configuration whose objects are held open. Folders holds only
+// what was opened; Public.Folders still holds every configured path, and
+// Unavailable accounts for the difference. The three always reconcile, because
+// silently losing a configured folder is the failure mode this shape exists to
+// prevent.
 type BoundConfig struct {
-	Public  settings.PublicConfig
-	Folders []FolderCapability
-	Log     LogCapability
+	Public      settings.PublicConfig
+	Folders     []FolderCapability
+	Unavailable []FolderUnavailable
+	Log         LogCapability
 }
 
 // Close is safe on a partially built value: binding closes what it opened when
@@ -79,9 +95,49 @@ func (b *BoundConfig) folderByPath(path string) *FolderCapability {
 	return nil
 }
 
-// Bindings projects the identities to persist alongside the configuration.
-func (b *BoundConfig) Bindings() (map[string]settings.ObjectBinding, *settings.ObjectBinding) {
-	folders := make(map[string]settings.ObjectBinding, len(b.Folders))
+// AttachedPaths is the set of folders that are actually being watched. Audit
+// rules are applied to these and to nothing else.
+func (b *BoundConfig) AttachedPaths() []string {
+	paths := make([]string, 0, len(b.Folders))
+	for _, f := range b.Folders {
+		paths = append(paths, f.Path)
+	}
+	return paths
+}
+
+// markUnavailable moves a folder out of the attached set and closes what it
+// held. The path stays in Public.Folders: a folder that went away is a status
+// to report, never a reason to forget the owner asked for it.
+func (b *BoundConfig) markUnavailable(i int, reason error, waiting bool) {
+	f := b.Folders[i]
+	if f.Security != 0 {
+		closeHandle(f.Security)
+	}
+	if f.Owner != 0 {
+		closeHandle(f.Owner)
+	}
+	b.Unavailable = append(b.Unavailable, FolderUnavailable{Path: f.Path, Reason: reason.Error(), Waiting: waiting})
+	b.Folders = append(b.Folders[:i], b.Folders[i+1:]...)
+}
+
+// MergeBindings projects the identities to persist alongside the configuration.
+//
+// It merges rather than replaces, and that is the whole point of the function.
+// A folder that could not be opened has no identity to record, and dropping its
+// previous one would not merely lose information: resumeIdentitiesMatch treats a
+// folder with no recorded binding as one that has never been authorised, so the
+// next volume to claim that drive letter would be watched - and given a SACL by
+// LocalSystem - without anyone deciding to. An unreachable folder therefore
+// keeps the identity it was last authorised with. Only a folder the owner
+// removed from the configuration loses its binding.
+func (b *BoundConfig) MergeBindings(previous map[string]settings.ObjectBinding) (map[string]settings.ObjectBinding, *settings.ObjectBinding) {
+	folders := make(map[string]settings.ObjectBinding, len(b.Public.Folders))
+	for _, path := range b.Public.Folders {
+		key := strings.ToLower(path)
+		if existing, ok := previous[key]; ok && !existing.Identity.Zero() {
+			folders[key] = existing
+		}
+	}
 	for _, f := range b.Folders {
 		folders[strings.ToLower(f.Path)] = settings.ObjectBinding{Path: f.Path, Identity: f.Identity}
 	}
@@ -166,34 +222,50 @@ func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConf
 	}
 
 	out := &BoundConfig{Public: public}
-	userFolders := make([]HANDLE, 0, len(public.Folders))
-	closeUserFolders := func() {
-		for _, h := range userFolders {
-			closeHandle(h)
-		}
-		userFolders = nil
-	}
 
-	normalizedFolders := make([]string, 0, len(public.Folders))
+	// One folder that cannot be opened does not fail the bind. A watched folder
+	// may live on a drive that is not always plugged in, and the folders that are
+	// present must keep being watched regardless of the ones that are not.
+	//
+	// Skipping is fail-closed per folder: a folder that is skipped is not opened,
+	// carries no audit rule and produces no events. Nothing a skip can do is
+	// weaker than what the whole-bind refusal did - it only stops one folder's
+	// problem from becoming every folder's problem.
+	configured := make([]string, 0, len(public.Folders))
 	for _, raw := range public.Folders {
 		handle, identity, normalized, openErr := openWatchedFolderAsClient(raw)
 		if openErr != nil {
-			closeUserFolders()
-			out.Close()
-			if revertErr := revert(); revertErr != nil {
-				return nil, revertErr, true
+			// Keep the owner's path in the configuration. Persisting only what
+			// opened would delete a folder from Settings the first time its drive
+			// was unplugged.
+			display, lexicalErr := validateLexicalPath(raw)
+			if lexicalErr != nil {
+				display = strings.TrimSpace(raw)
 			}
-			return nil, fmt.Errorf("%s: %w", raw, openErr), false
+			configured = append(configured, display)
+			waiting := waitingOpenFailure(openErr)
+			reason := openErr.Error()
+			if waiting {
+				reason = waitingReason(openErr)
+			}
+			out.Unavailable = append(out.Unavailable, FolderUnavailable{
+				Path:    display,
+				Reason:  reason,
+				Waiting: waiting,
+			})
+			continue
 		}
-		userFolders = append(userFolders, handle)
-		out.Folders = append(out.Folders, FolderCapability{Path: normalized, Identity: identity})
-		normalizedFolders = append(normalizedFolders, normalized)
+		configured = append(configured, normalized)
+		// The capability owns the handle from here, so every exit below releases
+		// it through out.Close() and there is no second list to keep in step.
+		out.Folders = append(out.Folders, FolderCapability{Path: normalized, Identity: identity, Owner: handle})
 	}
-	out.Public.Folders = normalizedFolders
+	out.Public.Folders = configured
 
+	// The log has no partial state to fall back to: with nowhere to write, there
+	// is no monitoring at all. It stays all or nothing.
 	logHandle, logIdentity, logPath, logErr := openLogAsClient(public.LogPath)
 	if logErr != nil {
-		closeUserFolders()
 		out.Close()
 		if revertErr := revert(); revertErr != nil {
 			return nil, revertErr, true
@@ -205,7 +277,6 @@ func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConf
 
 	// Everything below runs as LocalSystem again.
 	if revertErr := revert(); revertErr != nil {
-		closeUserFolders()
 		out.Close()
 		return nil, revertErr, true
 	}
@@ -217,28 +288,96 @@ func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConf
 	// watched root away from the audit rule applied to it. The configured
 	// pathname is never consulted a second time.
 	upgradeErr := withPrivilege("SeSecurityPrivilege", func() error {
-		for i := range out.Folders {
+		// Backwards, because a folder that fails here leaves the slice.
+		for i := len(out.Folders) - 1; i >= 0; i-- {
 			secure, err := openByIdentity(out.Folders[i].Identity)
-			if err != nil {
-				return fmt.Errorf("%s: %w", out.Folders[i].Path, err)
+			if err == nil {
+				out.Folders[i].Security = secure
+				continue
 			}
-			out.Folders[i].Security = secure
+			// The owner opened this object moments ago, so a failure now is the
+			// drive leaving between the two opens, not a decision about the folder.
+			out.markUnavailable(i, err, waitingOpenFailure(err))
 		}
 		return nil
 	})
-	if upgradeErr == nil {
-		// Hand the owner handles to the capability, which now owns closing them.
-		for i := range out.Folders {
-			out.Folders[i].Owner = userFolders[i]
-		}
-		userFolders = nil
-	}
-	closeUserFolders()
 	if upgradeErr != nil {
 		out.Close()
 		return nil, upgradeErr, false
 	}
 	return out, nil, false
+}
+
+// errDriveNotAttached is the ordinary state of a removable drive, not a fault,
+// so it is a value the rest of the code can recognise rather than one more
+// Win32 error code to interpret.
+var errDriveNotAttached = errors.New("the drive is not attached")
+
+// errVolumeUnavailable means the volume carrying a recorded object is not in the
+// machine. Unlike a missing object it says nothing about whether ReadWatch's
+// audit rule is still there - it is, on a disk that is somewhere else - so the
+// journal record must be kept rather than forgotten.
+var errVolumeUnavailable = errors.New("the drive holding this folder is not attached")
+
+// absentDeviceErrno is the set of Win32 errors that mean "the storage is not
+// here", as distinct from "you may not have it" or "it is not that kind of
+// object". The first two entries are the ones that matter and the ones that were
+// wrong: measured on this host, both a free drive letter and an unattached
+// \\?\Volume{...} name fail with ERROR_FILE_NOT_FOUND, not with any of the
+// device-shaped codes. See do/evidence/2026-08-17-absent-drive.
+func absentDeviceErrno(errno syscall.Errno) bool {
+	switch uintptr(errno) {
+	case ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_INVALID_DRIVE,
+		ERROR_NOT_READY, ERROR_BAD_UNIT, ERROR_DEV_NOT_EXIST, ERROR_INVALID_NAME,
+		ERROR_NO_SUCH_DEVICE, ERROR_UNRECOGNIZED_VOLUME, ERROR_NO_MEDIA_IN_DRIVE,
+		ERROR_DEVICE_NOT_CONNECTED:
+		return true
+	}
+	return false
+}
+
+// waitingReason says why a folder is not here, in the owner's terms. The raw
+// error names a \\?\Volume{...} pathname the walk built, which is the wrong
+// thing to put in a window: what is needed is which of their folders is missing
+// and whether that is the drive or the folder itself. A drive that is out and a
+// path that was mistyped are both "waiting", and they must not read alike.
+func waitingReason(err error) string {
+	if errors.Is(err, errDriveNotAttached) || errors.Is(err, errVolumeUnavailable) {
+		return "the drive is not attached"
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch uintptr(errno) {
+		case ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND:
+			return "this folder does not exist"
+		case ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION:
+			return "another program has this folder open"
+		case ERROR_NOT_READY, ERROR_NO_MEDIA_IN_DRIVE:
+			return "the drive has no disk in it"
+		}
+	}
+	return "this folder cannot be reached right now"
+}
+
+// waitingOpenFailure separates a folder that is not here right now from one
+// ReadWatch will not watch. Only the first is retried on its own; a junction, a
+// refused permission or a volume that cannot carry an audit rule reads the same
+// way every time, and calling that "waiting" would hide it behind a spinner
+// forever.
+func waitingOpenFailure(err error) bool {
+	if errors.Is(err, errDriveNotAttached) || errors.Is(err, errVolumeUnavailable) {
+		return true
+	}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	// Another process holding the folder incompatibly also clears on its own,
+	// with nobody changing anything.
+	if uintptr(errno) == ERROR_SHARING_VIOLATION || uintptr(errno) == ERROR_LOCK_VIOLATION {
+		return true
+	}
+	return absentDeviceErrno(errno)
 }
 
 const maxWatchedFolders = 32
@@ -315,6 +454,17 @@ func validateLexicalPath(raw string) (string, error) {
 // volume's own name so a drive-letter reassignment cannot redirect it midway.
 func volumeGUIDPath(driveAbsolute string) (string, string, error) {
 	root := strings.ToUpper(driveAbsolute[:1]) + `:\`
+	// Ask what kind of drive this is before asking the filesystem anything. A
+	// letter with no volume behind it is the ordinary state of a drive that is
+	// unplugged, and it has to read differently from a real failure; a network
+	// drive is a permanent refusal, and without this it would look like a drive
+	// that might come back and would sit in "waiting" forever.
+	switch driveType(root) {
+	case DRIVE_NO_ROOT_DIR:
+		return "", "", fmt.Errorf("%w (%s)", errDriveNotAttached, root)
+	case DRIVE_REMOTE:
+		return "", "", errors.New("network drives are not supported; monitor a local folder on the machine that holds it")
+	}
 	buf := make([]uint16, 64)
 	r, _, e := procGetVolumeNameForVolumeMountPntW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(root))),
@@ -327,6 +477,11 @@ func volumeGUIDPath(driveAbsolute string) (string, string, error) {
 	guid := syscall.UTF16ToString(buf)
 	rest := strings.TrimPrefix(driveAbsolute, driveAbsolute[:3])
 	return guid, guid + rest, nil
+}
+
+func driveType(root string) uint32 {
+	r, _, _ := procGetDriveTypeW.Call(uintptr(unsafe.Pointer(utf16Ptr(root))))
+	return uint32(r)
 }
 
 // openDirectoryComponent opens one path component and proves it is an ordinary
@@ -487,7 +642,10 @@ func openLogAsClient(raw string) (HANDLE, settings.ObjectIdentity, string, error
 	}
 	volumeGUID, internal, err := volumeGUIDPath(lexical)
 	if err != nil {
-		return 0, zero, "", err
+		// Say it is the log. A watched folder on the same unplugged drive
+		// produces word-for-word the same message, and that one is annotated with
+		// the folder it belongs to while this one would not be.
+		return 0, zero, "", fmt.Errorf("log file %s: %w", lexical, err)
 	}
 	guards, err := walkAncestors(volumeGUID, internal)
 	if err != nil {
@@ -611,6 +769,14 @@ func openByIdentityWithAccess(id settings.ObjectIdentity, desiredAccess uintptr)
 		0,
 	)
 	if volume == INVALID_HANDLE_VALUE || volume == 0 {
+		// Which of the two opens failed is the whole question. Failing here means
+		// the disk is not in the machine, so ReadWatch's audit rule is still on it
+		// and the journal record has to be kept. Failing at OpenFileById below
+		// means the volume is mounted and the object is not on it any more, which
+		// is the only case where the record can safely be forgotten.
+		if errno, ok := e.(syscall.Errno); ok && absentDeviceErrno(errno) {
+			return 0, fmt.Errorf("%w (%s)", errVolumeUnavailable, id.VolumeGUID)
+		}
 		return 0, fmt.Errorf("open volume %s: %w", id.VolumeGUID, e)
 	}
 	defer closeHandle(HANDLE(volume))

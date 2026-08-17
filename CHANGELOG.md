@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+Watched folders may now live on drives that are not always attached — a USB stick, a card reader.
+Before this, one unreachable folder stopped monitoring for every folder, and a path on a drive that
+was out could not even be added.
+
+### Changed behaviour
+
+- **A folder on a drive that is not attached can be added.** Settings checks the shape of the path,
+  the same way the service does, and no longer requires the folder to exist.
+- **One unreachable folder no longer stops the others.** Each configured folder is now reported
+  individually as watched, waiting for its drive, or not watched with the reason. Start, Save, Stop
+  and the resume on reconnect all continue with whatever is reachable.
+- **Drives are picked up when they arrive.** ReadWatch notices a volume appearing or leaving and
+  asks the service to bind again. If monitoring was on but nothing was reachable, a drive arriving
+  starts it.
+- **A folder that has been substituted is refused on its own** instead of failing the whole start.
+  Open Settings and Save to authorise the folder that is at the path now.
+- **Nothing reachable means monitoring stays off**, rather than enabling the machine-wide audit
+  policy with no folder carrying a rule.
+- Mapped network drives are refused with a message that says so, instead of failing with a raw
+  Windows error.
+- The window's summary line reports the breakdown: `3 folders (1 waiting for a drive) · 412 events`.
+
+### Fixed
+
+- **An unplugged drive no longer made ReadWatch forget the audit rule it left on it.** Measured on
+  the target host, an unattached volume fails with `ERROR_FILE_NOT_FOUND`, which the code treated as
+  "this object is gone for good" — so the journal record was deleted while the rule was still on the
+  disk. The two cases are now told apart by which of the two opens failed rather than by the error
+  number. See `do/evidence/2026-08-17-absent-drive`.
+- A rule that cannot be removed because its drive is out is kept, counted and named in the window,
+  and uninstall now says which drive to attach rather than refusing with no explanation.
+- Uninstall re-reads the configuration after cleanup, so its fail-closed check no longer tests a copy
+  loaded before the cleanup ran.
+- The handles a watched folder was applied through are no longer trusted blindly at removal time: if
+  the handle has stopped working, the object is reopened by identity, which is what can tell an
+  unplugged drive from a deleted folder.
+- Restoring the previous configuration after a failed Save no longer closes the handles it just
+  reinstated.
+- The exclusion list is copied rather than shared when the configuration is cloned, closing a race
+  with the state the window is sent.
+
+### Security
+
+- A folder that could not be opened keeps the identity it was last authorised with. Without this,
+  skipping an unreachable folder would have erased its recorded identity, and an unrecorded folder is
+  treated as one being authorised for the first time — so the next volume to claim that drive letter
+  would have been watched, and given an audit rule by LocalSystem, with nobody deciding.
+- A refresh caused by a drive arriving does not authorise anything. Only a Save does.
+
 ## 0.3.0 — 2026-08-13
 
 A security review found that the service validated a folder or log path as you, then later resolved

@@ -45,6 +45,11 @@ const (
 	trayExit     = 205
 
 	trayIconID = 1
+
+	// idDeviceTimer debounces the volume notifications. One insertion produces
+	// several of them, and each would otherwise cost a full re-bind.
+	idDeviceTimer  = 1
+	deviceSettleMS = 1500
 )
 
 var (
@@ -228,6 +233,10 @@ type AppUI struct {
 	alwaysOnTop      bool
 	startupDecided   bool
 	firstRunPrompted bool
+	// deviceRemoval remembers that a volume left during the current debounce
+	// window. A departure needs a re-bind whether or not anything is waiting: the
+	// handles that folder was watched through are dead.
+	deviceRemoval bool
 }
 
 func RunUI(startup bool) error {
@@ -816,10 +825,10 @@ func (u *AppUI) updateStatus() {
 		setWindowText(u.status, "○  Connecting…")
 		setWindowText(u.startBtn, "Start")
 	case state.Running:
-		setWindowText(u.status, "●  Monitoring")
+		setWindowText(u.status, "●  Monitoring"+waitingSuffix(state))
 		setWindowText(u.startBtn, "Stop")
 	default:
-		setWindowText(u.status, "○  Stopped")
+		setWindowText(u.status, "○  Stopped"+waitingSuffix(state))
 		setWindowText(u.startBtn, "Start")
 	}
 	// A command in flight owns both buttons, and the lock says whether one is in
@@ -837,6 +846,40 @@ func (u *AppUI) updateStatus() {
 	u.updateTrayTip()
 	if state.LastError != "" && idle {
 		setWindowText(u.status, "⚠  "+state.LastError)
+	} else if refused, ok := state.FirstRefused(); ok && idle {
+		// The one folder state that needs the owner to do something. Waiting
+		// folders are counted in the summary and deliberately kept out of here: a
+		// warning that nothing can clear stops being read as a warning.
+		setWindowText(u.status, "⚠  "+refused.Path+" — "+refused.Detail)
+	}
+}
+
+// waitingSuffix names a folder that is configured but not there, and says why.
+// A count alone would be enough for an unplugged drive, which the owner already
+// knows about - but a mistyped path is also "waiting", and that one only becomes
+// obvious when the folder is named.
+func waitingSuffix(state protocol.State) string {
+	first := ""
+	count := 0
+	for _, folder := range state.Folders {
+		if folder.State != protocol.FolderWaiting {
+			continue
+		}
+		if count == 0 {
+			first = folder.Path
+			if folder.Detail != "" {
+				first += " (" + folder.Detail + ")"
+			}
+		}
+		count++
+	}
+	switch {
+	case count == 0:
+		return ""
+	case count == 1:
+		return " — waiting for " + first
+	default:
+		return fmt.Sprintf(" — waiting for %s and %d more", first, count-1)
 	}
 }
 
@@ -895,7 +938,23 @@ func boolToUintptr(v bool) uintptr {
 
 func (u *AppUI) updateSummary() {
 	folders := len(u.state.Config.Folders)
-	text := fmt.Sprintf("%d %s · %d events", folders, plural(folders, "folder", "folders"), u.totalEvents)
+	text := fmt.Sprintf("%d %s", folders, plural(folders, "folder", "folders"))
+	// A folder whose drive is out is still a configured folder, so the total
+	// never drops - the breakdown says what is actually being watched.
+	if _, waiting, refused := u.state.Counts(); waiting > 0 || refused > 0 {
+		parts := make([]string, 0, 2)
+		if waiting > 0 {
+			// Not "waiting for a drive": a folder that does not exist yet on a
+			// drive that is right here is waiting too, and saying otherwise would
+			// send the owner looking for a drive that is not the problem.
+			parts = append(parts, fmt.Sprintf("%d waiting", waiting))
+		}
+		if refused > 0 {
+			parts = append(parts, fmt.Sprintf("%d not watched", refused))
+		}
+		text += " (" + strings.Join(parts, ", ") + ")"
+	}
+	text += fmt.Sprintf(" · %d events", u.totalEvents)
 	if dropped := since(u.state.LogDropped, &u.baseLogDropped); dropped > 0 {
 		text += fmt.Sprintf(" · %d log events dropped", dropped)
 	}
@@ -908,6 +967,12 @@ func (u *AppUI) updateSummary() {
 	// exclusion entries reads like a broken number.
 	if suppressed := since(u.state.Suppressed, &u.baseSuppressed); suppressed > 0 {
 		text += fmt.Sprintf(" · %d reads excluded", suppressed)
+	}
+	// An audit rule ReadWatch cannot reach is the one case where stopping does
+	// not leave the machine as it found it, so it is stated rather than left to
+	// be discovered at uninstall.
+	if n := len(u.state.PendingRules); n > 0 {
+		text += fmt.Sprintf(" · %d audit %s awaiting %s drive", n, plural(n, "rule", "rules"), plural(n, "its", "their"))
 	}
 	setWindowText(u.summary, text)
 }
@@ -934,6 +999,18 @@ func plural(n int, one, many string) string {
 }
 
 func (u *AppUI) runCommand(command string, cfg *settings.PublicConfig) {
+	u.dispatchCommand(command, cfg, false, false)
+}
+
+// runQuietCommand is for work the app decided to do by itself - a drive
+// appearing, not a button being pressed. It reports nothing on failure: a dialog
+// nobody asked for, raised because a USB stick was plugged in, is worse than the
+// status line simply continuing to say which folders are waiting.
+func (u *AppUI) runQuietCommand(command string) {
+	u.dispatchCommand(command, nil, true, false)
+}
+
+func (u *AppUI) dispatchCommand(command string, cfg *settings.PublicConfig, quiet, authorise bool) {
 	if !u.beginCommand(command) {
 		return
 	}
@@ -947,7 +1024,12 @@ func (u *AppUI) runCommand(command string, cfg *settings.PublicConfig) {
 			// reaching here means the pipe is down. Start may bring it back;
 			// every other command needs a service that is already listening.
 			if command != protocol.CmdStart {
-				u.queueError(fmt.Errorf("ReadWatch service is not connected"))
+				if !quiet {
+					u.queueError(fmt.Errorf("ReadWatch service is not connected"))
+				}
+				return
+			}
+			if quiet {
 				return
 			}
 			var err error
@@ -957,12 +1039,63 @@ func (u *AppUI) runCommand(command string, cfg *settings.PublicConfig) {
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		err := client.Command(ctx, command, cfg)
+		err := client.Command(ctx, command, cfg, authorise)
 		cancel()
-		if err != nil {
+		if err != nil && !quiet {
 			u.queueError(err)
 		}
 	}()
+}
+
+// armDeviceRefresh restarts the settle timer. SetTimer with an id that is
+// already running replaces it, which is the whole debounce.
+func (u *AppUI) armDeviceRefresh(removal bool) {
+	if removal {
+		u.deviceRemoval = true
+	}
+	procSetTimer.Call(uintptr(u.hwnd), idDeviceTimer, deviceSettleMS, 0)
+}
+
+// devicesChanged runs once the volume notifications have settled. A drive that
+// arrived may carry a folder that is waiting; a drive that left has taken a
+// watched folder with it and the handles it was watched through are dead. Both
+// are answered by asking the service to bind again, because opening a watched
+// folder can only happen under the connected owner's token - which is to say,
+// over this connection.
+func (u *AppUI) devicesChanged() {
+	removal := u.deviceRemoval
+	if !u.state.ServiceReady {
+		u.deviceRemoval = false
+		return
+	}
+	if u.commandBusy.Load() {
+		// Something else is in flight. Ask again rather than dropping the event.
+		u.armDeviceRefresh(removal)
+		return
+	}
+	u.deviceRemoval = false
+	_, waiting, _ := u.state.Counts()
+	switch {
+	case u.state.Running && (removal || waiting > 0):
+		u.runQuietCommand(protocol.CmdRefresh)
+	case !u.state.Running && u.state.Config.Enabled && waiting > 0:
+		// Monitoring is on as far as the owner is concerned; it just had nowhere
+		// to run. A drive arriving is the thing it was waiting for.
+		u.runQuietCommand(protocol.CmdStart)
+	case !u.state.Running && len(u.state.PendingRules) > 0:
+		// Monitoring is off but an audit rule is still out there on a drive that
+		// was not in the machine. If this is that drive, it can be removed now -
+		// and if nothing else asked, the rule would sit there until the next Start
+		// or the next time the app is opened.
+		u.runQuietCommand(protocol.CmdRefresh)
+	}
+}
+
+func isVolumeBroadcast(lParam unsafe.Pointer) bool {
+	if lParam == nil {
+		return false
+	}
+	return (*DEV_BROADCAST_HDR)(lParam).DbchDeviceType == DBT_DEVTYP_VOLUME
 }
 
 // startServiceAndAttach starts the demand-start service and waits for the
@@ -1347,6 +1480,23 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 				u.lastDispText = syscall.StringToUTF16(u.cellText(int(di.Item.IItem), int(di.Item.ISubItem)))
 				di.Item.PszText = &u.lastDispText[0]
 			}
+			return 0
+		}
+	case WM_DEVICECHANGE:
+		// Volume arrival and departure reach every top-level window with no
+		// registration at all, including this one while it is hidden in the tray.
+		// Which volume it was does not matter: the answer is always to look again.
+		// Anything else falls through to DefWindowProc - notably the query-remove
+		// messages, which are only sent to windows that asked for them and which
+		// must not be answered by accident.
+		if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) && isVolumeBroadcast(lParam) {
+			u.armDeviceRefresh(wParam == DBT_DEVICEREMOVECOMPLETE)
+			return 1
+		}
+	case WM_TIMER:
+		if wParam == idDeviceTimer {
+			procKillTimer.Call(hwnd, idDeviceTimer)
+			u.devicesChanged()
 			return 0
 		}
 	case WM_DPICHANGED:

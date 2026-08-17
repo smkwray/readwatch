@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -264,7 +265,7 @@ func uninstallElevated(quiet bool) error {
 		// past the cleanup it came to run.
 		if client, err := ConnectIPC(cfg.OwnerSID, protocol.RoleMaintenance, 1500*time.Millisecond, nil, nil, nil); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			cleanupErr := client.Command(ctx, protocol.CmdCleanup, nil)
+			cleanupErr := client.Command(ctx, protocol.CmdCleanup, nil, false)
 			cancel()
 			client.Close()
 			if cleanupErr != nil {
@@ -285,12 +286,19 @@ func uninstallElevated(quiet bool) error {
 			return err
 		}
 	}
-	// Fail closed. If any audit rule or policy change is still unresolved, stop
-	// before deleting the service and the configuration: that configuration is
-	// the only record of what was changed, and this installation is the only
-	// thing that can repair it.
+	// The cleanup above wrote the resolved configuration to disk - through the
+	// service on one branch and in this process on the other - so the gate below
+	// has to read it back. Testing the copy loaded before any of it ran would
+	// refuse an uninstall that had just succeeded.
+	if cfgErr == nil {
+		if fresh, err := loadServiceConfig(p.Config, p.DefaultLog); err == nil {
+			cfg = fresh
+		}
+	}
 	if cfgErr == nil && (len(cfg.Snapshots) > 0 || cfg.AuditPolicy != nil) {
-		return errors.New("ReadWatch still has auditing changes it could not undo, so it was left installed rather than losing the record of them; start ReadWatch, stop monitoring, and try again")
+		if err := confirmUnresolvedAuditState(cfg, quiet); err != nil {
+			return err
+		}
 	}
 	if err := deleteInstalledService(); err != nil {
 		return err
@@ -368,11 +376,79 @@ func uninstallElevated(quiet bool) error {
 // It undoes ReadWatch's machine changes from the journal, by identity, without
 // resolving any of the recorded pathnames.
 func directAuditCleanup(cfg *settings.Config) error {
-	if err := recoverJournalOffline(cfg); err != nil {
+	if _, err := recoverJournalOffline(cfg); err != nil {
 		return err
 	}
 	cfg.Enabled = false
 	return settings.Save(paths().Config, *cfg)
+}
+
+// confirmUnresolvedAuditState decides whether uninstall may proceed with audit
+// records ReadWatch could not undo.
+//
+// Failing closed is right whenever the change can still be repaired: the
+// configuration is the only record of what was altered, and this installation is
+// the only thing that can put it back. But a record can also name a folder on a
+// disk that is not in the machine and may never be again - the drive was
+// reformatted, or thrown away - and refusing forever would make watching a
+// removable drive a decision the owner cannot undo. That one case is named in
+// full and put to them, because only they know whether the drive is coming back.
+func confirmUnresolvedAuditState(cfg settings.Config, quiet bool) error {
+	blocked := errors.New("ReadWatch still has auditing changes it could not undo, so it was left installed rather than losing the record of them; start ReadWatch, stop monitoring, and try again")
+	stranded := detachedSnapshots(cfg)
+	if cfg.AuditPolicy != nil || len(stranded) == 0 || len(stranded) != len(cfg.Snapshots) {
+		// Something here is still reachable, so it can still be repaired properly.
+		return blocked
+	}
+	if quiet {
+		return errors.New("ReadWatch still has an auditing rule on a drive that is not attached (" + strings.Join(stranded, ", ") + "); attach the drive and uninstall again")
+	}
+	answer := messageBox(0,
+		"ReadWatch still has an auditing rule on a drive that is not attached:\r\n\r\n"+
+			strings.Join(stranded, "\r\n")+
+			"\r\n\r\nAttach the drive and run the uninstall again to have ReadWatch remove it.\r\n\r\n"+
+			"If you continue now, ReadWatch is removed and that rule stays on the drive. "+
+			"You would then have to remove it yourself, from the folder's Properties, Security, Advanced, Auditing.\r\n\r\n"+
+			"Continue without removing it?",
+		appName, MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)
+	if answer != IDYES {
+		return errors.New("uninstall was cancelled so the auditing rule can be removed with its drive attached")
+	}
+	return nil
+}
+
+// detachedSnapshots names the records whose volume is not in the machine. It
+// opens the volume rather than the recorded object, so it needs no privilege and
+// cannot be misled by a file identifier that has since been reused.
+func detachedSnapshots(cfg settings.Config) []string {
+	paths := make([]string, 0, len(cfg.Snapshots))
+	for _, snapshot := range cfg.Snapshots {
+		if snapshot.Identity.Zero() || volumeAttached(snapshot.Identity.VolumeGUID) {
+			continue
+		}
+		paths = append(paths, snapshot.Path)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+func volumeAttached(volumeGUID string) bool {
+	if volumeGUID == "" {
+		return false
+	}
+	r, _, _ := procCreateFileW.Call(
+		uintptr(unsafe.Pointer(utf16Ptr(strings.TrimRight(volumeGUID, `\`)))),
+		FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+		0, OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
+	if r == INVALID_HANDLE_VALUE || r == 0 {
+		return false
+	}
+	closeHandle(HANDLE(r))
+	return true
 }
 
 // serviceSDDL grants the interactive owner exactly enough to run the service on
