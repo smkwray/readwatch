@@ -377,9 +377,14 @@ func (s *session) Stop() {
 
 // Lost reports what the session itself dropped, which is different from what the
 // consumer failed to keep up with.
-func (s *session) Lost() (events, realtimeBuffers uint32) {
+//
+// known is the point of the third return. Reporting an unanswerable query as
+// zero makes "nothing was lost" indistinguishable from "nobody asked", and a
+// qualification instrument that cannot tell those apart can only ever produce a
+// false green.
+func (s *session) Lost() (events, realtimeBuffers uint32, known bool) {
 	if s == nil || s.handle == 0 {
-		return 0, 0
+		return 0, 0, false
 	}
 	buf, _ := propertiesBuffer(sessionName, true)
 	writeLoggerName(buf, uint32(unsafe.Sizeof(EVENT_TRACE_PROPERTIES{})), sessionName)
@@ -389,10 +394,10 @@ func (s *session) Lost() (events, realtimeBuffers uint32) {
 		EVENT_TRACE_CONTROL_QUERY,
 	)
 	if r != ERROR_SUCCESS {
-		return 0, 0
+		return 0, 0, false
 	}
 	p := (*EVENT_TRACE_PROPERTIES)(unsafe.Pointer(&buf[0]))
-	return p.EventsLost, p.RealTimeBuffersLost
+	return p.EventsLost, p.RealTimeBuffersLost, true
 }
 
 // openAndProcess attaches a consumer to the live session and blocks in
