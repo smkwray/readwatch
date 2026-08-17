@@ -534,6 +534,7 @@ func (e *ServiceEngine) stopMonitoringLocked(removeRules bool, clearEnabled bool
 // full before the running one is disturbed, and the old capabilities are kept
 // until the new ones are live so a failed transition can be undone through
 // handles rather than names.
+//
 // authorise says whether this is the owner making a decision. A Save is: it
 // records whatever object each configured path names now. A refresh triggered by
 // a drive appearing is not, so an identity that has changed under a path is
