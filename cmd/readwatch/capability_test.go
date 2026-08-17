@@ -25,7 +25,6 @@ func TestValidateLexicalPathRejections(t *testing.T) {
 		`\\?\C:\Docs`:               "extended-length device path",
 		`\\.\PhysicalDrive0`:        "device namespace",
 		`\??\C:\Docs`:               "object-manager path",
-		`C:\`:                       "volume root",
 		`C:\Docs:hidden`:            "alternate data stream",
 		`C:\Docs\..\Windows`:        "parent traversal",
 		`C:\Docs\.\Sub`:             "current-directory component",
@@ -55,6 +54,16 @@ func TestValidateLexicalPathNormalises(t *testing.T) {
 		// A deep path with an all-caps component: the case a real report showed
 		// rendered wrongly, which turned out to be the path itself, not a defect.
 		`C:\AI\Renders\batch\output`: `C:\AI\Renders\batch\output`,
+		// A whole drive is a legitimate thing to watch, and for a removable drive
+		// it is the obvious unit. Everything below this gate works on a volume
+		// root - measured against NTFS on both NVMe and USB - so the refusal that
+		// used to live here was ReadWatch's own rule, not a Windows limit.
+		// `D:` on its own stays rejected: bare drive letters are relative to that
+		// drive's current directory, which is not a location.
+		`D:\`:  `D:\`,
+		`d:\`:  `D:\`,
+		`D:/`:  `D:\`,
+		`D:\\`: `D:\`,
 	}
 	for in, want := range cases {
 		got, err := validateLexicalPath(in)

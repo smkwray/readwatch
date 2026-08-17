@@ -454,7 +454,47 @@ func (s *SettingsUI) addTypedFolder() {
 		messageBox(s.hwnd, "That is not a usable folder path:\r\n\r\n"+raw+"\r\n\r\n"+capitalise(err.Error()), appName, MB_OK|MB_ICONWARNING)
 		return
 	}
+	if !s.confirmWholeDrive(full) {
+		return
+	}
 	addToList(s.folderList, s.folderPath, full)
+}
+
+// confirmWholeDrive puts the cost of watching an entire drive where the owner
+// can see it, at the moment they choose it. Watching a whole drive is allowed -
+// for a removable drive it is the obvious thing to want - but the audit entry is
+// inheritable, so starting rewrites the security descriptor of every file
+// already on the volume and every read afterwards produces a Security-log entry.
+// On the drive Windows itself runs from, both of those are large enough to be
+// worth a firmer warning.
+func (s *SettingsUI) confirmWholeDrive(path string) bool {
+	if len(path) != 3 || path[1] != ':' {
+		return true
+	}
+	body := "Watch the whole of " + path + "?\r\n\r\n" +
+		"Every file already on the drive has to be marked when monitoring starts, which is not " +
+		"instant on a full drive, and every read anywhere on it will be reported.\r\n\r\n" +
+		"Watching a single folder on the drive avoids both."
+	if isSystemDrive(path) {
+		body = "Watch the whole of " + path + ", the drive Windows is installed on?\r\n\r\n" +
+			"This marks every file on the system drive and reports every read anywhere on it, " +
+			"including Windows' own constant background reads. It will be slow to start and very " +
+			"noisy, and it can push other records out of the Windows Security log.\r\n\r\n" +
+			"Watching a single folder is almost always what you want instead."
+	}
+	return messageBox(s.hwnd, body, appName, MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2) == IDYES
+}
+
+// isSystemDrive asks Windows where it is installed rather than reading an
+// environment variable the calling account could have set.
+func isSystemDrive(path string) bool {
+	buf := make([]uint16, 260)
+	r, _, _ := procGetSystemWindowsDirectoryW.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if r == 0 || int(r) >= len(buf) {
+		return false
+	}
+	windows := syscall.UTF16ToString(buf[:r])
+	return len(windows) >= 2 && len(path) >= 2 && strings.EqualFold(windows[:2], path[:2])
 }
 
 func capitalise(text string) string {
