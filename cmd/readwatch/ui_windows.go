@@ -28,6 +28,7 @@ const (
 	wmAppTray     = WM_APP + 5
 	wmAppExit     = WM_APP + 6
 	wmAppStatus   = WM_APP + 7
+	wmAppDevices  = WM_APP + 8
 
 	idStart    = 101
 	idSettings = 102
@@ -1049,11 +1050,22 @@ func (u *AppUI) dispatchCommand(command string, cfg *settings.PublicConfig, quie
 
 // armDeviceRefresh restarts the settle timer. SetTimer with an id that is
 // already running replaces it, which is the whole debounce.
-func (u *AppUI) armDeviceRefresh(removal bool) {
+// fallback says whether a timer that could not be created may be answered
+// immediately instead. The arrival path sets it; the busy-retry path does not,
+// because a timer that keeps failing would otherwise spin on its own retry.
+func (u *AppUI) armDeviceRefresh(removal, fallback bool) {
 	if removal {
 		u.deviceRemoval = true
 	}
-	procSetTimer.Call(uintptr(u.hwnd), idDeviceTimer, deviceSettleMS, 0)
+	if r, _, _ := procSetTimer.Call(uintptr(u.hwnd), idDeviceTimer, deviceSettleMS, 0); r != 0 {
+		return
+	}
+	// SetTimer returning zero means no timer exists and the notification that got
+	// us here would simply be lost. The debounce is an optimisation; noticing the
+	// drive is not. Post rather than call, to stay off the PnP broadcast.
+	if fallback {
+		postMessage(u.hwnd, wmAppDevices, 0, 0)
+	}
 }
 
 // devicesChanged runs once the volume notifications have settled. A drive that
@@ -1070,19 +1082,24 @@ func (u *AppUI) devicesChanged() {
 	}
 	if u.commandBusy.Load() {
 		// Something else is in flight. Ask again rather than dropping the event.
-		u.armDeviceRefresh(removal)
+		u.armDeviceRefresh(removal, false)
 		return
 	}
 	u.deviceRemoval = false
 	_, waiting, _ := u.state.Counts()
+	pending := len(u.state.PendingRules) > 0
 	switch {
-	case u.state.Running && (removal || waiting > 0):
+	case u.state.Running && (removal || waiting > 0 || pending):
+		// pending matters on its own. A folder can be taken out of Settings while
+		// its drive is out, which leaves no waiting folder but still leaves the
+		// rule on that disk; the drive coming back is then the only chance to
+		// remove it, and it arrives as an arrival with nothing else to notice.
 		u.runQuietCommand(protocol.CmdRefresh)
 	case !u.state.Running && u.state.Config.Enabled && waiting > 0:
 		// Monitoring is on as far as the owner is concerned; it just had nowhere
 		// to run. A drive arriving is the thing it was waiting for.
 		u.runQuietCommand(protocol.CmdStart)
-	case !u.state.Running && len(u.state.PendingRules) > 0:
+	case !u.state.Running && pending:
 		// Monitoring is off but an audit rule is still out there on a drive that
 		// was not in the machine. If this is that drive, it can be removed now -
 		// and if nothing else asked, the rule would sit there until the next Start
@@ -1490,7 +1507,7 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 		// messages, which are only sent to windows that asked for them and which
 		// must not be answered by accident.
 		if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) && isVolumeBroadcast(lParam) {
-			u.armDeviceRefresh(wParam == DBT_DEVICEREMOVECOMPLETE)
+			u.armDeviceRefresh(wParam == DBT_DEVICEREMOVECOMPLETE, true)
 			return 1
 		}
 	case WM_TIMER:
@@ -1499,6 +1516,9 @@ func mainWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.Poin
 			u.devicesChanged()
 			return 0
 		}
+	case wmAppDevices:
+		u.devicesChanged()
+		return 0
 	case WM_DPICHANGED:
 		u.dpiChanged(uint32(loword(wParam)), (*RECT)(lParam))
 		return 0

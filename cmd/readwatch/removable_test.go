@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -164,6 +165,78 @@ func TestDeletedFolderOnAnAttachedVolumeIsGone(t *testing.T) {
 	}
 	if transientOpenFailure(err) {
 		t.Errorf("a deleted folder was treated as a condition that will clear (%v); its record would block Stop, Apply and uninstall forever", err)
+	}
+	// The positive half, and the one the record's deletion hangs on: this has to
+	// be recognised as the object being gone, not merely as "not transient".
+	if !errors.Is(err, errObjectGone) {
+		t.Errorf("a deleted folder failed with %v, which is not recognised as the object being gone, so its audit record would be kept forever", err)
+	}
+	// Measured on this host, and the reason the list is measured: OpenFileById
+	// answers with ERROR_INVALID_PARAMETER, not with a not-found code.
+	var errno syscall.Errno
+	if errors.As(err, &errno) && uintptr(errno) != ERROR_INVALID_PARAMETER {
+		t.Logf("note: a deleted folder now reports errno %d (%v), not ERROR_INVALID_PARAMETER as measured on 2026-08-17", uintptr(errno), errno)
+	}
+}
+
+// The distinction the whole journal rests on. An object ReadWatch cannot reach
+// for some reason other than absence must keep its record: Windows returns
+// access-denied for an object that still exists but is pending deletion, so
+// reading a failure as absence would throw away the only record of a SACL that
+// is still applied.
+func TestIndeterminateIdentityFailureKeepsItsRecord(t *testing.T) {
+	for _, errno := range []uintptr{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_NOT_ALL_ASSIGNED} {
+		if objectGoneErrno(syscall.Errno(errno)) {
+			t.Errorf("error %d is read as the object being gone; a record would be deleted on it", errno)
+		}
+	}
+	for _, errno := range []uintptr{ERROR_INVALID_PARAMETER, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND} {
+		if !objectGoneErrno(syscall.Errno(errno)) {
+			t.Errorf("error %d is not read as the object being gone; its record would be kept forever", errno)
+		}
+	}
+	// An indeterminate failure must be neither forgettable nor transient, so it
+	// surfaces as an error the owner can see rather than as silence either way.
+	indeterminate := fmt.Errorf("open the recorded folder by identity: %w", syscall.Errno(ERROR_ACCESS_DENIED))
+	if errors.Is(indeterminate, errObjectGone) || transientOpenFailure(indeterminate) || deferredRemoval(indeterminate) {
+		t.Error("an access denial was classified rather than left indeterminate")
+	}
+}
+
+// A message that does not claim to be an owner decision may change settings, but
+// it may not change which objects ReadWatch is pointed at.
+func TestNonAuthorisingApplyCannotRepointReadWatch(t *testing.T) {
+	cfg := &settings.Config{
+		Folders:  []string{`C:\Watched`, `X:\Photos`},
+		LogPath:  `C:\Logs\readwatch.log`,
+		MaxRows:  1000,
+		OwnerSID: "S-1-5-21-0-0-0-1000",
+	}
+	cfg.Normalize()
+
+	same := cfg.Public()
+	same.ExcludedProcesses = []string{"explorer.exe"}
+	same.StartAtLogin = true
+	if err := refuseIdentityBearingChange(cfg, &same); err != nil {
+		t.Errorf("a settings-only change was refused: %v", err)
+	}
+
+	added := cfg.Public()
+	added.Folders = append(append([]string(nil), added.Folders...), `E:\Sneaked`)
+	if err := refuseIdentityBearingChange(cfg, &added); err == nil {
+		t.Error("an apply that was not an owner decision added a watched folder")
+	}
+
+	swapped := cfg.Public()
+	swapped.Folders = []string{`C:\Watched`, `X:\Different`}
+	if err := refuseIdentityBearingChange(cfg, &swapped); err == nil {
+		t.Error("an apply that was not an owner decision repointed a watched folder")
+	}
+
+	relogged := cfg.Public()
+	relogged.LogPath = `X:\Logs\readwatch.log`
+	if err := refuseIdentityBearingChange(cfg, &relogged); err == nil {
+		t.Error("an apply that was not an owner decision moved the log file")
 	}
 }
 

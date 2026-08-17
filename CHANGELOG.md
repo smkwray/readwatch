@@ -26,11 +26,12 @@ was out could not even be added.
 
 ### Fixed
 
-- **An unplugged drive no longer made ReadWatch forget the audit rule it left on it.** Measured on
-  the target host, an unattached volume fails with `ERROR_FILE_NOT_FOUND`, which the code treated as
-  "this object is gone for good" — so the journal record was deleted while the rule was still on the
-  disk. The two cases are now told apart by which of the two opens failed rather than by the error
-  number. See `do/evidence/2026-08-17-absent-drive`.
+- **An unplugged drive no longer made ReadWatch forget the audit rule it left on it.** Measured: an
+  unattached volume fails with `ERROR_FILE_NOT_FOUND`, which the code treated as "this object is gone
+  for good" — so the journal record was deleted while the rule was still on the disk. The two cases
+  are now told apart by which of the two opens failed rather than by the error number. A folder that
+  is genuinely gone reports `ERROR_INVALID_PARAMETER`, and only that answer forgets a record;
+  anything else keeps it. `cmd/readwatch/removable_test.go` holds both measurements.
 - A rule that cannot be removed because its drive is out is kept, counted and named in the window,
   and uninstall now says which drive to attach rather than refusing with no explanation.
 - Uninstall re-reads the configuration after cleanup, so its fail-closed check no longer tests a copy
@@ -49,7 +50,19 @@ was out could not even be added.
   skipping an unreachable folder would have erased its recorded identity, and an unrecorded folder is
   treated as one being authorised for the first time — so the next volume to claim that drive letter
   would have been watched, and given an audit rule by LocalSystem, with nobody deciding.
-- A refresh caused by a drive arriving does not authorise anything. Only a Save does.
+- Only a Save from Settings authorises what a watched path means. A refresh caused by a drive
+  arriving does not, nor does the right-click process exclusion, nor the sign-in rollback. The
+  service enforces this rather than trusting the sender: an apply that does not claim to be an owner
+  decision is refused outright if it would change the watched folders or the log file.
+- An audit record is forgotten only when the volume is attached and the object is provably not on
+  it. An access denial, a filter, or any other indeterminate failure keeps the record and reports it,
+  because Windows returns access-denied for an object that still exists but is pending deletion —
+  reading that as absence would discard the only record of a rule still applied.
+- Uninstall abandons a rule only when the drive is provably not attached. Any other reason a volume
+  cannot be opened now blocks uninstall and names the folder, rather than telling the owner a drive
+  is unplugged when it may not be.
+- Failures to withdraw a privileged change are reported instead of being logged and passed over. A
+  stop that could not restore the machine-wide audit policy no longer reports success.
 
 ## 0.3.0 — 2026-08-13
 

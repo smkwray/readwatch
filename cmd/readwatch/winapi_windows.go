@@ -714,6 +714,7 @@ const (
 	// variants - an empty card reader, an unformatted or offline volume.
 	ERROR_INVALID_DRIVE        = 15
 	ERROR_BAD_UNIT             = 20
+	ERROR_INVALID_PARAMETER    = 87
 	ERROR_INVALID_NAME         = 123
 	ERROR_NO_SUCH_DEVICE       = 433
 	ERROR_UNRECOGNIZED_VOLUME  = 1005

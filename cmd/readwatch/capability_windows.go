@@ -324,7 +324,8 @@ var errVolumeUnavailable = errors.New("the drive holding this folder is not atta
 // object". The first two entries are the ones that matter and the ones that were
 // wrong: measured on this host, both a free drive letter and an unattached
 // \\?\Volume{...} name fail with ERROR_FILE_NOT_FOUND, not with any of the
-// device-shaped codes. See do/evidence/2026-08-17-absent-drive.
+// device-shaped codes. TestUnattachedDriveLetterIsWaiting and
+// TestUnattachedVolumeKeepsItsRecord hold that measurement in place.
 func absentDeviceErrno(errno syscall.Errno) bool {
 	switch uintptr(errno) {
 	case ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_INVALID_DRIVE,
@@ -752,7 +753,7 @@ func requireFinalPath(h HANDLE, expected string) error {
 // SACL. The documentation assigns READ_CONTROL to the owner, group and DACL, so
 // it looks droppable; measured on this host, GetSecurityInfo returns
 // ERROR_ACCESS_DENIED without it whether the handle came from OpenFileById or
-// CreateFile, and succeeds with it. See do/evidence/2026-08-13-sacl-access.
+// CreateFile, and succeeds with it.
 func openByIdentity(id settings.ObjectIdentity) (HANDLE, error) {
 	return openByIdentityWithAccess(id, ACCESS_SYSTEM_SECURITY|READ_CONTROL|FILE_READ_ATTRIBUTES)
 }
@@ -798,6 +799,13 @@ func openByIdentityWithAccess(id settings.ObjectIdentity, desiredAccess uintptr)
 		FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,
 	)
 	if r == INVALID_HANDLE_VALUE || r == 0 {
+		// The volume opened, so this is about the object rather than the disk - but
+		// only some of the ways it can fail actually establish that the object is
+		// gone. The rest are indeterminate and must stay that way, because the
+		// caller deletes its only record of an applied audit rule on "gone".
+		if errno, ok := e.(syscall.Errno); ok && objectGoneErrno(errno) {
+			return 0, fmt.Errorf("%w (%v)", errObjectGone, errno)
+		}
 		return 0, fmt.Errorf("open the recorded folder by identity: %w", winErr("OpenFileById", e))
 	}
 	h := HANDLE(r)
@@ -810,9 +818,33 @@ func openByIdentityWithAccess(id settings.ObjectIdentity, desiredAccess uintptr)
 	// the whole tuple has to match before anything privileged happens to it.
 	if !current.Equal(id) {
 		closeHandle(h)
-		return 0, errors.New("the recorded object no longer exists; a different object now holds its identifier")
+		return 0, fmt.Errorf("%w: a different object now holds its identifier", errObjectGone)
 	}
 	return h, nil
+}
+
+// errObjectGone means the volume is here and the recorded object is provably not
+// on it. It is the only outcome that authorises forgetting an audit record: the
+// rule lived on the object, so it went with it.
+var errObjectGone = errors.New("the recorded folder no longer exists")
+
+// objectGoneErrno is what an attached volume says when the recorded object is not
+// on it. Measured on this host: OpenFileById fails with ERROR_INVALID_PARAMETER
+// both for a directory that was deleted after its identity was captured and for
+// a file identifier that was never allocated. Neither produces a not-found code,
+// which is exactly why this list is measured rather than reasoned about;
+// TestDeletedFolderOnAnAttachedVolumeIsGone keeps it honest.
+//
+// ERROR_ACCESS_DENIED is deliberately absent. Windows documents it for an object
+// that still exists but is pending deletion, so it cannot be read as absence,
+// and reading it that way would discard the only record of a rule still applied.
+// Anything not listed here stays indeterminate and keeps its record.
+func objectGoneErrno(errno syscall.Errno) bool {
+	switch uintptr(errno) {
+	case ERROR_INVALID_PARAMETER, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND:
+		return true
+	}
+	return false
 }
 
 // withPrivilege enables a privilege for exactly the call that needs it and puts

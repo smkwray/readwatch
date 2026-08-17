@@ -394,11 +394,16 @@ func directAuditCleanup(cfg *settings.Config) error {
 // removable drive a decision the owner cannot undo. That one case is named in
 // full and put to them, because only they know whether the drive is coming back.
 func confirmUnresolvedAuditState(cfg settings.Config, quiet bool) error {
-	blocked := errors.New("ReadWatch still has auditing changes it could not undo, so it was left installed rather than losing the record of them; start ReadWatch, stop monitoring, and try again")
-	stranded := detachedSnapshots(cfg)
-	if cfg.AuditPolicy != nil || len(stranded) == 0 || len(stranded) != len(cfg.Snapshots) {
-		// Something here is still reachable, so it can still be repaired properly.
-		return blocked
+	stranded, unresolved := classifySnapshots(cfg)
+	if cfg.AuditPolicy != nil || len(stranded) == 0 || len(unresolved) > 0 {
+		// Something here is either still reachable or could not be shown to be
+		// unreachable, so it can still be repaired properly - and must be, because
+		// this configuration is the only record of what was changed.
+		message := "ReadWatch still has auditing changes it could not undo, so it was left installed rather than losing the record of them; start ReadWatch, stop monitoring, and try again"
+		if len(unresolved) > 0 {
+			message += ".\r\n\r\nCould not be reached: " + strings.Join(unresolved, ", ")
+		}
+		return errors.New(message)
 	}
 	if quiet {
 		return errors.New("ReadWatch still has an auditing rule on a drive that is not attached (" + strings.Join(stranded, ", ") + "); attach the drive and uninstall again")
@@ -417,26 +422,44 @@ func confirmUnresolvedAuditState(cfg settings.Config, quiet bool) error {
 	return nil
 }
 
-// detachedSnapshots names the records whose volume is not in the machine. It
-// opens the volume rather than the recorded object, so it needs no privilege and
-// cannot be misled by a file identifier that has since been reused.
-func detachedSnapshots(cfg settings.Config) []string {
-	paths := make([]string, 0, len(cfg.Snapshots))
+// classifySnapshots splits the outstanding records into the ones whose volume is
+// provably not in the machine and the ones that could not be reached for some
+// other reason. Only the first kind may be abandoned, and only with the owner's
+// say-so; the second kind is why this is not a single boolean. Reading every
+// failure as "the drive is unplugged" would ask the owner to give up a rule under
+// an explanation that might simply be untrue - an access denial, a corrupt
+// volume, or a filter in the way all look identical from a failed open.
+func classifySnapshots(cfg settings.Config) (detached, unresolved []string) {
 	for _, snapshot := range cfg.Snapshots {
-		if snapshot.Identity.Zero() || volumeAttached(snapshot.Identity.VolumeGUID) {
+		if snapshot.Identity.Zero() {
+			unresolved = append(unresolved, snapshot.Path)
 			continue
 		}
-		paths = append(paths, snapshot.Path)
+		switch volumeState(snapshot.Identity.VolumeGUID) {
+		case volumeDetached:
+			detached = append(detached, snapshot.Path)
+		case volumeIndeterminate:
+			unresolved = append(unresolved, snapshot.Path)
+		}
 	}
-	sort.Strings(paths)
-	return paths
+	sort.Strings(detached)
+	sort.Strings(unresolved)
+	return detached, unresolved
 }
 
-func volumeAttached(volumeGUID string) bool {
+const (
+	volumeAttachedState = iota
+	volumeDetached
+	volumeIndeterminate
+)
+
+// volumeState opens the volume rather than the recorded object, so it needs no
+// privilege and cannot be misled by a file identifier that has since been reused.
+func volumeState(volumeGUID string) int {
 	if volumeGUID == "" {
-		return false
+		return volumeIndeterminate
 	}
-	r, _, _ := procCreateFileW.Call(
+	r, _, e := procCreateFileW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(strings.TrimRight(volumeGUID, `\`)))),
 		FILE_READ_ATTRIBUTES,
 		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
@@ -444,11 +467,14 @@ func volumeAttached(volumeGUID string) bool {
 		FILE_FLAG_BACKUP_SEMANTICS,
 		0,
 	)
-	if r == INVALID_HANDLE_VALUE || r == 0 {
-		return false
+	if r != INVALID_HANDLE_VALUE && r != 0 {
+		closeHandle(HANDLE(r))
+		return volumeAttachedState
 	}
-	closeHandle(HANDLE(r))
-	return true
+	if errno, ok := e.(syscall.Errno); ok && absentDeviceErrno(errno) {
+		return volumeDetached
+	}
+	return volumeIndeterminate
 }
 
 // serviceSDDL grants the interactive owner exactly enough to run the service on
