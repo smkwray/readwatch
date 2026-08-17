@@ -430,9 +430,16 @@ func validateLexicalPath(raw string) (string, error) {
 	if strings.Contains(p[2:], ":") {
 		return "", errors.New("alternate data streams are not supported")
 	}
+	// A bare drive root is allowed. Everything below this gate works on one -
+	// measured on this host against NTFS volumes on NVMe and USB alike - and for
+	// a removable drive the whole drive is the unit the owner thinks in. It is
+	// expensive rather than impossible: the audit entry is inheritable, so
+	// applying it rewrites the security descriptor of every file already on the
+	// volume, and every read then produces a Security-log event. That is a cost
+	// to warn about where the owner can see it, not a reason to refuse here.
 	rest := strings.Trim(p[3:], `\`)
 	if rest == "" {
-		return "", errors.New("watching an entire drive is blocked because it can generate extreme audit volume")
+		return strings.ToUpper(p[:1]) + `:\`, nil
 	}
 	components := strings.Split(rest, `\`)
 	clean := make([]string, 0, len(components))
@@ -466,6 +473,16 @@ func volumeGUIDPath(driveAbsolute string) (string, string, error) {
 	case DRIVE_REMOTE:
 		return "", "", errors.New("network drives are not supported; monitor a local folder on the machine that holds it")
 	}
+	// Ask what the volume is formatted as before walking into it. Windows audits
+	// file access through the security descriptor, and exFAT and FAT have no
+	// security descriptors at all - so there is nothing to attach an audit entry
+	// to and nothing will ever generate an event. Without this the walk fails at
+	// the volume root with "GetFileInformationByHandleEx(FileAttributeTagInfo):
+	// The parameter is incorrect", which tells the owner nothing. Most USB sticks
+	// ship formatted exFAT, so this is the common case, not the exotic one.
+	if fs, err := volumeFileSystem(root); err == nil && !strings.EqualFold(fs, "NTFS") && !strings.EqualFold(fs, "ReFS") {
+		return "", "", fmt.Errorf("%s is formatted %s, and Windows can only audit reads on NTFS or ReFS; reformat the drive as NTFS to watch it", root, fs)
+	}
 	buf := make([]uint16, 64)
 	r, _, e := procGetVolumeNameForVolumeMountPntW.Call(
 		uintptr(unsafe.Pointer(utf16Ptr(root))),
@@ -483,6 +500,21 @@ func volumeGUIDPath(driveAbsolute string) (string, string, error) {
 func driveType(root string) uint32 {
 	r, _, _ := procGetDriveTypeW.Call(uintptr(unsafe.Pointer(utf16Ptr(root))))
 	return uint32(r)
+}
+
+// volumeFileSystem names the filesystem on a mounted root, by path rather than
+// by handle, so it can be consulted before anything is opened.
+func volumeFileSystem(root string) (string, error) {
+	name := make([]uint16, 32)
+	r, _, e := procGetVolumeInformationW.Call(
+		uintptr(unsafe.Pointer(utf16Ptr(root))),
+		0, 0, 0, 0, 0,
+		uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)),
+	)
+	if r == 0 {
+		return "", winErr("GetVolumeInformation", e)
+	}
+	return syscall.UTF16ToString(name), nil
 }
 
 // openDirectoryComponent opens one path component and proves it is an ordinary
