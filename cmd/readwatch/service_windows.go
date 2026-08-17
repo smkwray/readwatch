@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -27,8 +28,14 @@ type ServiceEngine struct {
 	ipc     *IPCServer
 	// active holds the open folder and log handles the current monitoring
 	// session was authorised with. Everything privileged goes through these.
-	active       *BoundConfig
-	lastError    string
+	active    *BoundConfig
+	lastError string
+	// folders is what the last binding attempt found at each configured path, and
+	// pendingRules names audit rules ReadWatch still owns on a disk that is not in
+	// the machine. Both are reported rather than folded into lastError: neither is
+	// a fault, and a warning nothing can clear is worse than a plain statement.
+	folders      []protocol.FolderStatus
+	pendingRules []string
 	ready        bool
 	shuttingDown atomic.Bool
 }
@@ -97,14 +104,38 @@ func (e *ServiceEngine) OnViewerHello(pipe HANDLE) error {
 	if e.watcher.Running() {
 		return nil
 	}
+	// Resolve anything a previous session left behind before deciding whether to
+	// resume. Exiting clears the desired state, so without this an audit rule
+	// left on a drive that was out at the time would never be revisited: the only
+	// other route to the journal is a Start the owner might never press again.
+	// Nothing here needs the client's token - it undoes ReadWatch's own recorded
+	// changes, found by identity - and monitoring is off, so no rule in force can
+	// be withdrawn by mistake.
 	e.mu.RLock()
-	enabled := e.cfg.Enabled
-	folders := len(e.cfg.Folders)
+	cfg := cloneConfig(e.cfg)
+	enabled := cfg.Enabled
+	folders := len(cfg.Folders)
 	e.mu.RUnlock()
+	if len(cfg.Snapshots) > 0 || cfg.AuditPolicy != nil {
+		deferred, err := recoverJournal(&cfg, e.saveConfig)
+		e.setPendingRules(deferred)
+		if err != nil {
+			writeServiceDiagnostic(err)
+		}
+		e.mu.Lock()
+		e.cfg = cfg
+		e.mu.Unlock()
+	}
 	if !enabled || folders == 0 {
 		return nil
 	}
 	if err := e.startMonitoringBound(pipe, false); err != nil {
+		// Every folder being on a drive that is out is the resting state for a
+		// configuration like that, not a failure to report. The folder statuses
+		// already say which ones are waiting, and a device arrival resumes it.
+		if errors.Is(err, errNoFolderAvailable) {
+			return nil
+		}
 		e.setLastError(err)
 		return err
 	}
@@ -117,7 +148,21 @@ func (e *ServiceEngine) StartMonitoringFromClient(pipe HANDLE) error {
 	if err := e.rejectIfStopping(); err != nil {
 		return err
 	}
+	// An explicit Start deserves an answer, so the "nothing is reachable" case is
+	// returned to the caller that asked - but it is not stored as lastError,
+	// which would leave a warning on the status line that nothing clears.
 	return e.startMonitoringBound(pipe, true)
+}
+
+// RefreshFromClient re-binds the configuration the service already holds. A
+// drive appearing or leaving changes what can be watched without changing what
+// the owner asked for, and only a connected owner's token may open a folder, so
+// the viewer notices the device and this turns it into a re-bind.
+func (e *ServiceEngine) RefreshFromClient(pipe HANDLE) error {
+	e.mu.RLock()
+	public := cloneConfig(e.cfg).Public()
+	e.mu.RUnlock()
+	return e.applyBound(pipe, public, false)
 }
 
 func (e *ServiceEngine) Shutdown() {
@@ -155,6 +200,8 @@ func (e *ServiceEngine) CurrentState() protocol.State {
 	cfg := cloneConfig(e.cfg)
 	last := e.lastError
 	ready := e.ready
+	folders := append([]protocol.FolderStatus(nil), e.folders...)
+	pending := append([]string(nil), e.pendingRules...)
 	e.mu.RUnlock()
 	return protocol.State{
 		Running:      e.watcher.Running(),
@@ -164,11 +211,48 @@ func (e *ServiceEngine) CurrentState() protocol.State {
 		LiveDropped:  e.ipc.Dropped(),
 		Suppressed:   e.watcher.Suppressed(),
 		ServiceReady: ready,
+		Folders:      folders,
+		PendingRules: pending,
 	}
 }
 
-func (e *ServiceEngine) ApplyFromClient(pipe HANDLE, public settings.PublicConfig) error {
-	return e.applyBound(pipe, public)
+// ApplyFromClient records a configuration the viewer sent. Only a Save from the
+// Settings dialog arrives with authorise set: that is the one place the owner
+// looks at the folder list and decides what each path means.
+func (e *ServiceEngine) ApplyFromClient(pipe HANDLE, public settings.PublicConfig, authorise bool) error {
+	return e.applyBound(pipe, public, authorise)
+}
+
+// setFolderStatus records what the last bind found, in the order the owner
+// configured the folders. Every configured path appears exactly once, so the
+// counts the window shows always add up to the list in Settings.
+func (e *ServiceEngine) setFolderStatus(bound *BoundConfig) {
+	byPath := make(map[string]protocol.FolderStatus, len(bound.Public.Folders))
+	for _, f := range bound.Folders {
+		byPath[strings.ToLower(f.Path)] = protocol.FolderStatus{Path: f.Path, State: protocol.FolderAvailable}
+	}
+	for _, u := range bound.Unavailable {
+		state := protocol.FolderRefused
+		if u.Waiting {
+			state = protocol.FolderWaiting
+		}
+		byPath[strings.ToLower(u.Path)] = protocol.FolderStatus{Path: u.Path, State: state, Detail: u.Reason}
+	}
+	out := make([]protocol.FolderStatus, 0, len(bound.Public.Folders))
+	for _, path := range bound.Public.Folders {
+		if status, ok := byPath[strings.ToLower(path)]; ok {
+			out = append(out, status)
+		}
+	}
+	e.mu.Lock()
+	e.folders = out
+	e.mu.Unlock()
+}
+
+func (e *ServiceEngine) setPendingRules(paths []string) {
+	e.mu.Lock()
+	e.pendingRules = paths
+	e.mu.Unlock()
 }
 
 func (e *ServiceEngine) StopMonitoring(removeRules bool) error {
@@ -209,12 +293,21 @@ func (e *ServiceEngine) setLastError(err error) {
 	e.mu.Unlock()
 }
 
+// cloneConfig deep-copies everything a caller may go on to mutate. Sharing any
+// of it is a data race against CurrentState, and ApplyPublic writes through
+// Folders and ExcludedProcesses in place - the exclusion list was being shared,
+// which is the same defect that was already fixed for the folder list.
 func cloneConfig(in settings.Config) settings.Config {
 	out := in
 	out.Folders = append([]string(nil), in.Folders...)
+	out.ExcludedProcesses = append([]string(nil), in.ExcludedProcesses...)
 	out.Snapshots = make(map[string]settings.AuditSnapshot, len(in.Snapshots))
 	for k, v := range in.Snapshots {
 		out.Snapshots[k] = v
+	}
+	out.FolderBindings = make(map[string]settings.ObjectBinding, len(in.FolderBindings))
+	for k, v := range in.FolderBindings {
+		out.FolderBindings[k] = v
 	}
 	return out
 }

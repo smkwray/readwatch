@@ -170,6 +170,15 @@ type TRACKMOUSEEVENT struct {
 	DwHoverTime uint32
 }
 
+// DEV_BROADCAST_HDR is the common prefix of every WM_DEVICECHANGE payload. Only
+// the device type is read: which volume arrived does not matter, because the
+// answer is always "ask the service to look again".
+type DEV_BROADCAST_HDR struct {
+	DbchSize       uint32
+	DbchDeviceType uint32
+	DbchReserved   uint32
+}
+
 type LVITEMW struct {
 	Mask       uint32
 	IItem      int32
@@ -392,6 +401,7 @@ const (
 	WM_DRAWITEM        = 0x002B
 	WM_COMMAND         = 0x0111
 	WM_TIMER           = 0x0113
+	WM_DEVICECHANGE    = 0x0219
 	WM_NOTIFY          = 0x004E
 	WM_CONTEXTMENU     = 0x007B
 	WM_GETMINMAXINFO   = 0x0024
@@ -415,6 +425,15 @@ const (
 	WM_CTLCOLORLISTBOX = 0x0134
 	WM_CTLCOLORBTN     = 0x0135
 	WM_CTLCOLORSTATIC  = 0x0138
+
+	// Volume arrival and departure. Windows broadcasts these to every top-level
+	// window without any registration, which is why the viewer can notice a drive
+	// appearing while it is hidden in the tray. DBT_DEVICEQUERYREMOVE is
+	// deliberately not handled: it is only sent to windows that registered a
+	// handle notification, and it does not cover a stick that is simply pulled.
+	DBT_DEVICEARRIVAL        = 0x8000
+	DBT_DEVICEREMOVECOMPLETE = 0x8004
+	DBT_DEVTYP_VOLUME        = 2
 
 	SC_MINIMIZE = 0xF020
 
@@ -457,6 +476,7 @@ const (
 	SS_CENTER      = 0x00000001
 	SS_CENTERIMAGE = 0x00000200
 	SS_NOTIFY      = 0x00000100
+	SS_ENDELLIPSIS = 0x00004000
 
 	ES_AUTOHSCROLL = 0x0080
 	ES_READONLY    = 0x0800
@@ -620,6 +640,7 @@ const (
 	MB_ICONWARNING     = 0x00000030
 	MB_YESNO           = 0x00000004
 	MB_OKCANCEL        = 0x00000001
+	MB_DEFBUTTON2      = 0x00000100
 	IDOK               = 1
 	IDCANCEL           = 2
 	IDYES              = 6
@@ -673,19 +694,41 @@ const (
 	// RegisterClassEx reports a duplicate class as 1410, NOT 183. Guarding on
 	// ERROR_ALREADY_EXISTS meant reopening Settings failed with
 	// "RegisterClassEx(settings): Class already exists."
-	ERROR_CLASS_ALREADY_EXISTS    = 1410
-	ERROR_PIPE_BUSY               = 231
-	ERROR_NO_DATA                 = 232
-	ERROR_PIPE_CONNECTED          = 535
-	ERROR_IO_PENDING              = 997
-	ERROR_OPERATION_ABORTED       = 995
-	FILE_FLAG_OVERLAPPED          = 0x40000000
-	ERROR_CANCELLED               = 1223
-	ERROR_NOT_ALL_ASSIGNED        = 1300
-	ERROR_SHARING_VIOLATION       = 32
-	ERROR_LOCK_VIOLATION          = 33
-	ERROR_NOT_READY               = 21
-	ERROR_DEV_NOT_EXIST           = 55
+	ERROR_CLASS_ALREADY_EXISTS = 1410
+	ERROR_PIPE_BUSY            = 231
+	ERROR_NO_DATA              = 232
+	ERROR_PIPE_CONNECTED       = 535
+	ERROR_IO_PENDING           = 997
+	ERROR_OPERATION_ABORTED    = 995
+	FILE_FLAG_OVERLAPPED       = 0x40000000
+	ERROR_CANCELLED            = 1223
+	ERROR_NOT_ALL_ASSIGNED     = 1300
+	ERROR_SHARING_VIOLATION    = 32
+	ERROR_LOCK_VIOLATION       = 33
+	ERROR_NOT_READY            = 21
+	ERROR_DEV_NOT_EXIST        = 55
+	// A drive that is not in the machine does not report itself as "not ready".
+	// Measured on this host: both GetVolumeNameForVolumeMountPointW on a free
+	// drive letter and CreateFileW on an unattached \\?\Volume{...} name fail
+	// with ERROR_FILE_NOT_FOUND. The rest of these cover the media-shaped
+	// variants - an empty card reader, an unformatted or offline volume.
+	ERROR_INVALID_DRIVE        = 15
+	ERROR_BAD_UNIT             = 20
+	ERROR_INVALID_NAME         = 123
+	ERROR_NO_SUCH_DEVICE       = 433
+	ERROR_UNRECOGNIZED_VOLUME  = 1005
+	ERROR_NO_MEDIA_IN_DRIVE    = 1112
+	ERROR_DEVICE_NOT_CONNECTED = 1167
+
+	SEM_FAILCRITICALERRORS = 0x0001
+
+	DRIVE_UNKNOWN                 = 0
+	DRIVE_NO_ROOT_DIR             = 1
+	DRIVE_REMOVABLE               = 2
+	DRIVE_FIXED                   = 3
+	DRIVE_REMOTE                  = 4
+	DRIVE_CDROM                   = 5
+	DRIVE_RAMDISK                 = 6
 	ERROR_SERVICE_EXISTS          = 1073
 	ERROR_SERVICE_ALREADY_RUNNING = 1056
 	ERROR_SERVICE_NOT_ACTIVE      = 1062
@@ -870,6 +913,9 @@ var (
 	procSetNamedPipeHandleState = kernel32.NewProc("SetNamedPipeHandleState")
 	procFlushFileBuffers        = kernel32.NewProc("FlushFileBuffers")
 	procGetFullPathNameW        = kernel32.NewProc("GetFullPathNameW")
+	procGetDriveTypeW           = kernel32.NewProc("GetDriveTypeW")
+	procGetLogicalDrives        = kernel32.NewProc("GetLogicalDrives")
+	procSetErrorMode            = kernel32.NewProc("SetErrorMode")
 
 	procRegisterClassExW       = user32.NewProc("RegisterClassExW")
 	procRegisterWindowMessageW = user32.NewProc("RegisterWindowMessageW")
@@ -899,6 +945,8 @@ var (
 	procGetWindowTextW         = user32.NewProc("GetWindowTextW")
 	procEnableWindow           = user32.NewProc("EnableWindow")
 	procDestroyWindow          = user32.NewProc("DestroyWindow")
+	procSetTimer               = user32.NewProc("SetTimer")
+	procKillTimer              = user32.NewProc("KillTimer")
 	procIsWindowVisible        = user32.NewProc("IsWindowVisible")
 	procSetForegroundWindow    = user32.NewProc("SetForegroundWindow")
 	procSetFocus               = user32.NewProc("SetFocus")

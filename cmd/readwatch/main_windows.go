@@ -16,6 +16,11 @@ var (
 
 func main() {
 	setLeanRuntime()
+	// Reaching for a drive that is not there must never raise a Windows
+	// hard-error box. In the service there is nobody to answer one, so it would
+	// simply block a bind; in the viewer it would be a dialog about a drive the
+	// owner already knows is unplugged. Both cases are now ordinary.
+	procSetErrorMode.Call(SEM_FAILCRITICALERRORS)
 	args := os.Args[1:]
 	quiet := hasArg(args, "--quiet")
 

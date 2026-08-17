@@ -5,8 +5,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -56,6 +54,7 @@ type SettingsUI struct {
 	removeBtn    HWND
 	folderPath   HWND
 	addPathBtn   HWND
+	foldersHint  HWND
 
 	excludeLabel     HWND
 	excludeList      HWND
@@ -140,7 +139,7 @@ func (s *SettingsUI) create() error {
 	width := s.scale(520)
 	// Tall enough that the last checkbox still clears the Save row, which the
 	// layout below anchors to the bottom edge.
-	height := s.scale(566)
+	height := s.scale(580)
 	x, y := centeredWindowPosition(s.app.hwnd, width, height)
 	style := uintptr(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN)
 	hwnd, _, e := procCreateWindowExW.Call(
@@ -192,6 +191,7 @@ func (s *SettingsUI) createControls() {
 	s.folderPath = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL, 0, s.hwnd, idFolderPath)
 	s.addPathBtn = createControl("BUTTON", "Add", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddFolderPath)
 	sendMessage(s.folderPath, EM_SETCUEBANNER, 1, uintptr(unsafe.Pointer(utf16Ptr(`Paste a folder path, e.g. D:\Renders\output`))))
+	s.foldersHint = createControl("STATIC", "A folder on a drive that is not plugged in can be added; it is watched whenever the drive is there.", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS, 0, s.hwnd, 0)
 
 	s.excludeLabel = createControl("STATIC", "Ignore reads by these processes", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, s.hwnd, 0)
 	s.excludeList = createControl("LISTBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT, 0, s.hwnd, idExcludeList)
@@ -250,7 +250,7 @@ func (s *SettingsUI) createControls() {
 
 func (s *SettingsUI) controls() []HWND {
 	return []HWND{
-		s.foldersLabel, s.folderList, s.addBtn, s.removeBtn, s.folderPath, s.addPathBtn,
+		s.foldersLabel, s.folderList, s.addBtn, s.removeBtn, s.folderPath, s.addPathBtn, s.foldersHint,
 		s.excludeLabel, s.excludeList, s.excludeText, s.excludeAddBtn, s.excludeRemoveBtn,
 		s.logLabel, s.logPath, s.browseBtn, s.formatLabel, s.formatCombo,
 		s.includeDirs, s.startLogin, s.openLogin, s.alwaysTop, s.saveBtn, s.cancelBtn,
@@ -289,7 +289,9 @@ func (s *SettingsUI) layout() {
 	y += s.scale(74) + s.scale(6)
 	place(s.folderPath, m, y, fieldW, fieldH)
 	place(s.addPathBtn, rightX, y, buttonW, buttonH)
-	y += fieldH + s.scale(14)
+	y += fieldH + s.scale(2)
+	place(s.foldersHint, m, y, w-2*m, s.scale(16))
+	y += s.scale(16) + s.scale(10)
 
 	place(s.excludeLabel, m, y, w-2*m, labelH)
 	y += labelH + s.scale(4)
@@ -430,9 +432,15 @@ func removeSelected(list HWND) {
 	}
 }
 
-// addTypedFolder takes whatever was pasted or typed and validates it before it
-// reaches the list, so a typo surfaces here rather than as a silent no-match
-// once monitoring starts.
+// addTypedFolder takes whatever was pasted or typed and checks the shape of it
+// before it reaches the list, using the same rule the service applies, so the
+// dialog and the service can never disagree about what a usable path is.
+//
+// It deliberately does not check that the folder exists. A folder on a drive
+// that is not plugged in is a folder ReadWatch supports, and refusing to even
+// write it down was the whole reason a removable drive could not be configured.
+// A path that never turns up is not lost either: the window reports it as
+// waiting, by name, for as long as it stays that way.
 func (s *SettingsUI) addTypedFolder() {
 	raw := strings.TrimSpace(windowText(s.folderPath))
 	if raw == "" {
@@ -441,16 +449,19 @@ func (s *SettingsUI) addTypedFolder() {
 	// Explorer's "Copy as path" wraps the path in quotes, which is a very likely
 	// way for one to arrive here.
 	raw = strings.Trim(raw, `"`)
-	full, err := filepath.Abs(raw)
-	if err != nil || full == "" {
-		messageBox(s.hwnd, "That does not look like a usable folder path:\r\n\r\n"+raw, appName, MB_OK|MB_ICONWARNING)
-		return
-	}
-	if fi, statErr := os.Stat(full); statErr != nil || !fi.IsDir() {
-		messageBox(s.hwnd, "That folder does not exist:\r\n\r\n"+full, appName, MB_OK|MB_ICONWARNING)
+	full, err := validateLexicalPath(raw)
+	if err != nil {
+		messageBox(s.hwnd, "That is not a usable folder path:\r\n\r\n"+raw+"\r\n\r\n"+capitalise(err.Error()), appName, MB_OK|MB_ICONWARNING)
 		return
 	}
 	addToList(s.folderList, s.folderPath, full)
+}
+
+func capitalise(text string) string {
+	if text == "" {
+		return text
+	}
+	return strings.ToUpper(text[:1]) + text[1:]
 }
 
 func (s *SettingsUI) removeFolder() {
@@ -603,7 +614,9 @@ func (u *AppUI) applySettings(cfg settings.PublicConfig) bool {
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		err := client.Command(ctx, protocol.CmdApply, &cfg)
+		// The only authorising apply in the app. This is where the owner sees the
+		// folder list and says what each path means.
+		err := client.Command(ctx, protocol.CmdApply, &cfg, true)
 		cancel()
 		if err == nil {
 			err = setStartup(cfg.StartAtLogin)
@@ -612,7 +625,9 @@ func (u *AppUI) applySettings(cfg settings.PublicConfig) bool {
 				rollback.StartAtLogin = oldStart
 				rollback.OpenAtLogin = oldOpen
 				rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), 8*time.Second)
-				_ = client.Command(rollbackCtx, protocol.CmdApply, &rollback)
+				// Part of the same Save the owner just made, so it carries the same
+				// authority; it only puts the sign-in setting back.
+				_ = client.Command(rollbackCtx, protocol.CmdApply, &rollback, true)
 				rollbackCancel()
 				err = fmt.Errorf("save startup setting: %w", err)
 			}
