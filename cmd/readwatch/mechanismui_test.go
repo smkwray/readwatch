@@ -3,9 +3,12 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"readwatch/internal/model"
 	"readwatch/internal/settings"
 )
 
@@ -58,5 +61,40 @@ func TestMechanismLabelIsPlainWords(t *testing.T) {
 	}
 	if mechanismLabel("") != "" {
 		t.Error("with no mechanism decided the summary must say nothing rather than guess")
+	}
+}
+
+func TestEnrichmentRefusesAProcessThatStartedAfterTheRead(t *testing.T) {
+	// Windows reuses process ids, and enrichment runs after the deferred sweep,
+	// so the gap can be seconds wide. A process that started after the read
+	// cannot be the one that made it, and naming it would attribute a read to an
+	// innocent process.
+	self, _, _ := procOpenProcess.Call(PROCESS_QUERY_LIMITED_INFORMATION, 0, uintptr(os.Getpid()))
+	if self == 0 {
+		t.Skip("cannot open own process")
+	}
+	defer procCloseHandle.Call(self)
+
+	// This process plainly exists now, so a read timed now is attributable.
+	if !startedBefore(self, time.Now().UTC()) {
+		t.Fatal("a live process was rejected for a read happening now")
+	}
+	// A read from before this process existed is not.
+	if startedBefore(self, time.Now().UTC().Add(-24*time.Hour)) {
+		t.Error("a read from before this process started was attributed to it")
+	}
+	// An unreadable handle is a refusal, not a pass.
+	if startedBefore(0, time.Now().UTC()) {
+		t.Error("an unqueryable process was treated as verified")
+	}
+}
+
+func TestEnrichmentLeavesFieldsBlankWhenIdentityIsUnproven(t *testing.T) {
+	// Better a read with no process named than a read naming the wrong one.
+	s := &etwSource{}
+	e := model.Event{PID: 0xFFFFFFF0, Time: time.Now().UTC()}
+	s.Enrich(&e)
+	if e.Process != "" || e.ProcessPath != "" || e.User != "" {
+		t.Fatalf("an unresolvable pid was given an identity: %+v", e)
 	}
 }
