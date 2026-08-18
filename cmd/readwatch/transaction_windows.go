@@ -60,6 +60,14 @@ func (e *ServiceEngine) applyAuditRule(cfg *settings.Config, folder FolderCapabi
 		return fmt.Errorf("%s: %w", folder.Path, err)
 	}
 	key := folder.Identity.Key()
+	// Key is narrower than Equal - it omits the volume serial and the 64-bit
+	// index - so two objects can collide on it. Treating it as unique authority
+	// would let one folder adopt another's recorded SACL and then overwrite that
+	// folder's cleanup record, which is the one class of state that must never
+	// become unfindable. Refuse before anything privileged happens.
+	if existing, ok := cfg.Snapshots[key]; ok && !existing.Identity.Equal(folder.Identity) {
+		return fmt.Errorf("%s: the audit journal already records a different object under this key; no rule was changed", folder.Path)
+	}
 	if existing, ok := cfg.Snapshots[key]; ok && existing.Phase == settings.PhaseApplied {
 		current, err := readSACLState(folder.Security)
 		if err != nil {
@@ -509,7 +517,7 @@ func (e *ServiceEngine) startWithCapabilities(cfg *settings.Config, bound *Bound
 	// have reads under it reported as if they came from the watched folder.
 	watchCfg := cloneConfig(*cfg)
 	watchCfg.Folders = append([]string(nil), bound.AttachedPaths()...)
-	if err := e.watcher.Start(watchCfg, logFile, choice.Use); err != nil {
+	if err := e.watcher.Start(watchCfg, logFile, choice.Use, bound.AttachedRoots()); err != nil {
 		rollback()
 		cfg.Enabled = false
 		_ = e.saveConfig(cfg)

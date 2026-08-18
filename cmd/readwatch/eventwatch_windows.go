@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"readwatch/internal/etw"
 	"readwatch/internal/eventparse"
 	"readwatch/internal/logsink"
 	"readwatch/internal/model"
@@ -216,7 +217,7 @@ func (w *EventWatcher) Suppressed() uint64 { return w.suppressed.Load() }
 // mechanism decides which source runs. Never both at once: an ETW session
 // already reports reads on volumes that could carry a marker, so running the two
 // together would report every such read twice.
-func (w *EventWatcher) Start(cfg settings.Config, logFile *os.File, mechanism settings.Mechanism) error {
+func (w *EventWatcher) Start(cfg settings.Config, logFile *os.File, mechanism settings.Mechanism, roots []etw.BoundRoot) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.src != nil {
@@ -249,7 +250,7 @@ func (w *EventWatcher) Start(cfg settings.Config, logFile *os.File, mechanism se
 
 	var src source
 	if mechanism == settings.MechanismETW {
-		src = &etwSource{}
+		src = &etwSource{roots: roots}
 		// Directory listings are a separate file-I/O operation, and this consumer
 		// decodes only reads. Rather than leave the setting on and silently never
 		// honour it, it is turned off for the session and reported as unavailable.
@@ -284,13 +285,26 @@ func (w *EventWatcher) Stop() {
 		return
 	}
 	src := w.src
-	w.src = nil
 	stop := w.stop
 	done := w.done
 	w.mu.Unlock()
+
+	// The source is stopped first and guarantees no further deliveries once it
+	// returns. Only then is the worker told to finish, and it drains what is
+	// already queued before it goes - the previous order let the worker take the
+	// stop branch while the last events, and the final gap counters, were still
+	// in the channel.
 	src.Stop()
 	close(stop)
 	<-done
+
+	// Cleared last, so the worker's final gap pass can still read the source's
+	// counters. Clearing it before the stop made the closing NeverNamed,
+	// SessionLost and DrainTimeout figures unreachable at exactly the moment they
+	// were worth recording.
+	w.mu.Lock()
+	w.src = nil
+	w.mu.Unlock()
 }
 
 func (w *EventWatcher) worker(writer *logsink.Writer, src source) {
@@ -316,35 +330,8 @@ func (w *EventWatcher) worker(writer *logsink.Writer, src source) {
 	for {
 		select {
 		case event := <-w.events:
-			if event.PID == w.selfPID || !matchesAnyFolder(event.Path, w.cfg.Folders) {
-				continue
-			}
-			// Before the exclusion filter, which matches on the image path, and on
-			// this goroutine rather than on whatever thread delivered the event.
-			src.Enrich(&event)
-			// Filtered here, in the service, before the event reaches the log or
-			// the pipe: routine background readers can dominate this signal and
-			// should cost neither IPC nor UI work.
-			if settings.Excludes(w.cfg.ExcludedProcesses, event.ProcessPath, event.Process) {
-				w.suppressed.Add(1)
-				continue
-			}
-			attrs, _, _ := procGetFileAttributesW.Call(uintptr(unsafe.Pointer(utf16Ptr(event.Path))))
-			if uint32(attrs) != INVALID_FILE_ATTRIBUTES && uint32(attrs)&FILE_ATTRIBUTE_DIRECTORY != 0 {
-				event.Directory = true
-				if !w.cfg.IncludeDirectories {
-					continue
-				}
-			}
-			if event.Time.IsZero() {
-				event.Time = time.Now().UTC()
-			}
-			if err := writer.Write(event); err != nil && w.onError != nil {
-				w.onError(err)
-			}
-			armFlush()
-			if w.onEvent != nil {
-				w.onEvent(event)
+			if w.handle(writer, src, event) {
+				armFlush()
 			}
 		case <-flushC:
 			w.recordGaps(writer, src, seenLosses)
@@ -360,16 +347,65 @@ func (w *EventWatcher) worker(writer *logsink.Writer, src source) {
 				armFlush()
 			}
 		case <-w.stop:
-			w.recordGaps(writer, src, seenLosses)
 			if flushTimer != nil {
 				flushTimer.Stop()
 			}
+			// Drain what the source already delivered before finishing. The
+			// source has stopped by now, so this cannot run forever, and an event
+			// that arrived a moment before the stop is not less real than one
+			// that arrived a moment after.
+			for {
+				select {
+				case event := <-w.events:
+					w.handle(writer, src, event)
+					continue
+				default:
+				}
+				break
+			}
+			w.recordGaps(writer, src, seenLosses)
 			if err := writer.Flush(); err != nil && w.onError != nil {
 				w.onError(err)
 			}
 			return
 		}
 	}
+}
+
+// handle is everything that happens to one event, in one place, so the ordinary
+// path and the final drain cannot come to differ. It reports whether anything
+// was written, which is what arms the flush.
+func (w *EventWatcher) handle(writer *logsink.Writer, src source, event model.Event) bool {
+	if event.PID == w.selfPID || !matchesAnyFolder(event.Path, w.cfg.Folders) {
+		return false
+	}
+	// Before the exclusion filter, which matches on the image path, and on this
+	// goroutine rather than on whatever thread delivered the event.
+	src.Enrich(&event)
+	// Filtered here, in the service, before the event reaches the log or the
+	// pipe: routine background readers can dominate this signal and should cost
+	// neither IPC nor UI work.
+	if settings.Excludes(w.cfg.ExcludedProcesses, event.ProcessPath, event.Process) {
+		w.suppressed.Add(1)
+		return false
+	}
+	attrs, _, _ := procGetFileAttributesW.Call(uintptr(unsafe.Pointer(utf16Ptr(event.Path))))
+	if uint32(attrs) != INVALID_FILE_ATTRIBUTES && uint32(attrs)&FILE_ATTRIBUTE_DIRECTORY != 0 {
+		event.Directory = true
+		if !w.cfg.IncludeDirectories {
+			return false
+		}
+	}
+	if event.Time.IsZero() {
+		event.Time = time.Now().UTC()
+	}
+	if err := writer.Write(event); err != nil && w.onError != nil {
+		w.onError(err)
+	}
+	if w.onEvent != nil {
+		w.onEvent(event)
+	}
+	return true
 }
 
 // recordGaps writes one record per loss category that has advanced since the

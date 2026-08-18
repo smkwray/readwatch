@@ -5,6 +5,7 @@ package etw
 import (
 	"fmt"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -17,7 +18,8 @@ const SessionName = "ReadWatchFileRead"
 
 type session struct {
 	handle uint64 // TRACEHANDLE from StartTraceW
-	trace  uint64 // TRACEHANDLE from OpenTraceW
+	mu     sync.Mutex
+	trace  uint64 // TRACEHANDLE from OpenTraceW, guarded by mu
 	props  []byte
 	// ready closes once OpenTraceW has succeeded. A rundown asked for before
 	// that is delivered to nobody, and a fixed sleep is not proof of anything.
@@ -80,12 +82,22 @@ func writeLoggerName(buf []byte, offset uint32, name string) {
 // nobody consuming it. Nothing in ETW ties a session's lifetime to its creator,
 // so the only defence is to clear an orphan at every point ReadWatch gets
 // control - service start as well as monitoring start.
-func StopStale() {
-	_ = StopStaleVerified()
-	// The snapshot helper is short-lived, but "short-lived" is a property of the
-	// happy path: if the process died between starting and stopping it, it is
-	// still running. Named separately so clearing one cannot stop the other.
-	stopHelperSession()
+// StopStale clears both of ReadWatch's sessions and confirms each is gone. The
+// helper is short-lived only on the happy path: if the process died between
+// starting and stopping it, it is still running. Named separately so clearing
+// one can never stop the other, and reported so a failure to clean up is visible
+// rather than assumed away.
+func StopStale() error {
+	mainErr := StopStaleVerified()
+	helperErr := stopHelper()
+	switch {
+	case mainErr != nil && helperErr != nil:
+		return fmt.Errorf("%w; and %v", mainErr, helperErr)
+	case mainErr != nil:
+		return mainErr
+	default:
+		return helperErr
+	}
 }
 
 // stopStaleSession names the session explicitly, so it can never stop a session
@@ -130,7 +142,7 @@ func startSession() (*session, error) {
 		uintptr(unsafe.Pointer(&kernelFileProvider)),
 		EVENT_CONTROL_CODE_ENABLE_PROVIDER,
 		TRACE_LEVEL_VERBOSE,
-		uintptr(keywordsLifecycle), 0, 0,
+		uintptr(keywordsLifecycle), 0, enableTimeoutMS,
 		uintptr(unsafe.Pointer(&params)),
 	)
 	if r != ERROR_SUCCESS {
@@ -151,7 +163,7 @@ func (s *session) enableReads() error {
 		uintptr(unsafe.Pointer(&kernelFileProvider)),
 		EVENT_CONTROL_CODE_ENABLE_PROVIDER,
 		TRACE_LEVEL_VERBOSE,
-		uintptr(keywordsFull), 0, 0,
+		uintptr(keywordsFull), 0, enableTimeoutMS,
 		uintptr(unsafe.Pointer(&params)),
 	)
 	if r != ERROR_SUCCESS {
@@ -174,7 +186,7 @@ func (s *session) requestRundown() error {
 		uintptr(unsafe.Pointer(&kernelFileProvider)),
 		EVENT_CONTROL_CODE_CAPTURE_STATE,
 		TRACE_LEVEL_VERBOSE,
-		uintptr(keywordsLifecycle), 0, 0,
+		uintptr(keywordsLifecycle), 0, enableTimeoutMS,
 		uintptr(unsafe.Pointer(&params)),
 	)
 	if r != ERROR_SUCCESS {
@@ -257,15 +269,35 @@ func (s *session) Stop() error {
 // StopStaleVerified clears an orphan and confirms it is gone, rather than firing
 // a stop and assuming. Reported so a failure to clean up is visible instead of
 // silent.
-func StopStaleVerified() error {
-	if r := controlStale(EVENT_TRACE_CONTROL_STOP); r != ERROR_SUCCESS &&
-		r != ERROR_WMI_INSTANCE_NOT_FOUND && r != ERROR_CTX_CLOSE_PENDING {
-		return fmt.Errorf("ControlTrace(stop stale %s): %w", SessionName, syscall.Errno(r))
+func StopStaleVerified() error { return stopVerified(SessionName, controlStale) }
+
+// stopVerified stops a named session and then keeps asking until Windows says it
+// is not there. "Told it to stop" and "it is gone" are different statements, and
+// only the second one is cleanup. The distinctions matter: ERROR_MORE_DATA on a
+// stop still means the session stopped, ERROR_ACTIVE_CONNECTIONS means it is
+// already stopping, and only ERROR_WMI_INSTANCE_NOT_FOUND on a query proves
+// absence - any other query error is unknown, not success.
+func stopVerified(name string, control func(uintptr) uintptr) error {
+	switch r := control(EVENT_TRACE_CONTROL_STOP); r {
+	case ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, ERROR_CTX_CLOSE_PENDING,
+		ERROR_MORE_DATA, ERROR_ACTIVE_CONNECTIONS:
+	default:
+		return fmt.Errorf("ControlTrace(stop %s): %w", name, syscall.Errno(r))
 	}
-	if r := controlStale(EVENT_TRACE_CONTROL_QUERY); r == ERROR_SUCCESS {
-		return fmt.Errorf("an ETW session named %s is still running after being told to stop", SessionName)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		switch r := control(EVENT_TRACE_CONTROL_QUERY); r {
+		case ERROR_WMI_INSTANCE_NOT_FOUND:
+			return nil
+		case ERROR_SUCCESS:
+			if time.Now().After(deadline) {
+				return fmt.Errorf("an ETW session named %s is still running after being told to stop", name)
+			}
+			time.Sleep(25 * time.Millisecond)
+		default:
+			return fmt.Errorf("ControlTrace(query %s): %w", name, syscall.Errno(r))
+		}
 	}
-	return nil
 }
 
 func controlStale(code uintptr) uintptr {
@@ -304,26 +336,49 @@ func (s *session) Lost() (events, realtimeBuffers uint32, known bool) {
 
 // openAndProcess attaches a consumer to the live session and blocks in
 // ProcessTrace until the session stops. The callback runs on ETW's own thread.
-func (s *session) openAndProcess(callback uintptr) error {
+// token is carried in EVENT_TRACE_LOGFILEW.Context and arrives on every record
+// as EVENT_RECORD.UserContext, so a record can be routed to the consumer that
+// asked for it rather than to whichever one is current.
+func (s *session) openAndProcess(callback uintptr, token unsafe.Pointer) error {
 	logfile := EVENT_TRACE_LOGFILEW{
 		LoggerName:       syscall.StringToUTF16Ptr(SessionName),
 		ProcessTraceMode: PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD,
 		EventCallback:    callback,
+		Context:          token,
 	}
 	r, _, _ := procOpenTraceW.Call(uintptr(unsafe.Pointer(&logfile)))
 	if uint64(r) == INVALID_PROCESSTRACE_HANDLE {
 		return fmt.Errorf("OpenTrace failed")
 	}
+	s.mu.Lock()
 	s.trace = uint64(r)
+	s.mu.Unlock()
 	close(s.ready)
-	handles := [1]uint64{s.trace}
+	handles := [1]uint64{uint64(r)}
 	rc, _, _ := procProcessTrace.Call(
 		uintptr(unsafe.Pointer(&handles[0])), 1, 0, 0,
 	)
-	procCloseTrace.Call(uintptr(s.trace))
+	procCloseTrace.Call(r)
+	s.mu.Lock()
 	s.trace = 0
+	s.mu.Unlock()
 	if rc != ERROR_SUCCESS && rc != ERROR_CTX_CLOSE_PENDING {
 		return fmt.Errorf("ProcessTrace: %w", syscall.Errno(rc))
 	}
 	return nil
+}
+
+// closeConsumer asks the consumer to stop, which is what a drain that has run
+// out of patience needs. Microsoft documents that CloseTrace may be called
+// before ProcessTrace returns for a real-time stream, and that
+// ERROR_CTX_CLOSE_PENDING means the call succeeded: no further events will be
+// delivered, and those already queued are processed before ProcessTrace exits.
+func (s *session) closeConsumer() {
+	s.mu.Lock()
+	h := s.trace
+	s.trace = 0
+	s.mu.Unlock()
+	if h != 0 {
+		procCloseTrace.Call(uintptr(h))
+	}
 }

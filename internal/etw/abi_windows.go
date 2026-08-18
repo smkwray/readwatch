@@ -58,9 +58,16 @@ const (
 	keywordsLifecycle = 0xB0  // FILENAME|FILEIO|CREATE - names and handle lifetime
 	keywordsFull      = 0x1F0 // ...|OP_END|READ
 
-	ERROR_SUCCESS           = 0
-	ERROR_ALREADY_EXISTS    = 183
-	ERROR_CTX_CLOSE_PENDING = 7007
+	// enableTimeoutMS makes a provider enable synchronous. With zero, the call
+	// returns before the provider has been configured, so "reads are on" would be
+	// a statement about the request rather than about the session.
+	enableTimeoutMS = 10_000
+
+	ERROR_SUCCESS            = 0
+	ERROR_ALREADY_EXISTS     = 183
+	ERROR_MORE_DATA          = 234
+	ERROR_ACTIVE_CONNECTIONS = 2404
+	ERROR_CTX_CLOSE_PENDING  = 7007
 	// Returned when no session of that name exists, which is the state a stale
 	// cleanup is trying to reach rather than a failure to reach it.
 	ERROR_WMI_INSTANCE_NOT_FOUND = 4201

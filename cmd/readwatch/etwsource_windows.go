@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,6 +24,8 @@ type etwSource struct {
 	// and those two run on different goroutines.
 	mu sync.Mutex
 	w  *etw.Watcher
+	// roots are what the binder proved, carried in rather than re-derived.
+	roots []etw.BoundRoot
 }
 
 func (s *etwSource) watcher() *etw.Watcher {
@@ -35,7 +38,14 @@ func (s *etwSource) Start(cfg settings.Config, selfPID uint32, deliver func(mode
 	// Only what the provider hands over. Naming the process costs two syscalls
 	// and this callback runs on ETW's own thread, where anything slow shows up as
 	// lost events rather than as latency. The rest is filled in by Enrich.
-	w := etw.New(cfg.Folders, selfPID, func(r etw.Read) {
+	roots := s.roots
+	if len(roots) == 0 {
+		// No proven roots were handed over. Resolving the configured paths here
+		// would reintroduce exactly the bind-to-start remapping window the bound
+		// roots exist to close, so this is a refusal rather than a fallback.
+		return fmt.Errorf("no bound watch roots were provided to the tracing source")
+	}
+	w := etw.New(roots, selfPID, func(r etw.Read) {
 		deliver(model.Event{Time: r.Time, Path: r.Path, PID: r.PID})
 	}, onError)
 	if err := w.Start(); err != nil {
@@ -183,10 +193,10 @@ func startedBefore(h uintptr, at time.Time) bool {
 		return false
 	}
 	started := time.Unix(0, (ticks-windowsToUnixEpoch100ns)*100).UTC()
-	// A second of slack: the event clock and the process clock are both system
-	// time, but a read logged at the same instant a process starts should not be
-	// discarded over rounding.
-	return !started.After(at.Add(time.Second))
+	// Fail closed. A process that started after the event cannot have issued it,
+	// and a second of slack is a second in which a reused id names a replacement
+	// process. Equality is still accepted, for clock rounding.
+	return !started.After(at)
 }
 
 func tokenUser(process uintptr) (name, sid string) {

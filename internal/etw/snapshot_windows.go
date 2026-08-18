@@ -155,7 +155,7 @@ func snapshotOpenFiles() (map[uint64]string, error) {
 	<-ready
 	// Stopping it is the whole point: the enumeration of open files is what a
 	// system logger emits on the way down.
-	stopHelperSession()
+	stopErr := stopHelper()
 
 	select {
 	case err := <-done:
@@ -163,8 +163,17 @@ func snapshotOpenFiles() (map[uint64]string, error) {
 			return nil, err
 		}
 	case <-time.After(snapshotTimeout):
-		stopHelperSession()
+		if err := stopHelper(); err != nil {
+			return nil, fmt.Errorf("the filename snapshot did not finish within %s and its session could not be confirmed stopped: %w", snapshotTimeout, err)
+		}
 		return nil, fmt.Errorf("the filename snapshot did not finish within %s", snapshotTimeout)
+	}
+	if stopErr != nil {
+		// The names may be complete, but a helper that will not confirm it has
+		// stopped is a machine-wide logger of unknown status. Refusing the
+		// snapshot is the degraded start; keeping its names while its session may
+		// still be running is not.
+		return nil, stopErr
 	}
 
 	s.mu.Lock()
@@ -182,13 +191,23 @@ func helperProperties() ([]byte, *EVENT_TRACE_PROPERTIES) {
 	return buf, p
 }
 
-func stopHelperSession() {
+// stopHelper stops the helper and confirms it is gone, rather than firing a stop
+// and assuming. The helper is short-lived only on the happy path; if this
+// process died between starting and stopping it, it is still running, and a
+// machine-wide logger nobody is consuming is the thing this package must never
+// leave behind.
+func stopHelper() error { return stopVerified(helperSessionName, controlHelper) }
+
+func stopHelperSession() { _ = stopHelper() }
+
+func controlHelper(code uintptr) uintptr {
 	buf, _ := helperProperties()
 	writeLoggerName(buf, uint32(unsafe.Sizeof(EVENT_TRACE_PROPERTIES{})), helperSessionName)
-	procControlTraceW.Call(
+	r, _, _ := procControlTraceW.Call(
 		0,
 		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(helperSessionName))),
 		uintptr(unsafe.Pointer(&buf[0])),
-		EVENT_TRACE_CONTROL_STOP,
+		code,
 	)
+	return r
 }
