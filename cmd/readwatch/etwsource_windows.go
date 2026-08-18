@@ -58,9 +58,16 @@ func (s *etwSource) Start(cfg settings.Config, selfPID uint32, deliver func(mode
 }
 
 // Enrich names the process behind a read. ETW reports a process id and nothing
-// else about the process, so the image and the user are resolved here - on the
-// pipeline's goroutine, after the folder filter, so the cost is paid only for
-// reads the owner asked about and never for the machine-wide stream.
+// else about it, so the executable is resolved here - on the pipeline's
+// goroutine, after the folder filter, so the cost is paid only for reads the
+// owner asked about and never for the machine-wide stream.
+//
+// User and UserSID are deliberately left empty in this mode. Filling them meant
+// opening the security token of every process that reads a watched file, and
+// what this tool promises is to name the *process*, not the account behind it.
+// That is a real loss - the marker mechanism still reports the user - but
+// reading other processes' tokens is the most surveillance-shaped thing the
+// program did, for the least of what it exists to tell you.
 //
 // Resolved per event rather than cached by pid on purpose. Windows reuses
 // process ids, and a stale cache entry would attribute a read to whatever
@@ -133,7 +140,7 @@ func (s *etwSource) Enrich(e *model.Event) {
 	if e.PID == 0 {
 		return
 	}
-	image, user, sid, ok := processIdentity(e.PID, e.Time)
+	image, ok := processIdentity(e.PID, e.Time)
 	if !ok {
 		// The process could not be proven to be the one that read the file.
 		// Leaving these blank is the honest answer; filling them in from whoever
@@ -146,38 +153,33 @@ func (s *etwSource) Enrich(e *model.Event) {
 	} else {
 		e.Process = image
 	}
-	e.User = user
-	e.UserSID = sid
 }
 
 // processIdentity describes the process behind a read, or refuses to.
 //
-// One handle answers both questions. Opening twice - once for the image, once
-// for the token - can observe two different occupants of the same id, and
-// windows reuses process ids freely. The handle's creation time is then checked
-// against the time of the read: a process that started after the read cannot be
-// the one that made it, which is precisely the reused-id case. Enrichment
-// happens after the deferred sweep, so that gap can be seconds wide.
-func processIdentity(pid uint32, at time.Time) (image, user, sid string, ok bool) {
+// The handle's creation time is checked against the time of the read: a process
+// that started after the read cannot be the one that made it, which is precisely
+// the reused-id case. Enrichment happens after the deferred sweep, so that gap
+// can be seconds wide.
+func processIdentity(pid uint32, at time.Time) (image string, ok bool) {
 	h, _, _ := procOpenProcess.Call(PROCESS_QUERY_LIMITED_INFORMATION, 0, uintptr(pid))
 	if h == 0 {
-		return "", "", "", false
+		return "", false
 	}
 	defer procCloseHandle.Call(h)
 
 	if !startedBefore(h, at) {
-		return "", "", "", false
+		return "", false
 	}
 
 	buf := make([]uint16, 1024)
 	size := uint32(len(buf))
 	if r, _, _ := procQueryFullProcessImageNameW.Call(h, 0,
 		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size))); r == 0 {
-		return "", "", "", false
+		return "", false
 	}
 	image = syscall.UTF16ToString(buf[:size])
-	user, sid = tokenUser(h)
-	return image, user, sid, image != ""
+	return image, image != ""
 }
 
 // startedBefore reports whether this process existed when the read happened. An
@@ -206,48 +208,6 @@ func startedBefore(h uintptr, at time.Time) bool {
 	return !started.After(at)
 }
 
-func tokenUser(process uintptr) (name, sid string) {
-	var token HANDLE
-	if r, _, _ := procOpenProcessToken.Call(process, TOKEN_QUERY, uintptr(unsafe.Pointer(&token))); r == 0 {
-		return "", ""
-	}
-	defer procCloseHandle.Call(uintptr(token))
-
-	var needed uint32
-	procGetTokenInformation.Call(uintptr(token), TokenUser, 0, 0, uintptr(unsafe.Pointer(&needed)))
-	if needed == 0 {
-		return "", ""
-	}
-	buf := make([]byte, needed)
-	if r, _, _ := procGetTokenInformation.Call(uintptr(token), TokenUser,
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(needed), uintptr(unsafe.Pointer(&needed))); r == 0 {
-		return "", ""
-	}
-	tu := (*TOKEN_USER)(unsafe.Pointer(&buf[0]))
-
-	var sidText *uint16
-	if r, _, _ := procConvertSidToStringSidW.Call(tu.User.Sid, uintptr(unsafe.Pointer(&sidText))); r != 0 {
-		sid = syscall.UTF16ToString(unsafe.Slice(sidText, sidLen(sidText)))
-		procLocalFree.Call(uintptr(unsafe.Pointer(sidText)))
-	}
-	return accountNameForSID(tu.User.Sid), sid
-}
-
-// sidLen measures a null-terminated wide string LocalAlloc'd by Windows, so it
-// can be copied into Go memory before being freed.
-func sidLen(p *uint16) int {
-	if p == nil {
-		return 0
-	}
-	n := 0
-	for ; n < 1024; n++ {
-		if *(*uint16)(unsafe.Add(unsafe.Pointer(p), n*2)) == 0 {
-			break
-		}
-	}
-	return n
-}
-
 const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 // processImagePath names the executable behind a process id. A process that has
@@ -255,31 +215,3 @@ const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 // short-lived reader rather than an error to report: the read still happened and
 // is still reported, with the fields that could not be filled left empty rather
 // than guessed at.
-
-// accountNameForSID renders DOMAIN\user. An unresolvable SID is left empty
-// rather than filled with a placeholder: the SID itself is already reported, and
-// inventing a name would be worse than showing none.
-func accountNameForSID(sid uintptr) string {
-	var nameLen, domainLen uint32
-	var use uint32
-	procLookupAccountSidW.Call(0, sid, 0, uintptr(unsafe.Pointer(&nameLen)),
-		0, uintptr(unsafe.Pointer(&domainLen)), uintptr(unsafe.Pointer(&use)))
-	if nameLen == 0 {
-		return ""
-	}
-	name := make([]uint16, nameLen)
-	domain := make([]uint16, domainLen+1)
-	r, _, _ := procLookupAccountSidW.Call(0, sid,
-		uintptr(unsafe.Pointer(&name[0])), uintptr(unsafe.Pointer(&nameLen)),
-		uintptr(unsafe.Pointer(&domain[0])), uintptr(unsafe.Pointer(&domainLen)),
-		uintptr(unsafe.Pointer(&use)))
-	if r == 0 {
-		return ""
-	}
-	d := syscall.UTF16ToString(domain)
-	n := syscall.UTF16ToString(name)
-	if d == "" {
-		return n
-	}
-	return d + `\` + n
-}
