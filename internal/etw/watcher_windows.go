@@ -106,9 +106,11 @@ type Watcher struct {
 	done         chan struct{}
 	consumerDone chan struct{}
 
-	// keep names the paths whose reads are wanted. Everything else on the machine
-	// is decoded and discarded: this provider cannot be filtered by path, so the
-	// consumer sees every read and throws away what it does not want.
+	// roots are the watched folders, each bound to the volume device it resolved
+	// to when monitoring started. Everything else on the machine is decoded and
+	// discarded: this provider cannot be filtered by path, so the consumer sees
+	// every read and throws away what it did not ask for.
+	roots   []watchRoot
 	keep    []string
 	selfPID uint32
 	emit    func(Read)
@@ -123,8 +125,6 @@ type Watcher struct {
 	pending               map[uint64]pendingRead
 	deferred              map[uint64][]pendingRead
 	deferredHeld          int
-	volumes               map[string]string
-	volumesAt             time.Time
 	dropped               atomic.Uint64
 	neverNamed            atomic.Uint64
 	observed              atomic.Uint64
@@ -135,6 +135,7 @@ type Watcher struct {
 	running               atomic.Bool
 	drainTimedOut         atomic.Bool
 	retired               atomic.Uint64
+	unboundRoots          atomic.Uint64
 }
 
 // errAlreadyActive guards the one-per-process rule. ETW's callback is a C
@@ -156,10 +157,71 @@ func New(keep []string, selfPID uint32, emit func(Read), onError func(error)) *W
 	return w
 }
 
+// watchRoot is one watched folder, held as the NT device path the provider
+// actually reports and the drive-letter form the owner recognises.
+//
+// Matching is done on the NT form on purpose. Drive letters are a mutable
+// mapping: converting every event to a letter and comparing text there meant a
+// letter reassigned to a different volume could authorise reads from that new
+// volume under the old watched root, and a lookup that hit a stale entry never
+// even triggered a refresh. The device path is what the folder was bound to, so
+// it cannot drift; the letter is carried alongside purely so the owner sees the
+// path they typed.
+type watchRoot struct {
+	nt      string // \Device\HarddiskVolumeN\Folder, lowercased
+	display string // D:\Folder, as configured
+}
+
+// bindRoots resolves each configured folder to the volume device behind its
+// drive letter. A folder whose letter cannot be resolved is not watched rather
+// than watched by name, and is counted so the gap is visible.
+func (w *Watcher) bindRoots() {
+	var out []watchRoot
+	for _, f := range w.keep {
+		if len(f) < 2 || f[1] != ':' {
+			w.unboundRoots.Add(1)
+			continue
+		}
+		device, ok := deviceForLetter(strings.ToUpper(f[:1]) + ":")
+		if !ok {
+			w.unboundRoots.Add(1)
+			continue
+		}
+		nt := strings.ToLower(strings.TrimRight(device, `\`) + f[2:])
+		out = append(out, watchRoot{nt: nt, display: f})
+	}
+	w.rmu.Lock()
+	w.roots = out
+	w.rmu.Unlock()
+}
+
+// wantedNT matches a provider path against the bound roots and returns the
+// owner-facing path. The display form is rebuilt from the root that matched
+// rather than looked up, so it can never name a volume other than the one the
+// read actually came from.
+func (w *Watcher) wantedNT(ntPath string) (string, bool) {
+	lower := strings.ToLower(ntPath)
+	w.rmu.Lock()
+	roots := w.roots
+	w.rmu.Unlock()
+	for _, r := range roots {
+		if lower == r.nt {
+			return r.display, true
+		}
+		if strings.HasPrefix(lower, r.nt+`\`) {
+			return r.display + ntPath[len(r.nt):], true
+		}
+	}
+	return "", false
+}
+
+// setKeep records the configured folders as the owner wrote them. The case is
+// preserved deliberately: this is now the display form, and matching happens on
+// the lowercased device path built from it.
 func (w *Watcher) setKeep(folders []string) {
 	norm := make([]string, 0, len(folders))
 	for _, f := range folders {
-		f = strings.TrimRight(strings.ToLower(strings.TrimSpace(f)), `\/`)
+		f = strings.TrimRight(strings.TrimSpace(f), `\/`)
 		if f != "" {
 			norm = append(norm, f)
 		}
@@ -218,7 +280,7 @@ func (w *Watcher) Start() error {
 	}
 
 	w.initState()
-	w.refreshVolumes()
+	w.bindRoots()
 
 	// Claimed before the session is created, and by compare-and-swap rather than
 	// a check followed by a store: two watchers sharing one callback would each
@@ -499,27 +561,14 @@ func (w *Watcher) publish(ntPath string, p pendingRead) {
 		return
 	}
 	w.named.Add(1)
-	dos := w.toDOS(ntPath)
-	if dos == "" || !w.wanted(dos) {
+	display, ok := w.wantedNT(ntPath)
+	if !ok {
 		return
 	}
 	w.published.Add(1)
 	if w.emit != nil {
-		w.emit(Read{Path: dos, PID: p.pid, TID: p.tid, Bytes: p.bytes, Time: p.at})
+		w.emit(Read{Path: display, PID: p.pid, TID: p.tid, Bytes: p.bytes, Time: p.at})
 	}
-}
-
-func (w *Watcher) wanted(path string) bool {
-	if len(w.keep) == 0 {
-		return false
-	}
-	lower := strings.ToLower(path)
-	for _, root := range w.keep {
-		if lower == root || strings.HasPrefix(lower, root+`\`) {
-			return true
-		}
-	}
-	return false
 }
 
 func (w *Watcher) report(err error) {
@@ -637,82 +686,28 @@ func onEvent(rec *EVENT_RECORD) uintptr {
 	return 0
 }
 
-// toDOS turns \Device\HarddiskVolumeN\path into X:\path. A read whose device
-// has no drive letter is not discardable silently — it is returned empty and the
-// caller drops it, which is counted by the folder filter rather than hidden.
-func (w *Watcher) toDOS(nt string) string {
-	if nt == "" {
-		return ""
+// deviceForLetter resolves a drive letter to the volume device the provider
+// names in its events. Called once per watched folder when monitoring starts,
+// so the binding is fixed for the session: a letter reassigned afterwards
+// cannot silently move a watched root onto a different volume.
+func deviceForLetter(letter string) (string, bool) {
+	buf := make([]uint16, 1024)
+	n, _, _ := procQueryDosDeviceW.Call(
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(letter))),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	if n == 0 {
+		return "", false
 	}
-	if len(nt) > 1 && nt[1] == ':' {
-		return nt
+	device := syscall.UTF16ToString(buf)
+	if device == "" {
+		return "", false
 	}
-	w.rmu.Lock()
-	stale := time.Since(w.volumesAt) > 30*time.Second
-	vols := w.volumes
-	w.rmu.Unlock()
-
-	if dos, ok := matchVolume(vols, nt); ok {
-		return dos
-	}
-	if !stale {
-		return ""
-	}
-	// A drive letter may have appeared since the map was built — a removable
-	// volume arriving is the ordinary case — so a miss on a stale map is worth
-	// one rebuild before the read is given up on.
-	w.refreshVolumes()
-	w.rmu.Lock()
-	vols = w.volumes
-	w.rmu.Unlock()
-	dos, _ := matchVolume(vols, nt)
-	return dos
-}
-
-func matchVolume(vols map[string]string, nt string) (string, bool) {
-	for device, letter := range vols {
-		if strings.EqualFold(nt, device) {
-			return letter, true
-		}
-		if len(nt) > len(device) && nt[len(device)] == '\\' &&
-			strings.EqualFold(nt[:len(device)], device) {
-			return letter + nt[len(device):], true
-		}
-	}
-	return "", false
+	return device, true
 }
 
 var (
-	kernel32             = syscall.NewLazyDLL("kernel32.dll")
-	procQueryDosDeviceW  = kernel32.NewProc("QueryDosDeviceW")
-	procGetLogicalDrives = kernel32.NewProc("GetLogicalDrives")
+	kernel32            = syscall.NewLazyDLL("kernel32.dll")
+	procQueryDosDeviceW = kernel32.NewProc("QueryDosDeviceW")
 )
-
-// refreshVolumes maps \Device\... to drive letters. Rebuilt rather than cached
-// forever because a removable volume arriving changes the answer.
-func (w *Watcher) refreshVolumes() {
-	mask, _, _ := procGetLogicalDrives.Call()
-	vols := make(map[string]string, 26)
-	buf := make([]uint16, 1024)
-	for i := 0; i < 26; i++ {
-		if mask&(1<<uint(i)) == 0 {
-			continue
-		}
-		letter := string(rune('A'+i)) + ":"
-		n, _, _ := procQueryDosDeviceW.Call(
-			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(letter))),
-			uintptr(unsafe.Pointer(&buf[0])),
-			uintptr(len(buf)),
-		)
-		if n == 0 {
-			continue
-		}
-		if device := syscall.UTF16ToString(buf); device != "" {
-			vols[device] = letter
-		}
-	}
-	w.rmu.Lock()
-	w.volumes = vols
-	w.volumesAt = time.Now()
-	w.rmu.Unlock()
-}

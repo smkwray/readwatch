@@ -4,6 +4,7 @@ package etw
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -107,72 +108,76 @@ func TestDecodeFileIoNameCarriesTheJoinKey(t *testing.T) {
 	}
 }
 
-func TestMatchVolume(t *testing.T) {
-	vols := map[string]string{
-		`\Device\HarddiskVolume1`:  "C:",
-		`\Device\HarddiskVolume11`: "D:",
+func TestWantedNTMatchesTheBoundVolumeNotADriveLetter(t *testing.T) {
+	// Authorization is on the device the folder was bound to. A drive letter is a
+	// mutable mapping, so matching on the letter let a letter reassigned to
+	// another volume authorise reads the owner never asked for.
+	w := New(nil, 0, nil, nil)
+	w.roots = []watchRoot{
+		{nt: `\device\harddiskvolume1\watched`, display: `C:\Watched`},
+		{nt: `\device\harddiskvolume11\stick`, display: `D:\Stick`},
 	}
 	cases := []struct {
 		nt   string
 		want string
 	}{
-		{`\Device\HarddiskVolume1\a\b.txt`, `C:\a\b.txt`},
-		{`\Device\HarddiskVolume11\a.txt`, `D:\a.txt`},
-		{`\Device\HarddiskVolume1`, "C:"},
-		// A volume number that merely starts with another's must not be captured
-		// by it: HarddiskVolume11 is not inside HarddiskVolume1.
-		{`\Device\HarddiskVolume111\a.txt`, ""},
-		{`\Device\Mup\server\share\a.txt`, ""},
-		// Windows is case-insensitive here and the provider's casing is not
-		// guaranteed to match QueryDosDevice's.
-		{`\device\harddiskvolume1\A.TXT`, `C:\A.TXT`},
+		{`\Device\HarddiskVolume1\Watched\a.txt`, `C:\Watched\a.txt`},
+		{`\Device\HarddiskVolume1\Watched`, `C:\Watched`},
+		{`\Device\HarddiskVolume11\Stick\b.txt`, `D:\Stick\b.txt`},
+		// A different volume whose device name merely starts the same way.
+		{`\Device\HarddiskVolume111\Watched\a.txt`, ""},
+		// The right volume, a folder that is not watched.
+		{`\Device\HarddiskVolume1\Elsewhere\a.txt`, ""},
+		// A sibling whose name merely starts with the watched root's.
+		{`\Device\HarddiskVolume1\WatchedElsewhere\a.txt`, ""},
 	}
 	for _, c := range cases {
-		got, _ := matchVolume(vols, c.nt)
-		if got != c.want {
-			t.Errorf("matchVolume(%q) = %q, want %q", c.nt, got, c.want)
+		got, ok := w.wantedNT(c.nt)
+		if c.want == "" {
+			if ok {
+				t.Errorf("wantedNT(%q) matched as %q, want no match", c.nt, got)
+			}
+			continue
+		}
+		if !ok || got != c.want {
+			t.Errorf("wantedNT(%q) = %q,%v want %q,true", c.nt, got, ok, c.want)
 		}
 	}
 }
 
-func TestWantedRejectsSiblingPrefix(t *testing.T) {
-	w := New([]string{`C:\Watched`, `D:\`}, 0, nil, nil)
-	cases := []struct {
-		path string
-		want bool
-	}{
-		{`C:\Watched\a.txt`, true},
-		{`C:\Watched`, true},
-		{`c:\watched\SUB\a.txt`, true},
-		// The reason this test exists: a prefix match without the separator would
-		// report reads of an unwatched folder as if the owner had asked for them.
-		{`C:\WatchedElsewhere\a.txt`, false},
-		{`C:\Other\a.txt`, false},
-		{`D:\anything\a.txt`, true},
-	}
-	for _, c := range cases {
-		if got := w.wanted(c.path); got != c.want {
-			t.Errorf("wanted(%q) = %v, want %v", c.path, got, c.want)
-		}
-	}
-}
-
-func TestWantedWithNoFoldersEmitsNothing(t *testing.T) {
+func TestDisplayPathComesFromTheRootThatMatched(t *testing.T) {
+	// Rebuilt from the root that matched rather than looked up, so the reported
+	// path can never name a volume other than the one the read came from.
 	w := New(nil, 0, nil, nil)
-	if w.wanted(`C:\anything`) {
-		t.Fatal("an empty watch list matched a path; it must match nothing")
+	w.roots = []watchRoot{{nt: `\device\harddiskvolume9\photos`, display: `X:\Photos`}}
+	got, ok := w.wantedNT(`\Device\HarddiskVolume9\Photos\sub\IMG.jpg`)
+	if !ok || got != `X:\Photos\sub\IMG.jpg` {
+		t.Fatalf("got %q,%v", got, ok)
 	}
 }
 
-// newTestWatcher builds a watcher with correlation state and a fixed volume map,
-// so the parking and sweep path can be exercised without opening a session.
+func TestNoWatchedRootsMatchesNothing(t *testing.T) {
+	// A watcher with nothing bound must publish nothing, rather than treating an
+	// empty root list as "everything".
+	w := New(nil, 0, nil, nil)
+	if _, ok := w.wantedNT(`\Device\HarddiskVolume1nything.txt`); ok {
+		t.Fatal("an empty root list matched a path; it must match nothing")
+	}
+}
+
 func newTestWatcher(t *testing.T, keep []string, emit func(Read)) *Watcher {
 	t.Helper()
 	w := New(keep, 0, emit, nil)
 	w.initState()
 	w.rmu.Lock()
-	w.volumes = map[string]string{`\Device\HarddiskVolume3`: "C:"}
-	w.volumesAt = time.Now()
+	for _, k := range w.keep {
+		if len(k) > 2 && k[1] == ':' {
+			w.roots = append(w.roots, watchRoot{
+				nt:      `\device\harddiskvolume3` + strings.ToLower(k[2:]),
+				display: k,
+			})
+		}
+	}
 	w.rmu.Unlock()
 	return w
 }
