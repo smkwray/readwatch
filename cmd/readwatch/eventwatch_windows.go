@@ -155,6 +155,18 @@ type EventWatcher struct {
 	onError    func(error)
 	dropped    atomic.Uint64
 	suppressed atomic.Uint64
+	// dirListingUnavailable records that the owner asked for directory listings
+	// and this mechanism cannot supply them. Reported rather than ignored.
+	dirListingUnavailable bool
+}
+
+// DirectoryListingUnavailable reports a setting the running mechanism cannot
+// honour. Silently dropping it would leave the owner believing they were being
+// shown something they were not.
+func (w *EventWatcher) DirectoryListingUnavailable() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dirListingUnavailable
 }
 
 func NewEventWatcher(onEvent func(model.Event), onError func(error)) *EventWatcher {
@@ -227,6 +239,13 @@ func (w *EventWatcher) Start(cfg settings.Config, logFile *os.File, mechanism se
 	var src source
 	if mechanism == settings.MechanismETW {
 		src = &etwSource{}
+		// Directory listings are a separate file-I/O operation, and this consumer
+		// decodes only reads. Rather than leave the setting on and silently never
+		// honour it, it is turned off for the session and reported as unavailable.
+		// Implementing it needs the enumeration event's layout verified against a
+		// real capture, which has not been done.
+		w.cfg.IncludeDirectories = false
+		w.dirListingUnavailable = mechanism == settings.MechanismETW && cfg.IncludeDirectories
 	} else {
 		src = &saclSource{}
 	}

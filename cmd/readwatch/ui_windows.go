@@ -852,6 +852,8 @@ func (u *AppUI) updateStatus() {
 		// folders are counted in the summary and deliberately kept out of here: a
 		// warning that nothing can clear stops being read as a warning.
 		setWindowText(u.status, "⚠  "+refused.Path+" — "+refused.Detail)
+	} else if state.DirListingUnavailable && idle {
+		setWindowText(u.status, "●  Event tracing cannot report folder listings; that setting is off for now")
 	} else if state.MechanismOverridden && idle {
 		// Running something other than what was asked for is worth the status
 		// line once. It is not a fault - monitoring is working - so it sits below

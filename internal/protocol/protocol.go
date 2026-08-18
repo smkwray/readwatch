@@ -121,6 +121,9 @@ type State struct {
 	// owner asked for markers and could not have them.
 	MechanismReason     string `json:"mechanism_reason,omitempty"`
 	MechanismOverridden bool   `json:"mechanism_overridden,omitempty"`
+	// DirListingUnavailable is set when the owner asked for directory listings
+	// and the running mechanism cannot produce them.
+	DirListingUnavailable bool `json:"dir_listing_unavailable,omitempty"`
 }
 
 // Counts summarises the folder states for the status line.

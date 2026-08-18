@@ -240,9 +240,11 @@ func (e *ServiceEngine) CurrentState() protocol.State {
 		Mechanism:           string(mechanism.Use),
 		MechanismReason:     mechanism.Reason,
 		MechanismOverridden: mechanism.Overridden,
-		ServiceReady:        ready,
-		Folders:             folders,
-		PendingRules:        pending,
+
+		DirListingUnavailable: e.watcher.DirectoryListingUnavailable(),
+		ServiceReady:          ready,
+		Folders:               folders,
+		PendingRules:          pending,
 	}
 }
 
