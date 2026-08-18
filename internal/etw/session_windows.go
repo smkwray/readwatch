@@ -80,7 +80,13 @@ func writeLoggerName(buf []byte, offset uint32, name string) {
 // nobody consuming it. Nothing in ETW ties a session's lifetime to its creator,
 // so the only defence is to clear an orphan at every point ReadWatch gets
 // control - service start as well as monitoring start.
-func StopStale() { _ = StopStaleVerified() }
+func StopStale() {
+	_ = StopStaleVerified()
+	// The snapshot helper is short-lived, but "short-lived" is a property of the
+	// happy path: if the process died between starting and stopping it, it is
+	// still running. Named separately so clearing one cannot stop the other.
+	stopHelperSession()
+}
 
 // stopStaleSession names the session explicitly, so it can never stop a session
 // belonging to anything else.
@@ -124,7 +130,7 @@ func startSession() (*session, error) {
 		uintptr(unsafe.Pointer(&kernelFileProvider)),
 		EVENT_CONTROL_CODE_ENABLE_PROVIDER,
 		TRACE_LEVEL_VERBOSE,
-		uintptr(keywordsAny), 0, 0,
+		uintptr(keywordsLifecycle), 0, 0,
 		uintptr(unsafe.Pointer(&params)),
 	)
 	if r != ERROR_SUCCESS {
@@ -132,6 +138,26 @@ func startSession() (*session, error) {
 		return nil, fmt.Errorf("EnableTraceEx2(enable): %w", syscall.Errno(r))
 	}
 	return s, nil
+}
+
+// enableReads turns on the read keywords once the startup snapshot is in place.
+// Until this is called the session sees handle lifetime and filenames but no
+// reads, which is what keeps the naming queue from filling with reads nothing
+// can name yet.
+func (s *session) enableReads() error {
+	params := ENABLE_TRACE_PARAMETERS{Version: 2}
+	r, _, _ := procEnableTraceEx2.Call(
+		uintptr(s.handle),
+		uintptr(unsafe.Pointer(&kernelFileProvider)),
+		EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+		TRACE_LEVEL_VERBOSE,
+		uintptr(keywordsFull), 0, 0,
+		uintptr(unsafe.Pointer(&params)),
+	)
+	if r != ERROR_SUCCESS {
+		return fmt.Errorf("EnableTraceEx2(enable reads): %w", syscall.Errno(r))
+	}
+	return nil
 }
 
 // requestRundown asks both providers to describe what they already know: the
@@ -148,7 +174,7 @@ func (s *session) requestRundown() error {
 		uintptr(unsafe.Pointer(&kernelFileProvider)),
 		EVENT_CONTROL_CODE_CAPTURE_STATE,
 		TRACE_LEVEL_VERBOSE,
-		uintptr(keywordsAny), 0, 0,
+		uintptr(keywordsLifecycle), 0, 0,
 		uintptr(unsafe.Pointer(&params)),
 	)
 	if r != ERROR_SUCCESS {

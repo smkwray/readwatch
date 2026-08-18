@@ -50,6 +50,14 @@ const (
 
 	TRACE_LEVEL_VERBOSE = 5
 
+	// Two keyword sets, because the session comes up in two stages. Reads are not
+	// enabled until the startup filename snapshot has been taken: enabling them
+	// first means every read on a handle that predates the session arrives with no
+	// name and has to be parked, and a machine at rest produces tens of thousands
+	// of those a second.
+	keywordsLifecycle = 0xB0  // FILENAME|FILEIO|CREATE - names and handle lifetime
+	keywordsFull      = 0x1F0 // ...|OP_END|READ
+
 	ERROR_SUCCESS           = 0
 	ERROR_ALREADY_EXISTS    = 183
 	ERROR_CTX_CLOSE_PENDING = 7007

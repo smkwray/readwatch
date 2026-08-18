@@ -350,3 +350,103 @@ func openUnbuffered(path string) (syscall.Handle, error) {
 		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE, nil,
 		syscall.OPEN_EXISTING, fileFlagNoBuffering, 0)
 }
+
+// TestLiveStartupSnapshotNamesLive is the whole point of the helper session: a
+// handle that was already open when monitoring began must be named while
+// monitoring is still running, not when it stops. Without the snapshot the
+// directed rundown answers only at teardown, so a monitor left running for hours
+// never names its longest-lived readers.
+func TestLiveStartupSnapshotNamesLive(t *testing.T) {
+	if os.Getenv("READWATCH_ETW_LIVE") != "1" {
+		t.Skip("set READWATCH_ETW_LIVE=1 and run elevated to exercise a real session")
+	}
+	dir := `C:\ReadWatch-Test`
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Skipf("cannot use %s: %v", dir, err)
+	}
+	target := filepath.Join(dir, "live-snapshot-check.txt")
+	if err := os.WriteFile(target, make([]byte, 512*1024), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	defer os.Remove(target)
+
+	// Open before the watcher exists, and never reopen.
+	h, err := openUnbuffered(target)
+	if err != nil {
+		t.Fatalf("pre-open: %v", err)
+	}
+	defer syscall.CloseHandle(h)
+
+	var mu sync.Mutex
+	var seen []Read
+	w := New([]string{dir}, 0, func(r Read) {
+		mu.Lock()
+		seen = append(seen, r)
+		mu.Unlock()
+	}, func(err error) { t.Logf("watcher reported: %v", err) })
+
+	startedAt := time.Now()
+	if err := w.Start(); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	stopped := false
+	defer func() {
+		if !stopped {
+			w.Stop()
+		}
+	}()
+	c := w.Counters()
+	t.Logf("startup took %s; snapshot named %d files, discarded %d as already closed, failed=%v",
+		time.Since(startedAt).Round(time.Millisecond), c.SnapshotNames, c.SnapshotStale, c.SnapshotFailed)
+	if c.SnapshotFailed {
+		t.Skip("the startup snapshot could not be taken on this run; nothing to assert")
+	}
+	if c.SnapshotNames == 0 {
+		t.Fatal("the startup snapshot named nothing at all")
+	}
+
+	buf := make([]byte, 2*sectorAlign)
+	off := (sectorAlign - int(uintptr(unsafe.Pointer(&buf[0]))%uintptr(sectorAlign))) % sectorAlign
+	page := buf[off : off+sectorAlign]
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for i := 0; i < 20; i++ {
+			if _, err := syscall.Seek(h, int64(i)*3*sectorAlign, 0); err != nil {
+				t.Fatalf("seek: %v", err)
+			}
+			var moved uint32
+			if err := syscall.ReadFile(h, page, &moved, nil); err != nil && err != syscall.ERROR_HANDLE_EOF {
+				t.Fatalf("read: %v", err)
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+	}
+
+	// Read BEFORE stopping. If this only worked at teardown the count would be
+	// zero here and the whole exercise would have changed nothing.
+	mu.Lock()
+	live := append([]Read(nil), seen...)
+	mu.Unlock()
+
+	var matched int
+	for _, r := range live {
+		if strings.EqualFold(r.Path, target) {
+			matched++
+		}
+	}
+	c = w.Counters()
+	t.Logf("while still running: %d reads published, %d of them the pre-opened file; counters %+v",
+		len(live), matched, c)
+	w.Stop()
+	stopped = true
+
+	if matched == 0 {
+		t.Fatalf("the pre-opened handle was not named while monitoring ran; the snapshot did not do its job. counters %+v", c)
+	}
+}
