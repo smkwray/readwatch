@@ -82,6 +82,14 @@ func onSnapshotEvent(rec *EVENT_RECORD) uintptr {
 	return 0
 }
 
+// takeSnapshot is the seam the degraded path is tested through. Windows allows a
+// limited number of system loggers, so a machine already running several can
+// refuse this one, and that has to be a reported degradation rather than a
+// refusal to monitor. Forcing slot exhaustion on demand is not practical, so the
+// failure is injected here instead - the handling is what needs proving, not
+// Windows' ability to run out of slots.
+var takeSnapshot = snapshotOpenFiles
+
 // snapshotOpenFiles starts a helper system logger, stops it at once, drains its
 // teardown enumeration, and returns what it named, keyed by FileKey.
 //

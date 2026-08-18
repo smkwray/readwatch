@@ -436,3 +436,82 @@ func TestIRPCollisionsAreCounted(t *testing.T) {
 		t.Fatalf("collisions counted %d, want 1 — quarantining silently hides a real loss", w.collisions.Load())
 	}
 }
+
+func TestAFailedStartupSnapshotDegradesRatherThanRefuses(t *testing.T) {
+	// Windows allows a limited number of system loggers, so a busy machine can
+	// refuse the helper. Monitoring must still start: reads on handles opened
+	// from that point resolve normally, and only the already-open ones are
+	// affected. Refusing to monitor at all would be a worse answer than a
+	// reported gap in coverage.
+	w := New([]string{`C:\Watched`}, 0, nil, nil)
+	w.initState()
+	w.retiredDuringInit = map[uint64]bool{}
+
+	// The failure path, without a session: merge is skipped and the flag is set.
+	w.snapshotFailed.Store(true)
+	c := w.Counters()
+	if !c.SnapshotFailed {
+		t.Fatal("a failed snapshot was not reported")
+	}
+	if c.SnapshotNames != 0 {
+		t.Fatalf("a failed snapshot reported %d names", c.SnapshotNames)
+	}
+	// And naming from the live stream still works, which is the whole reason a
+	// failure here is a degradation rather than a stop.
+	w.learn(&w.byObjCur, 0x1234, `\Device\HarddiskVolume3\Watched\after.txt`)
+	if _, ok := w.lookup(0x1234, 0); !ok {
+		t.Fatal("a name learned after a failed snapshot did not resolve")
+	}
+}
+
+func TestSnapshotNamesAreRejectedIfTheIdentityClosedWhileCollecting(t *testing.T) {
+	// The race the fence exists for: a handle closes during collection, its key
+	// is reused, and a snapshot name taken before the close lands on the new
+	// file. Observed once for real in a live run, so this pins it.
+	w := New([]string{`C:\Watched`}, 0, nil, nil)
+	w.initState()
+	w.retiredDuringInit = map[uint64]bool{}
+
+	const closed, live = uint64(0xC105ED), uint64(0x11FE)
+	// The main session sees this identity close while the snapshot is collected.
+	w.forget(&w.byObjCur, &w.byObjPrev, closed)
+
+	w.mergeSnapshot(map[uint64]string{
+		closed: `\Device\HarddiskVolume3\Watched\stale.txt`,
+		live:   `\Device\HarddiskVolume3\Watched\good.txt`,
+	})
+
+	if name, ok := w.lookup(0, closed); ok {
+		t.Fatalf("a name for an identity that closed during collection was merged as %q", name)
+	}
+	if _, ok := w.lookup(0, live); !ok {
+		t.Fatal("a name for an untouched identity was discarded")
+	}
+	c := w.Counters()
+	if c.SnapshotStale != 1 {
+		t.Errorf("stale names counted %d, want 1 — a discarded name is a real gap in coverage", c.SnapshotStale)
+	}
+	if c.SnapshotNames != 1 {
+		t.Errorf("merged names counted %d, want 1", c.SnapshotNames)
+	}
+}
+
+func TestTheLiveStreamOutranksTheStartupSnapshot(t *testing.T) {
+	// If the session already named an identity, that is newer than a snapshot
+	// taken during startup and must not be overwritten by it.
+	w := New([]string{`C:\Watched`}, 0, nil, nil)
+	w.initState()
+	w.retiredDuringInit = map[uint64]bool{}
+
+	const key = 0xFEED
+	w.learn(&w.byKeyCur, key, `\Device\HarddiskVolume3\Watched\current.txt`)
+	w.mergeSnapshot(map[uint64]string{key: `\Device\HarddiskVolume3\Watched\older.txt`})
+
+	name, ok := w.lookup(0, key)
+	if !ok {
+		t.Fatal("the name went missing")
+	}
+	if name != `\Device\HarddiskVolume3\Watched\current.txt` {
+		t.Fatalf("the snapshot overwrote a newer live name with %q", name)
+	}
+}
