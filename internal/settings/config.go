@@ -52,12 +52,20 @@ func (id ObjectIdentity) VolumeOnly() bool {
 
 // Key identifies a snapshot by the object it describes rather than by a path
 // that can be pointed somewhere else.
+//
+// It deliberately does not include the volume serial or the 64-bit index, even
+// though Equal compares both. Widening it would change the key of every audit
+// record already on disk, stranding the cleanup records for rules ReadWatch has
+// applied - the one class of state that must never become unfindable. Changing
+// it needs an explicit migration that rewrites those records, not a quiet
+// redefinition.
 func (id ObjectIdentity) Key() string {
 	return fmt.Sprintf("%s|%x|%d", strings.ToLower(id.VolumeGUID), id.FileID128, id.CreationTime)
 }
 
 func (id ObjectIdentity) Equal(other ObjectIdentity) bool {
 	return strings.EqualFold(id.VolumeGUID, other.VolumeGUID) &&
+		strings.EqualFold(id.FileSystem, other.FileSystem) &&
 		id.VolumeSerial == other.VolumeSerial &&
 		id.FileID128 == other.FileID128 &&
 		id.FileIndex64 == other.FileIndex64 &&

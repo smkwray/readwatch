@@ -80,3 +80,19 @@ func TestObjectIdentityKeyAndEquality(t *testing.T) {
 		t.Fatal("Zero did not distinguish an unbound identity")
 	}
 }
+
+func TestEqualComparesTheFilesystemToo(t *testing.T) {
+	// A volume-only identity carries the filesystem as part of what it knows. If
+	// the same GUID and serial came back describing a different filesystem, that
+	// is a different volume, not the one that was authorised.
+	base := ObjectIdentity{VolumeGUID: `\?\Volume{a}\`, VolumeSerial: 7, FileSystem: "exFAT"}
+	same := base
+	if !base.Equal(same) {
+		t.Fatal("an identical identity did not compare equal")
+	}
+	other := base
+	other.FileSystem = "NTFS"
+	if base.Equal(other) {
+		t.Fatal("identities differing only by filesystem compared equal")
+	}
+}
