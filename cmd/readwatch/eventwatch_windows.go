@@ -43,6 +43,10 @@ type source interface {
 	// than absorbed: a monitor that quietly misses reads is worse than one that
 	// says how many it missed.
 	Dropped() uint64
+	// Losses breaks that total into named categories, so the log can record what
+	// kind of gap occurred rather than only that one did. Categories with a zero
+	// count may be omitted.
+	Losses() map[string]uint64
 }
 
 var (
@@ -140,6 +144,13 @@ func (s *saclSource) Dropped() uint64 { return s.dropped.Load() }
 // Enrich has nothing to do: event 4663 already carries the process, its image
 // path and the user.
 func (s *saclSource) Enrich(*model.Event) {}
+
+func (s *saclSource) Losses() map[string]uint64 {
+	if n := s.dropped.Load(); n > 0 {
+		return map[string]uint64{"security-log events the consumer could not keep up with": n}
+	}
+	return nil
+}
 
 // EventWatcher is the pipeline every mechanism feeds: it decides what is
 // reported, writes the log and drives the live feed.
@@ -285,6 +296,9 @@ func (w *EventWatcher) Stop() {
 func (w *EventWatcher) worker(writer *logsink.Writer, src source) {
 	defer close(w.done)
 	defer writer.Close()
+	gapTicker := time.NewTicker(5 * time.Second)
+	defer gapTicker.Stop()
+	seenLosses := map[string]uint64{}
 	var flushTimer *time.Timer
 	var flushC <-chan time.Time
 	armFlush := func() {
@@ -333,11 +347,20 @@ func (w *EventWatcher) worker(writer *logsink.Writer, src source) {
 				w.onEvent(event)
 			}
 		case <-flushC:
+			w.recordGaps(writer, src, seenLosses)
 			if err := writer.Flush(); err != nil && w.onError != nil {
 				w.onError(err)
 			}
 			flushC = nil
+		case <-gapTicker.C:
+			// A gap has to reach the log even when nothing else is being written -
+			// a silent stretch is exactly when one is most likely and least
+			// visible.
+			if w.recordGaps(writer, src, seenLosses) {
+				armFlush()
+			}
 		case <-w.stop:
+			w.recordGaps(writer, src, seenLosses)
 			if flushTimer != nil {
 				flushTimer.Stop()
 			}
@@ -347,6 +370,33 @@ func (w *EventWatcher) worker(writer *logsink.Writer, src source) {
 			return
 		}
 	}
+}
+
+// recordGaps writes one record per loss category that has advanced since the
+// last check. Counters are cumulative, so only the delta is reported and the
+// running total is remembered - a category that stops advancing stops being
+// mentioned rather than repeating itself every few seconds.
+func (w *EventWatcher) recordGaps(writer *logsink.Writer, src source, seen map[string]uint64) bool {
+	wrote := false
+	for category, total := range src.Losses() {
+		delta := total - seen[category]
+		if total < seen[category] {
+			// The mechanism restarted and zeroed its counters.
+			delta = total
+		}
+		if delta == 0 {
+			continue
+		}
+		seen[category] = total
+		if err := writer.WriteGap(time.Now().UTC(), category, delta, ""); err != nil {
+			if w.onError != nil {
+				w.onError(err)
+			}
+			continue
+		}
+		wrote = true
+	}
+	return wrote
 }
 
 func matchesAnyFolder(path string, folders []string) bool {

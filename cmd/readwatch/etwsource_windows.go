@@ -83,6 +83,34 @@ func (s *etwSource) Dropped() uint64 {
 	return c.Dropped + c.NeverNamed + c.SessionLost
 }
 
+// Losses names each way a read failed to reach the log. They are kept apart
+// because they have different causes and different fixes: a session that lost
+// buffers is not the same problem as a correlation that could not name a file.
+func (s *etwSource) Losses() map[string]uint64 {
+	w := s.watcher()
+	if w == nil {
+		return nil
+	}
+	c := w.Counters()
+	out := map[string]uint64{}
+	add := func(name string, n uint64) {
+		if n > 0 {
+			out[name] = n
+		}
+	}
+	add("events the trace session dropped", c.SessionLost)
+	add("trace buffers lost", c.BuffersLost)
+	add("reads the consumer could not keep up with", c.Dropped)
+	add("reads whose file could not be named", c.NeverNamed)
+	add("reads whose completion never arrived", c.Expired)
+	add("operations sharing a reused identifier", c.Collisions)
+	add("watched folders whose volume could not be resolved", c.UnboundRoots)
+	if c.DrainTimeout {
+		add("teardown stopped waiting for the trace to finish", 1)
+	}
+	return out
+}
+
 func (s *etwSource) Enrich(e *model.Event) {
 	if e.PID == 0 {
 		return

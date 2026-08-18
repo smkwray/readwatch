@@ -76,6 +76,54 @@ func (w *Writer) Write(e model.Event) error {
 	return err
 }
 
+// WriteGap records that reads were missed, and why. A log that simply stops
+// mentioning a folder is indistinguishable from a quiet folder, which is the
+// one confusion this tool cannot afford: the reader who matters most is the one
+// whose reads went unrecorded. Each category is written separately because they
+// have different causes - a session that dropped buffers is not the same problem
+// as a correlation that could not name a file.
+func (w *Writer) WriteGap(at time.Time, category string, count uint64, detail string) error {
+	if w == nil {
+		return nil
+	}
+	var err error
+	switch w.format {
+	case JSONL:
+		var b []byte
+		b, err = json.Marshal(struct {
+			Time     time.Time `json:"time"`
+			Gap      string    `json:"gap"`
+			Count    uint64    `json:"count"`
+			Detail   string    `json:"detail,omitempty"`
+			Category string    `json:"category"`
+		}{at, "reads were not recorded", count, detail, category})
+		if err == nil {
+			_, err = w.buf.Write(append(b, '\n'))
+		}
+	case CSV:
+		err = w.csv.Write([]string{
+			at.Local().Format(time.RFC3339Nano), "GAP", category,
+			strconv.FormatUint(count, 10), "", detail, "", "0", "0x0",
+		})
+	case Text:
+		fallthrough
+	default:
+		_, err = fmt.Fprintf(w.buf, "%s | GAP  | %-24s | %d read(s) not recorded%s\n",
+			at.Local().Format("2006-01-02 15:04:05.000"), clean(category), count, gapDetail(detail))
+	}
+	if err == nil {
+		w.dirty = true
+	}
+	return err
+}
+
+func gapDetail(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return " | " + clean(detail)
+}
+
 func (w *Writer) Dirty() bool { return w != nil && w.dirty }
 
 func (w *Writer) Flush() error {
