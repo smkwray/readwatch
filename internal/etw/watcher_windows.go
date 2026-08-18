@@ -525,8 +525,15 @@ func (w *Watcher) lookup(obj, key uint64) (string, bool) {
 		w.byObjCur[obj] = n
 		return n, true
 	}
-	// The rundown's value is matched against FileKey, which is what classic
-	// FileIo documents it as and what a qualification run confirmed exactly.
+	// The rundown's value is matched against FileKey only. Classic FileIo names
+	// its field "FileObject", but Microsoft's own instrumentation notes say that
+	// field is a file *key*; the two are both pointer-shaped and are not
+	// interchangeable. A second arm matching it against a read's FileObject was
+	// tried and removed: the live teardown test publishes all 240 reads of a
+	// pre-opened handle without it, so it bought nothing, and Cleanup/Close
+	// retires only byObj - so a stale byRun entry at a reused file-object address
+	// could have outlived the very event that makes the address reusable and named
+	// the wrong file.
 	if n, ok := w.byKeyCur[key]; ok {
 		return n, true
 	}
@@ -539,20 +546,6 @@ func (w *Watcher) lookup(obj, key uint64) (string, bool) {
 	}
 	if n, ok := w.byRunPrev[key]; ok {
 		w.byRunCur[key] = n
-		return n, true
-	}
-	// And against FileObject. The rundown's value is a FILE_OBJECT pointer, and
-	// so is a read's FileObject, so this is the same namespace on both sides -
-	// arguably more obviously correct than the FileKey match above, which is the
-	// one classic FileIo documents. The probe tried both and only ever saw the
-	// FileKey form hit, so this was dropped when the package was written; a live
-	// teardown test then found the pre-opened handle named in the map and still
-	// unresolvable, because its reads matched neither of the forms being tried.
-	if n, ok := w.byRunCur[obj]; ok {
-		return n, true
-	}
-	if n, ok := w.byRunPrev[obj]; ok {
-		w.byRunCur[obj] = n
 		return n, true
 	}
 	return "", false
