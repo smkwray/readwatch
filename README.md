@@ -94,6 +94,38 @@ Before/after SACL snapshots mean a folder is restored only if the live SACL is s
 ReadWatch applied, and each change is written down before it is made, so an interrupted one can be
 undone on the next start. The audit policy is owned the same way.
 
+## Antivirus flags the event-tracing build
+
+Windows Defender classified an event-tracing build as `Trojan:Win32/Bearfoos.A!ml` and removed it —
+executable, service registration and all — about ten seconds after it was installed. The build is
+not signed, and `!ml` means a machine-learning model made the call rather than a signature match.
+
+**Why.** To report which process read a file, ReadWatch does three things that malware also does:
+
+| What it does | Where |
+| --- | --- |
+| Starts a machine-wide kernel file-trace session | `internal/etw/session_windows.go` |
+| Starts a second one at startup and enumerates every open file on the PC | `internal/etw/snapshot_windows.go` |
+| Opens other processes and their tokens, to name the reader and its user | `processIdentity` in `cmd/readwatch/etwsource_windows.go` |
+
+Those three lines are the product. There is no version of "tell me who read this file" that does not
+look like this from the outside.
+
+**The audit-marker mechanism is not affected.** A marker-only build of the same program, sitting in
+the same folder, was never touched. So the trigger is the tracing code, not ReadWatch.
+
+Which of the three weighs most is **not established**: once the detection was allowed on the test
+machine it could no longer be reproduced, so the three could not be tested apart.
+
+**If it happens to you**, allow it in Windows Security, or exclude the install folder:
+
+```powershell
+Add-MpPreference -ExclusionPath 'C:\Program Files\ReadWatch'
+```
+
+If you would rather not do that, use audit markers instead — every NTFS and ReFS folder can carry
+one, and that path has never been flagged. Only exFAT and FAT drives require event tracing.
+
 ## Build
 
 Go 1.23+, Windows 10 1903 / Windows 11, x64.
