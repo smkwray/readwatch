@@ -36,6 +36,13 @@ was out could not even be added.
   certainty — a short-lived reader that has already exited, whose process id Windows has since given
   to something else — is reported with the process left blank rather than named wrongly.
 
+### Removed
+
+- **Event tracing no longer reads other programs' security tokens.** It supplied only the User
+  column, and ReadWatch's job is to name the *process*. Under event tracing that column is now
+  blank; audit markers still report the user. Removing it takes out the most surveillance-shaped
+  thing the program did for the least of what it exists to tell you.
+
 ### Known issue: antivirus
 
 - **Windows Defender may flag an event-tracing build and remove it.** Classified
@@ -124,6 +131,13 @@ have made SYSTEM act on a different object. Closing that changed several things 
 > **Upgrading from 0.1.x or 0.2.x:** stop monitoring in the old version before upgrading. The
 > installer refuses to replace a copy that still has audit rules applied, because those records
 > identify folders by path and cannot be undone reliably after the upgrade.
+
+### Removed
+
+- **Event tracing no longer reads other programs' security tokens.** It supplied only the User
+  column, and ReadWatch's job is to name the *process*. Under event tracing that column is now
+  blank; audit markers still report the user. Removing it takes out the most surveillance-shaped
+  thing the program did for the least of what it exists to tell you.
 
 ### Known issue: antivirus
 

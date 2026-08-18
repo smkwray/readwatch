@@ -48,8 +48,10 @@ recorded as gaps and never guessed. The provider cannot be filtered by folder, s
 activity and discards what you did not ask for — which costs a little CPU continuously, whether you
 watch one folder or twenty. It does not report a read made purely through a memory mapping, and it
 cannot report folder listings, so that setting is unavailable while it is running and ReadWatch says
-so. It also leaves the process and user blank rather than guessing when a short-lived reader has
-already exited and its process id has been reused.
+so. It leaves the **User** column blank: naming the account behind a read means opening other
+programs' security tokens, which is more than this tool needs in order to name the *process*. Audit
+markers still report the user. It also leaves the process blank rather than guessing when a
+short-lived reader has already exited and its process id has been reused.
 
 **Which one runs.** Markers when every watched folder can carry one, event tracing when any folder
 cannot — so a folder on a USB stick is watched rather than refused. Never both at once, since a
@@ -106,10 +108,14 @@ not signed, and `!ml` means a machine-learning model made the call rather than a
 | --- | --- |
 | Starts a machine-wide kernel file-trace session | `internal/etw/session_windows.go` |
 | Starts a second one at startup and enumerates every open file on the PC | `internal/etw/snapshot_windows.go` |
-| Opens other processes and their tokens, to name the reader and its user | `processIdentity` in `cmd/readwatch/etwsource_windows.go` |
+| Opens other processes to read their executable path | `processIdentity` in `cmd/readwatch/etwsource_windows.go` |
 
-Those three lines are the product. There is no version of "tell me who read this file" that does not
-look like this from the outside.
+Those three lines are the product. There is no version of "tell me which program read this file"
+that does not look like this from the outside.
+
+Reading other programs' **security tokens** was on this list and has been removed — it only supplied
+the User column, which is not what the tool promises. What remains is the minimum needed to turn a
+process id into a program name.
 
 **The audit-marker mechanism is not affected.** A marker-only build of the same program, sitting in
 the same folder, was never touched. So the trigger is the tracing code, not ReadWatch.
