@@ -102,7 +102,12 @@ Windows Defender classified an event-tracing build as `Trojan:Win32/Bearfoos.A!m
 executable, service registration and all — about ten seconds after it was installed. The build is
 not signed, and `!ml` means a machine-learning model made the call rather than a signature match.
 
-**Why.** To report which process read a file, ReadWatch does three things that malware also does:
+**When.** Defender's own record says `Detection Type: FastPath`, at file access, on the installed
+copy **with monitoring switched off**. So it is the executable's contents that are being judged, not
+anything it did: no trace session had started and no process had been inspected.
+
+**Why.** To report which process read a file, ReadWatch is built to do things malware also does, and
+that shows in the binary:
 
 | What it does | Where |
 | --- | --- |
@@ -120,8 +125,8 @@ process id into a program name.
 **The audit-marker mechanism is not affected.** A marker-only build of the same program, sitting in
 the same folder, was never touched. So the trigger is the tracing code, not ReadWatch.
 
-Which of the three weighs most is **not established**: once the detection was allowed on the test
-machine it could no longer be reproduced, so the three could not be tested apart.
+Which of these weighs most is **not established**, and cannot be tested on a machine where the
+detection has been allowed — allowing it suppresses the classification for later builds too.
 
 **If it happens to you**, allow it in Windows Security, or exclude the install folder:
 

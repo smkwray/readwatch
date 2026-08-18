@@ -46,10 +46,9 @@ was out could not even be added.
 ### Known issue: antivirus
 
 - **Windows Defender may flag an event-tracing build and remove it.** Classified
-  `Trojan:Win32/Bearfoos.A!ml` on an unsigned build about ten seconds after install. The three
-  things that draw it — a machine-wide kernel file-trace session, enumerating every open file at
-  startup, and opening other processes' tokens to name a reader — are what the feature is. The
-  audit-marker path has never been flagged. The README says where each lives and how to allow it.
+  `Trojan:Win32/Bearfoos.A!ml` on an unsigned build about ten seconds after install — judged on the
+  file's contents at access time, with monitoring switched off, so not on anything it had done. The
+  audit-marker path has never been flagged. The README says which code draws it and how to allow it.
 
 ### Changed behaviour
 
@@ -142,10 +141,9 @@ have made SYSTEM act on a different object. Closing that changed several things 
 ### Known issue: antivirus
 
 - **Windows Defender may flag an event-tracing build and remove it.** Classified
-  `Trojan:Win32/Bearfoos.A!ml` on an unsigned build about ten seconds after install. The three
-  things that draw it — a machine-wide kernel file-trace session, enumerating every open file at
-  startup, and opening other processes' tokens to name a reader — are what the feature is. The
-  audit-marker path has never been flagged. The README says where each lives and how to allow it.
+  `Trojan:Win32/Bearfoos.A!ml` on an unsigned build about ten seconds after install — judged on the
+  file's contents at access time, with monitoring switched off, so not on anything it had done. The
+  audit-marker path has never been flagged. The README says which code draws it and how to allow it.
 
 ### Changed behaviour
 
