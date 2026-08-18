@@ -129,3 +129,45 @@ func TestCSVHeaderIsWrittenOnlyOnce(t *testing.T) {
 		t.Fatalf("unexpected CSV rows: %#v", records)
 	}
 }
+
+func TestGapIsRecordedInEveryFormat(t *testing.T) {
+	// A log that simply stops mentioning a folder is indistinguishable from a
+	// quiet folder. The reader who matters most is the one whose reads went
+	// unrecorded, so the gap has to be in the log itself, not only in a counter.
+	when := time.Date(2026, 8, 18, 9, 30, 0, 0, time.UTC)
+	for _, f := range []Format{Text, JSONL, CSV} {
+		path := filepath.Join(t.TempDir(), "log")
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := New(file, f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.WriteGap(when, "reads whose file could not be named", 7, ""); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := string(b)
+		if !strings.Contains(out, "7") {
+			t.Errorf("%s: the count is missing from %q", f, out)
+		}
+		if !strings.Contains(out, "could not be named") {
+			t.Errorf("%s: the reason is missing from %q", f, out)
+		}
+	}
+}
+
+func TestGapOnANilWriterIsNotAnError(t *testing.T) {
+	var w *Writer
+	if err := w.WriteGap(time.Now(), "x", 1, ""); err != nil {
+		t.Fatal(err)
+	}
+}
