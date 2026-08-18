@@ -104,6 +104,7 @@ func (s *etwSource) Losses() map[string]uint64 {
 	add("reads whose file could not be named", c.NeverNamed)
 	add("reads whose completion never arrived", c.Expired)
 	add("operations sharing a reused identifier", c.Collisions)
+	add("reads beyond one file's share of the naming queue", c.Crowded)
 	add("watched folders whose volume could not be resolved", c.UnboundRoots)
 	if c.DrainTimeout {
 		add("teardown stopped waiting for the trace to finish", 1)

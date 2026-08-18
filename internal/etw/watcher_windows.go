@@ -42,6 +42,7 @@ type Counters struct {
 	// number makes a broken correlation and a busy machine look the same.
 	BuffersLost  uint64 // real-time buffers the session lost
 	Collisions   uint64 // reused IRP values, both sides quarantined
+	Crowded      uint64 // one file's reads beyond its share of the parking queue
 	Expired      uint64 // started reads whose completion never arrived
 	UnboundRoots uint64 // watched folders whose volume could not be resolved
 	DrainTimeout bool   // teardown gave up waiting for the consumer
@@ -73,9 +74,25 @@ const (
 	nameMapMax = 1 << 16
 	// pendingReadMax bounds reads awaiting their completion event.
 	pendingReadMax = 20000
-	// deferredMax bounds reads awaiting a name. Reaching it means correlation is
-	// broken, not that a backlog is worth keeping.
-	deferredMax = 50000
+	// deferredMax bounds reads awaiting a name, and deferredPerIdentity bounds how
+	// many any one file may contribute.
+	//
+	// The per-identity cap is the important one. A machine at rest still issues
+	// tens of thousands of reads a second, nearly all of them on handles opened
+	// before this session existed and so unnameable until the rundown answers. A
+	// single first-come-first-served queue is emptied by whichever file is busiest
+	// in the first fraction of a second, and the folder the owner actually asked
+	// about never gets a slot. Measured here: 620,638 reads observed in seven
+	// seconds, 50,000 parked, 570,248 dropped, and the watched file among the
+	// dropped. Bounding each identity separately keeps one noisy file from
+	// crowding out every quiet one.
+	//
+	// 256 rather than a handful: at 16 a live run reported only 16 of the 240
+	// reads it made of the watched file, because the name for a pre-existing
+	// handle does not arrive until the session stops and every read until then
+	// has to wait in the queue.
+	deferredMax         = 50000
+	deferredPerIdentity = 256
 	// sweepInterval is how often parked reads are retried. Names for handles that
 	// predate the session arrive well after the reads do, so this is the primary
 	// naming path rather than a fallback: on a qualification run 3,893 of 4,965
@@ -151,6 +168,7 @@ type Watcher struct {
 	unboundRoots          atomic.Uint64
 	collisions            atomic.Uint64
 	expired               atomic.Uint64
+	crowded               atomic.Uint64
 }
 
 // errAlreadyActive guards the one-per-process rule. ETW's callback is a C
@@ -283,6 +301,7 @@ func (w *Watcher) Counters() Counters {
 		Published:    w.published.Load(),
 		BuffersLost:  uint64(bufs),
 		Collisions:   w.collisions.Load(),
+		Crowded:      w.crowded.Load(),
 		Expired:      w.expired.Load(),
 		UnboundRoots: w.unboundRoots.Load(),
 		DrainTimeout: w.drainTimedOut.Load(),
@@ -460,14 +479,9 @@ func (w *Watcher) sweepDeferred(final bool) {
 	// on top of it without a check - the structure grew by a cap's worth every
 	// sweep. What does not fit is dropped and counted, never quietly kept.
 	w.rmu.Lock()
-	for k, v := range readd {
+	for _, v := range readd {
 		for _, p := range v {
-			if w.deferredHeld >= deferredMax {
-				w.dropped.Add(1)
-				continue
-			}
-			w.deferred[k] = append(w.deferred[k], p)
-			w.deferredHeld++
+			w.parkLocked(p)
 		}
 	}
 	w.rmu.Unlock()
@@ -525,6 +539,20 @@ func (w *Watcher) lookup(obj, key uint64) (string, bool) {
 	}
 	if n, ok := w.byRunPrev[key]; ok {
 		w.byRunCur[key] = n
+		return n, true
+	}
+	// And against FileObject. The rundown's value is a FILE_OBJECT pointer, and
+	// so is a read's FileObject, so this is the same namespace on both sides -
+	// arguably more obviously correct than the FileKey match above, which is the
+	// one classic FileIo documents. The probe tried both and only ever saw the
+	// FileKey form hit, so this was dropped when the package was written; a live
+	// teardown test then found the pre-opened handle named in the map and still
+	// unresolvable, because its reads matched neither of the forms being tried.
+	if n, ok := w.byRunCur[obj]; ok {
+		return n, true
+	}
+	if n, ok := w.byRunPrev[obj]; ok {
+		w.byRunCur[obj] = n
 		return n, true
 	}
 	return "", false
@@ -600,6 +628,17 @@ func (w *Watcher) takePending(irp uint64) (pendingRead, bool) {
 func (w *Watcher) park(p pendingRead) {
 	w.rmu.Lock()
 	defer w.rmu.Unlock()
+	w.parkLocked(p)
+}
+
+func (w *Watcher) parkLocked(p pendingRead) {
+	if len(w.deferred[p.fileKey]) >= deferredPerIdentity {
+		// This file has already contributed as much as it may. Its later reads are
+		// lost, and counted, but they cannot take the slot of a file nothing has
+		// heard from yet.
+		w.crowded.Add(1)
+		return
+	}
 	if w.deferredHeld >= deferredMax {
 		w.dropped.Add(1)
 		return
