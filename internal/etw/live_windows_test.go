@@ -3,6 +3,7 @@
 package etw
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -449,4 +450,81 @@ func TestLiveStartupSnapshotNamesLive(t *testing.T) {
 	if matched == 0 {
 		t.Fatalf("the pre-opened handle was not named while monitoring ran; the snapshot did not do its job. counters %+v", c)
 	}
+}
+
+// TestLiveDegradedSnapshotStillMonitors proves the degraded path through the
+// real Start, not just its flag. A machine already running several system
+// loggers can refuse the helper, and monitoring must continue: reads on handles
+// opened from that point still resolve, and only the already-open ones suffer.
+func TestLiveDegradedSnapshotStillMonitors(t *testing.T) {
+	if os.Getenv("READWATCH_ETW_LIVE") != "1" {
+		t.Skip("set READWATCH_ETW_LIVE=1 and run elevated to exercise a real session")
+	}
+	dir := `C:\ReadWatch-Test`
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Skipf("cannot use %s: %v", dir, err)
+	}
+
+	original := takeSnapshot
+	takeSnapshot = func() (map[uint64]string, error) {
+		return nil, fmt.Errorf("injected: no system logger slot available")
+	}
+	defer func() { takeSnapshot = original }()
+
+	var mu sync.Mutex
+	var seen []Read
+	var reported []string
+	w := New([]string{dir}, 0, func(r Read) {
+		mu.Lock()
+		seen = append(seen, r)
+		mu.Unlock()
+	}, func(err error) {
+		mu.Lock()
+		reported = append(reported, err.Error())
+		mu.Unlock()
+	})
+
+	if err := w.Start(); err != nil {
+		t.Fatalf("a failed startup snapshot stopped monitoring altogether: %v", err)
+	}
+	defer w.Stop()
+
+	if c := w.Counters(); !c.SnapshotFailed {
+		t.Error("the failure was not reported in the counters")
+	}
+	mu.Lock()
+	said := strings.Join(reported, " | ")
+	mu.Unlock()
+	if !strings.Contains(said, "unnamed until monitoring stops") {
+		t.Errorf("the owner was not told what the degradation costs, got %q", said)
+	}
+
+	// A file created and read now: its name comes from the live stream, so this
+	// must still work with no snapshot at all.
+	target := filepath.Join(dir, "live-degraded-check.txt")
+	if err := os.WriteFile(target, make([]byte, 64*1024), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	defer os.Remove(target)
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := readUnbuffered(target); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		time.Sleep(300 * time.Millisecond)
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+	}
+	mu.Lock()
+	got := len(seen)
+	mu.Unlock()
+	if got == 0 {
+		t.Fatalf("no read was reported at all after a failed snapshot; counters %+v", w.Counters())
+	}
+	t.Logf("degraded start still reported %d reads; counters %+v", got, w.Counters())
 }

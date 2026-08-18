@@ -76,6 +76,20 @@ reduction is accepted only under event tracing, which writes nothing to the volu
 it must find again in order to undo it. Audit markers still refuse such a volume, and so does the log
 file.
 
+Two limits are worth being exact about, because both are easy to overread:
+
+- **This is replacement detection, not media authentication.** ReadWatch trusts what the Windows
+  storage stack tells it about a volume. The serial it records is assigned by Windows when the volume
+  is formatted, not burned into the hardware, so a deliberately cloned or reproduced volume is not
+  something it can distinguish. It tells you the disk changed under a path; it does not prove which
+  physical disk you have.
+- **The junction check trusts the filesystem driver.** ReadWatch refuses to follow a junction,
+  symbolic link or mount point into a watched folder. On a volume that reports it cannot hold one at
+  all, that check is skipped — there is nothing to find — and an object claiming otherwise on such a
+  volume is refused rather than reconciled. A hostile or faulty *kernel* filesystem or filter driver
+  could lie about both, but a driver at that level can defeat ReadWatch far more directly, so this is
+  where the trust boundary sits.
+
 Before/after SACL snapshots mean a folder is restored only if the live SACL is still what
 ReadWatch applied, and each change is written down before it is made, so an interrupted one can be
 undone on the next start. The audit policy is owned the same way.

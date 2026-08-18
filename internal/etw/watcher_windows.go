@@ -391,7 +391,7 @@ func (w *Watcher) Start() error {
 	// being taken is discarded rather than merged: the main session has been
 	// watching lifetime events throughout, and a name that was already stale when
 	// it arrived is exactly how a read of one file gets attributed to another.
-	if names, err := snapshotOpenFiles(); err != nil {
+	if names, err := takeSnapshot(); err != nil {
 		w.snapshotFailed.Store(true)
 		w.report(fmt.Errorf("startup filename snapshot unavailable, reads on handles opened before now may be unnamed until monitoring stops: %w", err))
 	} else {
