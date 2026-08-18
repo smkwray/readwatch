@@ -27,6 +27,10 @@ was out could not even be added.
 - The window's summary names the mechanism in use. If you asked for markers and a watched folder
   made that impossible, ReadWatch says so rather than quietly running the other one.
 - Settings offers the choice, with what each option costs and what each can see written next to it.
+- **Event tracing names files that were already open when you pressed Start.** Windows only offers
+  that list when a trace session ends, so ReadWatch runs a short one during startup purely to
+  collect it — about a second. Without it, a program holding a file open before monitoring began
+  would have gone unattributed for the whole run, which is exactly the reader worth noticing.
 - **What event tracing cannot do, it says rather than silently skips.** Folder listings are
   unavailable while it runs, and the window says so. A read whose process cannot be identified with
   certainty — a short-lived reader that has already exited, whose process id Windows has since given
