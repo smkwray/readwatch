@@ -898,6 +898,8 @@ var (
 	// else, so the image and the owner have to be asked for separately.
 	procOpenProcess                = kernel32.NewProc("OpenProcess")
 	procQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
+	// Resolving a recorded volume GUID to the device name the provider uses.
+	procQueryDosDeviceW = kernel32.NewProc("QueryDosDeviceW")
 	// Creation time is what tells a live process from a reused id.
 	procGetProcessTimes    = kernel32.NewProc("GetProcessTimes")
 	procGetFileAttributesW = kernel32.NewProc("GetFileAttributesW")

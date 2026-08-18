@@ -31,7 +31,7 @@ func TestLiveSessionReportsARead(t *testing.T) {
 
 	var mu sync.Mutex
 	var seen []Read
-	w := New([]string{dir}, uint32(os.Getpid()), func(r Read) {
+	w := New(RootsFromPaths([]string{dir}), uint32(os.Getpid()), func(r Read) {
 		mu.Lock()
 		seen = append(seen, r)
 		mu.Unlock()
@@ -138,7 +138,7 @@ func TestLiveSessionLeavesNothingBehind(t *testing.T) {
 		t.Skip("set READWATCH_ETW_LIVE=1 and run elevated to exercise a real session")
 	}
 	for i := 0; i < 2; i++ {
-		w := New([]string{`C:\ReadWatch-Test`}, uint32(os.Getpid()), nil, nil)
+		w := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), uint32(os.Getpid()), nil, nil)
 		if err := w.Start(); err != nil {
 			t.Fatalf("start %d: %v", i+1, err)
 		}
@@ -186,7 +186,7 @@ func TestLiveTeardownNamesAPreOpenedHandle(t *testing.T) {
 	// selfPID 0, not this process: the reads under test are issued by the test
 	// itself, and production deliberately drops reads it made. Passing our own id
 	// here would filter out the very thing being measured.
-	w := New([]string{dir}, 0, func(r Read) {
+	w := New(RootsFromPaths([]string{dir}), 0, func(r Read) {
 		mu.Lock()
 		seen = append(seen, r)
 		mu.Unlock()
@@ -326,13 +326,13 @@ func TestLiveSecondWatcherIsRefused(t *testing.T) {
 	if os.Getenv("READWATCH_ETW_LIVE") != "1" {
 		t.Skip("set READWATCH_ETW_LIVE=1 and run elevated to exercise a real session")
 	}
-	first := New([]string{`C:\ReadWatch-Test`}, uint32(os.Getpid()), nil, nil)
+	first := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), uint32(os.Getpid()), nil, nil)
 	if err := first.Start(); err != nil {
 		t.Fatalf("first start: %v", err)
 	}
 	defer first.Stop()
 
-	second := New([]string{`C:\ReadWatch-Test`}, uint32(os.Getpid()), nil, nil)
+	second := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), uint32(os.Getpid()), nil, nil)
 	if err := second.Start(); err == nil {
 		second.Stop()
 		t.Fatal("a second watcher started while one was already running")
@@ -380,7 +380,7 @@ func TestLiveStartupSnapshotNamesLive(t *testing.T) {
 
 	var mu sync.Mutex
 	var seen []Read
-	w := New([]string{dir}, 0, func(r Read) {
+	w := New(RootsFromPaths([]string{dir}), 0, func(r Read) {
 		mu.Lock()
 		seen = append(seen, r)
 		mu.Unlock()
@@ -474,7 +474,7 @@ func TestLiveDegradedSnapshotStillMonitors(t *testing.T) {
 	var mu sync.Mutex
 	var seen []Read
 	var reported []string
-	w := New([]string{dir}, 0, func(r Read) {
+	w := New(RootsFromPaths([]string{dir}), 0, func(r Read) {
 		mu.Lock()
 		seen = append(seen, r)
 		mu.Unlock()

@@ -5,6 +5,7 @@ package etw
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,11 +42,12 @@ type Counters struct {
 	// The remaining ways a read can fail to reach the log, kept apart because
 	// they have different causes and different fixes. Collapsing them into one
 	// number makes a broken correlation and a busy machine look the same.
-	BuffersLost  uint64 // real-time buffers the session lost
-	Collisions   uint64 // reused IRP values, both sides quarantined
-	Crowded      uint64 // one file's reads beyond its share of the parking queue
-	Expired      uint64 // started reads whose completion never arrived
-	UnboundRoots uint64 // watched folders whose volume could not be resolved
+	BuffersLost   uint64 // real-time buffers the session lost
+	Collisions    uint64 // reused IRP values, both sides quarantined
+	Crowded       uint64 // one file's reads beyond its share of the parking queue
+	NamesRejected uint64 // names the bounded map could not admit
+	Expired       uint64 // started reads whose completion never arrived
+	UnboundRoots  uint64 // watched folders whose volume could not be resolved
 	// SnapshotNames is how many already-open files the startup snapshot named;
 	// SnapshotStale how many it discarded as already closed; SnapshotFailed
 	// whether it could not be taken at all, which is a degraded start rather than
@@ -75,11 +77,14 @@ func eventTime(ticks int64) time.Time {
 }
 
 const (
-	// nameMapMax bounds each generation of the name maps. A service runs for
+	// nameMapMax bounds each generation of the name maps. 1<<18, not 1<<16: the
+	// startup snapshot alone names ~116,000 files on this host, so a smaller
+	// bound would reject most of it at every start and the bound would be
+	// enforced by throwing away the coverage it was built to provide. A service runs for
 	// hours, not the twelve seconds a probe runs, so names must be retired or the
 	// maps grow without limit. Two generations are kept: a name is only dropped
 	// after it has survived a full sweep without being needed.
-	nameMapMax = 1 << 16
+	nameMapMax = 1 << 18
 	// pendingReadMax bounds reads awaiting their completion event.
 	pendingReadMax = 20000
 	// deferredMax bounds reads awaiting a name, and deferredPerIdentity bounds how
@@ -138,17 +143,21 @@ type pendingRead struct {
 // context that survives the round trip, so the active watcher is found through a
 // package-level pointer.
 type Watcher struct {
-	mu           sync.Mutex
-	session      *session
-	stop         chan struct{}
-	done         chan struct{}
-	consumerDone chan struct{}
+	mu      sync.Mutex
+	session *session
+	// sessionForDrain survives session being cleared at Stop, so housekeeping can
+	// still close the consumer if the drain runs out of patience.
+	sessionForDrain *session
+	stop            chan struct{}
+	done            chan struct{}
+	consumerDone    chan struct{}
 
 	// roots are the watched folders, each bound to the volume device it resolved
 	// to when monitoring started. Everything else on the machine is decoded and
 	// discarded: this provider cannot be filtered by path, so the consumer sees
 	// every read and throws away what it did not ask for.
 	roots   []watchRoot
+	bound   []BoundRoot
 	keep    []string
 	selfPID uint32
 	emit    func(Read)
@@ -171,39 +180,87 @@ type Watcher struct {
 	sessionLost, lostBufs uint32
 	lostKnown             bool
 	running               atomic.Bool
-	drainTimedOut         atomic.Bool
-	retired               atomic.Uint64
-	unboundRoots          atomic.Uint64
-	collisions            atomic.Uint64
-	expired               atomic.Uint64
-	crowded               atomic.Uint64
-	snapshotNames         atomic.Uint64
-	snapshotStale         atomic.Uint64
-	snapshotFailed        atomic.Bool
-	initialised           atomic.Bool
+	// token identifies this watcher on every record ETW delivers to it, and
+	// accepting says whether it still wants them. The token is the address of
+	// tokenCell, pinned for the consumer's life, so it is unique and stable.
+	token          uintptr
+	tokenCell      *uint64
+	pin            runtime.Pinner
+	accepting      atomic.Bool
+	drainTimedOut  atomic.Bool
+	retired        atomic.Uint64
+	unboundRoots   atomic.Uint64
+	collisions     atomic.Uint64
+	expired        atomic.Uint64
+	crowded        atomic.Uint64
+	namesRejected  atomic.Uint64
+	snapshotNames  atomic.Uint64
+	snapshotStale  atomic.Uint64
+	snapshotFailed atomic.Bool
+	initialised    atomic.Bool
 	// retiredDuringInit records identities the main session saw closed or deleted
 	// while the startup snapshot was being collected, so a name that was already
 	// stale when it arrived is never merged. Dropped once initialisation ends.
 	retiredDuringInit map[uint64]bool
 }
 
-// errAlreadyActive guards the one-per-process rule. ETW's callback is a C
-// function pointer with no user context that survives the round trip, so a
-// second concurrent watcher would silently steal the first one's events.
+// errAlreadyActive guards the one-session-at-a-time rule. Records are routed by
+// their own token, so a second watcher could not steal the first one's events
+// even if it existed; this exists because the session name is fixed and two
+// watchers would fight over the same logger.
 var errAlreadyActive = errors.New("an ETW watcher is already running in this process")
 
+// Consumers are found by the token ETW carries on every record, not by a global
+// pointer to whichever watcher is current.
+//
+// EVENT_TRACE_LOGFILEW.Context is copied into EVENT_RECORD.UserContext, so each
+// consumer can be identified from the record itself. The earlier global was
+// wrong on both counts: the comment claimed no per-consumer context survives the
+// round trip, which is untrue, and a slot released while an old consumer was
+// still delivering let one session's records enter a later watcher as if they
+// were its own.
 var (
-	active        atomic.Pointer[Watcher]
+	consumers     sync.Map // token -> *Watcher
+	nextConsumer  atomic.Uint64
 	eventCallback = syscall.NewCallback(onEvent)
+	// active only enforces the one-session-at-a-time rule; it is never used to
+	// route a record.
+	active atomic.Pointer[Watcher]
 )
 
 // New builds a watcher. keep is the set of folders whose reads should be
 // emitted; a read outside all of them is discarded in this process rather than
 // sent anywhere.
-func New(keep []string, selfPID uint32, emit func(Read), onError func(error)) *Watcher {
-	w := &Watcher{selfPID: selfPID, emit: emit, onError: onError}
-	w.setKeep(keep)
+// New builds a watcher over roots the caller has already bound to a volume.
+func New(roots []BoundRoot, selfPID uint32, emit func(Read), onError func(error)) *Watcher {
+	w := &Watcher{selfPID: selfPID, emit: emit, onError: onError, bound: roots}
+	for _, r := range roots {
+		w.keep = append(w.keep, r.Display)
+	}
 	return w
+}
+
+// RootsFromPaths is for callers that have only paths - the live tests, and
+// nothing in the service. It resolves each drive letter once, here, so that the
+// watcher itself never does.
+func RootsFromPaths(paths []string) []BoundRoot {
+	out := make([]BoundRoot, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimRight(strings.TrimSpace(p), `\/`)
+		if len(p) < 2 || p[1] != ':' {
+			continue
+		}
+		device, ok := deviceForLetter(strings.ToUpper(p[:1]) + ":")
+		if !ok {
+			continue
+		}
+		within := ""
+		if len(p) > 2 {
+			within = p[2:]
+		}
+		out = append(out, BoundRoot{Device: device, Within: within, Display: p})
+	}
+	return out
 }
 
 // watchRoot is one watched folder, held as the NT device path the provider
@@ -221,23 +278,29 @@ type watchRoot struct {
 	display string // D:\Folder, as configured
 }
 
-// bindRoots resolves each configured folder to the volume device behind its
-// drive letter. A folder whose letter cannot be resolved is not watched rather
-// than watched by name, and is counted so the gap is visible.
+// BoundRoot is a watched folder as the binder proved it: the volume device it
+// actually sits on, the path within that volume, and the form the owner
+// recognises. The watcher never resolves a drive letter itself - the letter is a
+// mutable mapping, and re-resolving it at start would reopen the window where a
+// reassignment between binding and startup authorises a different volume.
+type BoundRoot struct {
+	Device  string // \Device\HarddiskVolumeN, as the provider names it
+	Within  string // \Folder, the path inside that volume
+	Display string // D:\Folder, as the owner wrote it
+}
+
+// bindRoots turns the caller's proven roots into the matching form. A root with
+// no device is not watched rather than watched by name, and is counted so the
+// gap is visible.
 func (w *Watcher) bindRoots() {
 	var out []watchRoot
-	for _, f := range w.keep {
-		if len(f) < 2 || f[1] != ':' {
+	for _, r := range w.bound {
+		if r.Device == "" || r.Display == "" {
 			w.unboundRoots.Add(1)
 			continue
 		}
-		device, ok := deviceForLetter(strings.ToUpper(f[:1]) + ":")
-		if !ok {
-			w.unboundRoots.Add(1)
-			continue
-		}
-		nt := strings.ToLower(strings.TrimRight(device, `\`) + f[2:])
-		out = append(out, watchRoot{nt: nt, display: f})
+		nt := strings.ToLower(strings.TrimRight(r.Device, `\`) + r.Within)
+		out = append(out, watchRoot{nt: nt, display: r.Display})
 	}
 	w.rmu.Lock()
 	w.roots = out
@@ -262,20 +325,6 @@ func (w *Watcher) wantedNT(ntPath string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// setKeep records the configured folders as the owner wrote them. The case is
-// preserved deliberately: this is now the display form, and matching happens on
-// the lowercased device path built from it.
-func (w *Watcher) setKeep(folders []string) {
-	norm := make([]string, 0, len(folders))
-	for _, f := range folders {
-		f = strings.TrimRight(strings.TrimSpace(f), `\/`)
-		if f != "" {
-			norm = append(norm, f)
-		}
-	}
-	w.keep = norm
 }
 
 // initState resets every correlation map. Separate from Start so the
@@ -318,6 +367,7 @@ func (w *Watcher) Counters() Counters {
 		BuffersLost:    uint64(bufs),
 		Collisions:     w.collisions.Load(),
 		Crowded:        w.crowded.Load(),
+		NamesRejected:  w.namesRejected.Load(),
 		Expired:        w.expired.Load(),
 		UnboundRoots:   w.unboundRoots.Load(),
 		SnapshotNames:  w.snapshotNames.Load(),
@@ -355,24 +405,38 @@ func (w *Watcher) Start() error {
 		return err
 	}
 	w.session = s
+	w.sessionForDrain = s
 	w.stop = make(chan struct{})
 	w.done = make(chan struct{})
 	w.running.Store(true)
+
+	// The token is the address of a pinned allocation this watcher owns, so it is
+	// unique for as long as the consumer lives and cannot be confused with any
+	// other. Windows copies it onto every record as UserContext.
+	w.tokenCell = new(uint64)
+	*w.tokenCell = nextConsumer.Add(1)
+	w.pin.Pin(w.tokenCell)
+	w.token = uintptr(unsafe.Pointer(w.tokenCell))
+	consumers.Store(w.token, w)
+	w.accepting.Store(true)
 
 	consumerDone := make(chan struct{})
 	w.consumerDone = consumerDone
 	go func() {
 		defer close(consumerDone)
-		if err := s.openAndProcess(eventCallback); err != nil {
+		if err := s.openAndProcess(eventCallback, unsafe.Pointer(w.tokenCell)); err != nil {
 			w.report(err)
 		}
 	}()
 
 	if err := s.waitConsumerReady(5 * time.Second); err != nil {
 		w.running.Store(false)
+		w.accepting.Store(false)
 		active.Store(nil)
 		_ = s.Stop()
 		<-consumerDone
+		consumers.Delete(w.token)
+		w.pin.Unpin()
 		w.session = nil
 		return err
 	}
@@ -400,9 +464,12 @@ func (w *Watcher) Start() error {
 
 	if err := s.enableReads(); err != nil {
 		w.running.Store(false)
+		w.accepting.Store(false)
 		active.Store(nil)
 		_ = s.Stop()
 		<-consumerDone
+		consumers.Delete(w.token)
+		w.pin.Unpin()
 		w.session = nil
 		return err
 	}
@@ -426,8 +493,11 @@ func (w *Watcher) mergeSnapshot(names map[uint64]string) {
 			// The live stream already named it, and the live stream is newer.
 			continue
 		}
-		w.byRunCur[key] = name
-		kept++
+		before := len(w.byRunCur)
+		w.learnLocked(&w.byRunCur, key, name)
+		if len(w.byRunCur) > before {
+			kept++
+		}
 	}
 	w.snapshotNames.Store(uint64(kept))
 	w.retiredDuringInit = nil
@@ -476,6 +546,18 @@ func (w *Watcher) Stop() {
 		w.report(err)
 	}
 	<-done
+	// The consumer is only retired once it has actually left ProcessTrace. If the
+	// drain ran out of patience, housekeeping has already asked it to close, and
+	// this waits for that to take effect rather than releasing the token while
+	// records may still arrive. Until then the watcher stops accepting, so late
+	// records are dropped by their own consumer rather than handed to another.
+	w.accepting.Store(false)
+	select {
+	case <-w.consumerDone:
+	case <-time.After(drainTimeout):
+	}
+	consumers.Delete(w.token)
+	w.pin.Unpin()
 	active.Store(nil)
 }
 
@@ -502,7 +584,22 @@ func (w *Watcher) housekeeping(consumerDone chan struct{}) {
 			select {
 			case <-consumerDone:
 			case <-time.After(drainTimeout):
+				// Out of patience. Ask the consumer to close rather than simply
+				// walking away from it: CloseTrace may be called while
+				// ProcessTrace is still running, and it stops further delivery
+				// after draining what is already queued. Walking away left a live
+				// consumer whose records could reach a later watcher.
 				w.drainTimedOut.Store(true)
+				w.mu.Lock()
+				s := w.sessionForDrain
+				w.mu.Unlock()
+				if s != nil {
+					s.closeConsumer()
+				}
+				select {
+				case <-consumerDone:
+				case <-time.After(drainTimeout):
+				}
 			}
 			w.sweepDeferred(true)
 			return
@@ -570,6 +667,10 @@ func (w *Watcher) rotateNames() {
 func (w *Watcher) rotate() {
 	w.rmu.Lock()
 	defer w.rmu.Unlock()
+	w.rotateLocked()
+}
+
+func (w *Watcher) rotateLocked() {
 	w.byKeyPrev, w.byKeyCur = w.byKeyCur, make(map[uint64]string, 1<<12)
 	w.byObjPrev, w.byObjCur = w.byObjCur, make(map[uint64]string, 1<<12)
 	w.byRunPrev, w.byRunCur = w.byRunCur, make(map[uint64]string, 1<<12)
@@ -640,8 +741,24 @@ func (w *Watcher) learn(m *map[uint64]string, id uint64, name string) {
 		return
 	}
 	w.rmu.Lock()
-	(*m)[id] = name
+	w.learnLocked(m, id, name)
 	w.rmu.Unlock()
+}
+
+// learnLocked admits a name only if the current generation has room. Rotating
+// after an overshoot is not a bound: a startup snapshot of 116,000 names walked
+// straight past a stated maximum of 65,536 before anything was rotated. When the
+// generation is full it is rotated here, at the moment of insertion, and a name
+// that still cannot be admitted is counted rather than quietly kept.
+func (w *Watcher) learnLocked(m *map[uint64]string, id uint64, name string) {
+	if len(*m) >= nameMapMax {
+		w.rotateLocked()
+	}
+	if len(*m) >= nameMapMax {
+		w.namesRejected.Add(1)
+		return
+	}
+	(*m)[id] = name
 }
 
 func (w *Watcher) pend(irp uint64, p pendingRead) {
@@ -737,8 +854,18 @@ func (w *Watcher) report(err error) {
 // onEvent is ETW's callback. It runs on ETW's own thread, so it copies what it
 // needs out of the record and does no blocking work.
 func onEvent(rec *EVENT_RECORD) uintptr {
-	w := active.Load()
-	if w == nil {
+	if rec.UserContext == nil {
+		return 0
+	}
+	v, ok := consumers.Load(uintptr(rec.UserContext))
+	if !ok {
+		// The consumer this record belongs to has been retired. Dropping it is
+		// right; handing it to whichever watcher is current would attribute one
+		// session's reads to another's configuration.
+		return 0
+	}
+	w := v.(*Watcher)
+	if !w.accepting.Load() {
 		return 0
 	}
 	provider := rec.EventHeader.ProviderId

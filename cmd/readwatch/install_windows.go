@@ -304,8 +304,11 @@ func uninstallElevated(quiet bool) error {
 	// An ETW session survives the process that made it, so a service that was
 	// killed at some point could have left one running. Nothing else clears it
 	// once the service is deleted, and uninstall is the last moment ReadWatch has
-	// to leave the machine as it found it.
-	etw.StopStale()
+	// to leave the machine as it found it - so a failure to confirm both sessions
+	// gone stops the uninstall rather than being logged and walked past.
+	if err := etw.StopStale(); err != nil {
+		return fmt.Errorf("ReadWatch could not confirm its event tracing sessions are stopped, so uninstall would leave one running: %w", err)
+	}
 	if err := deleteInstalledService(); err != nil {
 		return err
 	}

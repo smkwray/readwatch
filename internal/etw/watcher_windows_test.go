@@ -167,7 +167,7 @@ func TestNoWatchedRootsMatchesNothing(t *testing.T) {
 
 func newTestWatcher(t *testing.T, keep []string, emit func(Read)) *Watcher {
 	t.Helper()
-	w := New(keep, 0, emit, nil)
+	w := New(RootsFromPaths(keep), 0, emit, nil)
 	w.initState()
 	w.rmu.Lock()
 	for _, k := range w.keep {
@@ -443,7 +443,7 @@ func TestAFailedStartupSnapshotDegradesRatherThanRefuses(t *testing.T) {
 	// from that point resolve normally, and only the already-open ones are
 	// affected. Refusing to monitor at all would be a worse answer than a
 	// reported gap in coverage.
-	w := New([]string{`C:\Watched`}, 0, nil, nil)
+	w := New(RootsFromPaths([]string{`C:\Watched`}), 0, nil, nil)
 	w.initState()
 	w.retiredDuringInit = map[uint64]bool{}
 
@@ -468,7 +468,7 @@ func TestSnapshotNamesAreRejectedIfTheIdentityClosedWhileCollecting(t *testing.T
 	// The race the fence exists for: a handle closes during collection, its key
 	// is reused, and a snapshot name taken before the close lands on the new
 	// file. Observed once for real in a live run, so this pins it.
-	w := New([]string{`C:\Watched`}, 0, nil, nil)
+	w := New(RootsFromPaths([]string{`C:\Watched`}), 0, nil, nil)
 	w.initState()
 	w.retiredDuringInit = map[uint64]bool{}
 
@@ -499,7 +499,7 @@ func TestSnapshotNamesAreRejectedIfTheIdentityClosedWhileCollecting(t *testing.T
 func TestTheLiveStreamOutranksTheStartupSnapshot(t *testing.T) {
 	// If the session already named an identity, that is newer than a snapshot
 	// taken during startup and must not be overwritten by it.
-	w := New([]string{`C:\Watched`}, 0, nil, nil)
+	w := New(RootsFromPaths([]string{`C:\Watched`}), 0, nil, nil)
 	w.initState()
 	w.retiredDuringInit = map[uint64]bool{}
 

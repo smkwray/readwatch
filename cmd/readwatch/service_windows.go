@@ -98,9 +98,14 @@ func loadServiceConfig(path, defaultLog string) (settings.Config, error) {
 func (e *ServiceEngine) Start() error {
 	// An ETW session outlives the process that created it, so a service that was
 	// killed rather than stopped leaves one running with nobody consuming it.
-	// Clear it here as well as at monitoring start: the service can sit idle for
-	// a long time before anything else would notice.
-	etw.StopStale()
+	// Clear both here as well as at monitoring start: the service can sit idle
+	// for a long time before anything else would notice. A failure to confirm
+	// them gone is recorded and surfaced rather than passed over - an orphaned
+	// machine-wide logger is the state this service most may not be in silently.
+	if err := etw.StopStale(); err != nil {
+		writeServiceDiagnostic(err)
+		e.setLastError(err)
+	}
 	e.ipc.Start()
 	e.mu.Lock()
 	e.ready = true

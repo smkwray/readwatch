@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"readwatch/internal/etw"
 	"readwatch/internal/settings"
 )
 
@@ -103,6 +104,54 @@ func (b *BoundConfig) AttachedPaths() []string {
 		paths = append(paths, f.Path)
 	}
 	return paths
+}
+
+// AttachedRoots carries what the binder actually proved: which volume each
+// watched folder is on, established under the owner's token at bind time.
+//
+// Handing the watcher a list of drive letters instead meant it resolved those
+// letters again when it started, and a letter reassigned between binding and
+// startup would have authorised the replacement volume - the very window the
+// volume-relative matching was introduced to close.
+func (b *BoundConfig) AttachedRoots() []etw.BoundRoot {
+	roots := make([]etw.BoundRoot, 0, len(b.Folders))
+	for _, f := range b.Folders {
+		device, ok := deviceForVolumeGUID(f.Identity.VolumeGUID)
+		if !ok {
+			continue
+		}
+		rest := ""
+		if len(f.Path) > 2 {
+			rest = f.Path[2:]
+		}
+		roots = append(roots, etw.BoundRoot{
+			Device:  device,
+			Within:  rest,
+			Display: f.Path,
+		})
+	}
+	return roots
+}
+
+// deviceForVolumeGUID turns the volume GUID the binder recorded into the device
+// name the provider uses in its events. The GUID is what the folder was bound
+// to, so this cannot drift the way a drive letter can.
+func deviceForVolumeGUID(guid string) (string, bool) {
+	trimmed := strings.TrimSuffix(strings.TrimPrefix(guid, `\?\`), `\`)
+	if trimmed == "" {
+		return "", false
+	}
+	buf := make([]uint16, 1024)
+	n, _, _ := procQueryDosDeviceW.Call(
+		uintptr(unsafe.Pointer(utf16Ptr(trimmed))),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+	)
+	if n == 0 {
+		return "", false
+	}
+	device := syscall.UTF16ToString(buf)
+	return device, device != ""
 }
 
 // markUnavailable moves a folder out of the attached set and closes what it
