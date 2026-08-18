@@ -31,7 +31,12 @@ func TestLiveSessionReportsARead(t *testing.T) {
 
 	var mu sync.Mutex
 	var seen []Read
-	w := New(RootsFromPaths([]string{dir}), uint32(os.Getpid()), func(r Read) {
+	// selfPID 0, not this process. The reads under test are issued by the test
+	// itself, and production deliberately drops reads it made - so passing our
+	// own id filters out the very thing being measured. It passed for a while by
+	// luck, because the kernel sometimes attributes an unbuffered read to a
+	// system process instead, which is not something to depend on.
+	w := New(RootsFromPaths([]string{dir}), 0, func(r Read) {
 		mu.Lock()
 		seen = append(seen, r)
 		mu.Unlock()
@@ -138,7 +143,7 @@ func TestLiveSessionLeavesNothingBehind(t *testing.T) {
 		t.Skip("set READWATCH_ETW_LIVE=1 and run elevated to exercise a real session")
 	}
 	for i := 0; i < 2; i++ {
-		w := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), uint32(os.Getpid()), nil, nil)
+		w := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), 0, nil, nil)
 		if err := w.Start(); err != nil {
 			t.Fatalf("start %d: %v", i+1, err)
 		}
@@ -326,13 +331,13 @@ func TestLiveSecondWatcherIsRefused(t *testing.T) {
 	if os.Getenv("READWATCH_ETW_LIVE") != "1" {
 		t.Skip("set READWATCH_ETW_LIVE=1 and run elevated to exercise a real session")
 	}
-	first := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), uint32(os.Getpid()), nil, nil)
+	first := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), 0, nil, nil)
 	if err := first.Start(); err != nil {
 		t.Fatalf("first start: %v", err)
 	}
 	defer first.Stop()
 
-	second := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), uint32(os.Getpid()), nil, nil)
+	second := New(RootsFromPaths([]string{`C:\ReadWatch-Test`}), 0, nil, nil)
 	if err := second.Start(); err == nil {
 		second.Stop()
 		t.Fatal("a second watcher started while one was already running")
