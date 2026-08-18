@@ -80,7 +80,7 @@ func writeLoggerName(buf []byte, offset uint32, name string) {
 // nobody consuming it. Nothing in ETW ties a session's lifetime to its creator,
 // so the only defence is to clear an orphan at every point ReadWatch gets
 // control - service start as well as monitoring start.
-func StopStale() { stopStaleSession() }
+func StopStale() { _ = StopStaleVerified() }
 
 // stopStaleSession names the session explicitly, so it can never stop a session
 // belonging to anything else.
@@ -205,17 +205,53 @@ func (s *session) requestSystemRundown() error {
 
 // Stop tears the session down. Monitoring-specific resources must not outlive
 // monitoring, and an ETW session is one of them.
-func (s *session) Stop() {
+// Stop tears the session down and says whether it is actually gone. The result
+// was previously discarded, which meant "cleanup ran" and "cleanup worked" were
+// the same statement - and a session that outlives the process is the one thing
+// this package must never leave behind.
+func (s *session) Stop() error {
 	if s == nil || s.handle == 0 {
-		return
+		return nil
 	}
-	procControlTraceW.Call(
+	r, _, _ := procControlTraceW.Call(
 		uintptr(s.handle),
 		0,
 		uintptr(unsafe.Pointer(&s.props[0])),
 		EVENT_TRACE_CONTROL_STOP,
 	)
 	s.handle = 0
+	// Already stopped, or never started, are both the state being asked for.
+	switch r {
+	case ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND, ERROR_CTX_CLOSE_PENDING:
+		return nil
+	}
+	return fmt.Errorf("ControlTrace(stop %s): %w", SessionName, syscall.Errno(r))
+}
+
+// StopStaleVerified clears an orphan and confirms it is gone, rather than firing
+// a stop and assuming. Reported so a failure to clean up is visible instead of
+// silent.
+func StopStaleVerified() error {
+	if r := controlStale(EVENT_TRACE_CONTROL_STOP); r != ERROR_SUCCESS &&
+		r != ERROR_WMI_INSTANCE_NOT_FOUND && r != ERROR_CTX_CLOSE_PENDING {
+		return fmt.Errorf("ControlTrace(stop stale %s): %w", SessionName, syscall.Errno(r))
+	}
+	if r := controlStale(EVENT_TRACE_CONTROL_QUERY); r == ERROR_SUCCESS {
+		return fmt.Errorf("an ETW session named %s is still running after being told to stop", SessionName)
+	}
+	return nil
+}
+
+func controlStale(code uintptr) uintptr {
+	buf, _ := propertiesBuffer(SessionName)
+	writeLoggerName(buf, uint32(unsafe.Sizeof(EVENT_TRACE_PROPERTIES{})), SessionName)
+	r, _, _ := procControlTraceW.Call(
+		0,
+		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(SessionName))),
+		uintptr(unsafe.Pointer(&buf[0])),
+		code,
+	)
+	return r
 }
 
 // Lost reports what the session itself dropped, which is different from what the

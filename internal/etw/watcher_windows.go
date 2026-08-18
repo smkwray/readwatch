@@ -37,6 +37,14 @@ type Counters struct {
 	Observed  uint64 // read events decoded, machine-wide
 	Named     uint64 // of those, resolved to a path
 	Published uint64 // of those, inside a watched folder and handed on
+	// The remaining ways a read can fail to reach the log, kept apart because
+	// they have different causes and different fixes. Collapsing them into one
+	// number makes a broken correlation and a busy machine look the same.
+	BuffersLost  uint64 // real-time buffers the session lost
+	Collisions   uint64 // reused IRP values, both sides quarantined
+	Expired      uint64 // started reads whose completion never arrived
+	UnboundRoots uint64 // watched folders whose volume could not be resolved
+	DrainTimeout bool   // teardown gave up waiting for the consumer
 }
 
 const windowsToUnixEpoch100ns int64 = 116444736000000000
@@ -73,6 +81,11 @@ const (
 	// naming path rather than a fallback: on a qualification run 3,893 of 4,965
 	// resolved reads were named by a sweep, not at completion.
 	sweepInterval = 2 * time.Second
+	// pendingMaxAge is how long a started read waits for its completion. IRP
+	// values are pointers the kernel reuses, so an entry whose OperationEnd was
+	// lost must not sit there until some later operation's completion consumes
+	// it and publishes this read with that operation's status and byte count.
+	pendingMaxAge = 60 * time.Second
 	// drainTimeout bounds the wait for ProcessTrace to return at teardown.
 	// Microsoft documents that it can take seconds and may still be delivering
 	// queued events, so this is generous rather than tight.
@@ -136,6 +149,8 @@ type Watcher struct {
 	drainTimedOut         atomic.Bool
 	retired               atomic.Uint64
 	unboundRoots          atomic.Uint64
+	collisions            atomic.Uint64
+	expired               atomic.Uint64
 }
 
 // errAlreadyActive guards the one-per-process rule. ETW's callback is a C
@@ -256,16 +271,21 @@ func (w *Watcher) Running() bool { return w.running.Load() }
 
 func (w *Watcher) Counters() Counters {
 	w.rmu.Lock()
-	lost, known := w.sessionLost, w.lostKnown
+	lost, bufs, known := w.sessionLost, w.lostBufs, w.lostKnown
 	w.rmu.Unlock()
 	return Counters{
-		Dropped:     w.dropped.Load(),
-		NeverNamed:  w.neverNamed.Load(),
-		SessionLost: uint64(lost),
-		LostKnown:   known,
-		Observed:    w.observed.Load(),
-		Named:       w.named.Load(),
-		Published:   w.published.Load(),
+		Dropped:      w.dropped.Load(),
+		NeverNamed:   w.neverNamed.Load(),
+		SessionLost:  uint64(lost),
+		LostKnown:    known,
+		Observed:     w.observed.Load(),
+		Named:        w.named.Load(),
+		Published:    w.published.Load(),
+		BuffersLost:  uint64(bufs),
+		Collisions:   w.collisions.Load(),
+		Expired:      w.expired.Load(),
+		UnboundRoots: w.unboundRoots.Load(),
+		DrainTimeout: w.drainTimedOut.Load(),
 	}
 }
 
@@ -312,7 +332,7 @@ func (w *Watcher) Start() error {
 	if err := s.waitConsumerReady(5 * time.Second); err != nil {
 		w.running.Store(false)
 		active.Store(nil)
-		s.Stop()
+		_ = s.Stop()
 		<-consumerDone
 		w.session = nil
 		return err
@@ -361,7 +381,13 @@ func (w *Watcher) Stop() {
 	// receive the first session's events as if they were its own.
 	w.running.Store(false)
 	close(stop)
-	s.Stop()
+	if err := s.Stop(); err != nil {
+		// A session that outlives the process is the one thing this package must
+		// never leave behind, so a stop that did not take is reported rather than
+		// swallowed. The next start clears an orphan by name, but nobody should
+		// have to find out that way.
+		w.report(err)
+	}
 	<-done
 	active.Store(nil)
 }
@@ -376,6 +402,7 @@ func (w *Watcher) housekeeping(consumerDone chan struct{}) {
 		select {
 		case <-sweep.C:
 			w.sweepDeferred(false)
+			w.expirePending()
 			w.rotateNames()
 		case <-w.stop:
 			// The stream is still being drained, and the rundown a system logger
@@ -427,10 +454,21 @@ func (w *Watcher) sweepDeferred(final bool) {
 	if readd == nil {
 		return
 	}
+	// The cap has to hold across the merge, not just on insert. Detaching the
+	// parked set reset the count to zero, so callbacks could fill another whole
+	// generation while the sweep ran and the unresolved set was then added back
+	// on top of it without a check - the structure grew by a cap's worth every
+	// sweep. What does not fit is dropped and counted, never quietly kept.
 	w.rmu.Lock()
 	for k, v := range readd {
-		w.deferred[k] = append(w.deferred[k], v...)
-		w.deferredHeld += len(v)
+		for _, p := range v {
+			if w.deferredHeld >= deferredMax {
+				w.dropped.Add(1)
+				continue
+			}
+			w.deferred[k] = append(w.deferred[k], p)
+			w.deferredHeld++
+		}
 	}
 	w.rmu.Unlock()
 }
@@ -522,6 +560,7 @@ func (w *Watcher) pend(irp uint64, p pendingRead) {
 		// the only safe answer: publishing either could attach one operation's
 		// outcome to the other's file.
 		delete(w.pending, irp)
+		w.collisions.Add(1)
 		return
 	}
 	if len(w.pending) >= pendingReadMax {
@@ -531,6 +570,21 @@ func (w *Watcher) pend(irp uint64, p pendingRead) {
 		w.pending = make(map[uint64]pendingRead, 1<<12)
 	}
 	w.pending[irp] = p
+}
+
+// expirePending drops started reads whose completion never arrived. Each one is
+// counted: a read that started and was never resolved is a gap in the record,
+// and leaving it in the map turns it into a future misattribution instead.
+func (w *Watcher) expirePending() {
+	cutoff := time.Now().UTC().Add(-pendingMaxAge)
+	w.rmu.Lock()
+	defer w.rmu.Unlock()
+	for irp, p := range w.pending {
+		if p.at.IsZero() || p.at.Before(cutoff) {
+			delete(w.pending, irp)
+			w.expired.Add(1)
+		}
+	}
 }
 
 func (w *Watcher) takePending(irp uint64) (pendingRead, bool) {
