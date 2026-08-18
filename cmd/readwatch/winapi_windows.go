@@ -898,9 +898,11 @@ var (
 	// else, so the image and the owner have to be asked for separately.
 	procOpenProcess                = kernel32.NewProc("OpenProcess")
 	procQueryFullProcessImageNameW = kernel32.NewProc("QueryFullProcessImageNameW")
-	procGetFileAttributesW         = kernel32.NewProc("GetFileAttributesW")
-	procMoveFileExW                = kernel32.NewProc("MoveFileExW")
-	procCreateFileW                = kernel32.NewProc("CreateFileW")
+	// Creation time is what tells a live process from a reused id.
+	procGetProcessTimes    = kernel32.NewProc("GetProcessTimes")
+	procGetFileAttributesW = kernel32.NewProc("GetFileAttributesW")
+	procMoveFileExW        = kernel32.NewProc("MoveFileExW")
+	procCreateFileW        = kernel32.NewProc("CreateFileW")
 	// The capability set: identify an open object and find it again by identity
 	// alone, without consulting its configured name.
 	procGetFileInformationByHandle      = kernel32.NewProc("GetFileInformationByHandle")
