@@ -27,6 +27,10 @@ was out could not even be added.
 - The window's summary names the mechanism in use. If you asked for markers and a watched folder
   made that impossible, ReadWatch says so rather than quietly running the other one.
 - Settings offers the choice, with what each option costs and what each can see written next to it.
+- **What event tracing cannot do, it says rather than silently skips.** Folder listings are
+  unavailable while it runs, and the window says so. A read whose process cannot be identified with
+  certainty — a short-lived reader that has already exited, whose process id Windows has since given
+  to something else — is reported with the process left blank rather than named wrongly.
 
 ### Changed behaviour
 

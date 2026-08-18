@@ -43,7 +43,10 @@ most USB sticks ship.
 writes nothing to your drives and starts instantly on any of them, including exFAT and encrypted
 volumes. The provider cannot be filtered by folder, so ReadWatch sees the whole machine's file
 activity and discards what you did not ask for — which costs a little CPU continuously, whether you
-watch one folder or twenty. It does not report a read made purely through a memory mapping.
+watch one folder or twenty. It does not report a read made purely through a memory mapping, and it
+cannot report folder listings, so that setting is unavailable while it is running and ReadWatch says
+so. It also leaves the process and user blank rather than guessing when a short-lived reader has
+already exited and its process id has been reused.
 
 **Which one runs.** Markers when every watched folder can carry one, event tracing when any folder
 cannot — so a folder on a USB stick is watched rather than refused. Never both at once, since a
