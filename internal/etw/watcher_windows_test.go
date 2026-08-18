@@ -387,3 +387,52 @@ func TestEventTimeUsesTheProviderTimestamp(t *testing.T) {
 		t.Fatalf("eventTime(0) = %s, want the zero time", got)
 	}
 }
+
+func TestParkingStaysBoundedAcrossASweep(t *testing.T) {
+	// The sweep detaches the parked set, which reset the count to zero. Callbacks
+	// could then fill another whole generation while it ran, and the unresolved
+	// set was added back on top without a check - the structure grew by a cap's
+	// worth every sweep.
+	w := newTestWatcher(t, []string{`C:\Watched`}, nil)
+	for i := 0; i < deferredMax; i++ {
+		w.park(pendingRead{fileKey: uint64(i + 1)})
+	}
+	// Nothing can name any of these, so the sweep tries to put them all back.
+	w.sweepDeferred(false)
+	w.rmu.Lock()
+	held := w.deferredHeld
+	w.rmu.Unlock()
+	if held > deferredMax {
+		t.Fatalf("parked set grew to %d across a sweep, cap is %d", held, deferredMax)
+	}
+}
+
+func TestAStartedReadWhoseCompletionNeverArrivesExpires(t *testing.T) {
+	// IRP values are pointers the kernel reuses. An entry whose OperationEnd was
+	// lost must not sit there until some later operation's completion consumes it
+	// and publishes this read with that operation's status and byte count.
+	w := newTestWatcher(t, []string{`C:\Watched`}, nil)
+	w.pend(0x1000, pendingRead{fileKey: 1, pid: 5, at: time.Now().UTC().Add(-2 * pendingMaxAge)})
+	w.pend(0x2000, pendingRead{fileKey: 2, pid: 5, at: time.Now().UTC()})
+
+	w.expirePending()
+
+	if _, ok := w.takePending(0x1000); ok {
+		t.Error("a read older than the maximum age survived; a reused IRP could complete it")
+	}
+	if _, ok := w.takePending(0x2000); !ok {
+		t.Error("a recent read was expired")
+	}
+	if w.expired.Load() != 1 {
+		t.Errorf("expiry counted %d, want 1 — an unresolved read is a gap in the record", w.expired.Load())
+	}
+}
+
+func TestIRPCollisionsAreCounted(t *testing.T) {
+	w := newTestWatcher(t, nil, nil)
+	w.pend(0x99, pendingRead{fileKey: 1})
+	w.pend(0x99, pendingRead{fileKey: 2})
+	if w.collisions.Load() != 1 {
+		t.Fatalf("collisions counted %d, want 1 — quarantining silently hides a real loss", w.collisions.Load())
+	}
+}

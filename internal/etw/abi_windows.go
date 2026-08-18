@@ -53,6 +53,9 @@ const (
 	ERROR_SUCCESS           = 0
 	ERROR_ALREADY_EXISTS    = 183
 	ERROR_CTX_CLOSE_PENDING = 7007
+	// Returned when no session of that name exists, which is the state a stale
+	// cleanup is trying to reach rather than a failure to reach it.
+	ERROR_WMI_INSTANCE_NOT_FOUND = 4201
 
 	EVENT_TRACE_CONTROL_STOP  = 1
 	EVENT_TRACE_CONTROL_QUERY = 0
