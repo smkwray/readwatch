@@ -32,9 +32,6 @@ const (
 	fileIoFileRundown = 36
 )
 
-// keywordsAny is FILENAME|FILEIO|OP_END|CREATE|READ.
-const keywordsAny = 0x1F0
-
 var errShort = errors.New("event payload shorter than its declared layout")
 
 // readEvent is Read (15). It carries no path: the name has to come from a

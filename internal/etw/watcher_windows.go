@@ -4,6 +4,7 @@ package etw
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,7 +46,14 @@ type Counters struct {
 	Crowded      uint64 // one file's reads beyond its share of the parking queue
 	Expired      uint64 // started reads whose completion never arrived
 	UnboundRoots uint64 // watched folders whose volume could not be resolved
-	DrainTimeout bool   // teardown gave up waiting for the consumer
+	// SnapshotNames is how many already-open files the startup snapshot named;
+	// SnapshotStale how many it discarded as already closed; SnapshotFailed
+	// whether it could not be taken at all, which is a degraded start rather than
+	// a failure to monitor.
+	SnapshotNames  uint64
+	SnapshotStale  uint64
+	SnapshotFailed bool
+	DrainTimeout   bool // teardown gave up waiting for the consumer
 }
 
 const windowsToUnixEpoch100ns int64 = 116444736000000000
@@ -169,6 +177,14 @@ type Watcher struct {
 	collisions            atomic.Uint64
 	expired               atomic.Uint64
 	crowded               atomic.Uint64
+	snapshotNames         atomic.Uint64
+	snapshotStale         atomic.Uint64
+	snapshotFailed        atomic.Bool
+	initialised           atomic.Bool
+	// retiredDuringInit records identities the main session saw closed or deleted
+	// while the startup snapshot was being collected, so a name that was already
+	// stale when it arrived is never merged. Dropped once initialisation ends.
+	retiredDuringInit map[uint64]bool
 }
 
 // errAlreadyActive guards the one-per-process rule. ETW's callback is a C
@@ -292,19 +308,22 @@ func (w *Watcher) Counters() Counters {
 	lost, bufs, known := w.sessionLost, w.lostBufs, w.lostKnown
 	w.rmu.Unlock()
 	return Counters{
-		Dropped:      w.dropped.Load(),
-		NeverNamed:   w.neverNamed.Load(),
-		SessionLost:  uint64(lost),
-		LostKnown:    known,
-		Observed:     w.observed.Load(),
-		Named:        w.named.Load(),
-		Published:    w.published.Load(),
-		BuffersLost:  uint64(bufs),
-		Collisions:   w.collisions.Load(),
-		Crowded:      w.crowded.Load(),
-		Expired:      w.expired.Load(),
-		UnboundRoots: w.unboundRoots.Load(),
-		DrainTimeout: w.drainTimedOut.Load(),
+		Dropped:        w.dropped.Load(),
+		NeverNamed:     w.neverNamed.Load(),
+		SessionLost:    uint64(lost),
+		LostKnown:      known,
+		Observed:       w.observed.Load(),
+		Named:          w.named.Load(),
+		Published:      w.published.Load(),
+		BuffersLost:    uint64(bufs),
+		Collisions:     w.collisions.Load(),
+		Crowded:        w.crowded.Load(),
+		Expired:        w.expired.Load(),
+		UnboundRoots:   w.unboundRoots.Load(),
+		SnapshotNames:  w.snapshotNames.Load(),
+		SnapshotStale:  w.snapshotStale.Load(),
+		SnapshotFailed: w.snapshotFailed.Load(),
+		DrainTimeout:   w.drainTimedOut.Load(),
 	}
 }
 
@@ -320,6 +339,7 @@ func (w *Watcher) Start() error {
 
 	w.initState()
 	w.bindRoots()
+	w.retiredDuringInit = make(map[uint64]bool, 1<<12)
 
 	// Claimed before the session is created, and by compare-and-swap rather than
 	// a check followed by a store: two watchers sharing one callback would each
@@ -361,8 +381,56 @@ func (w *Watcher) Start() error {
 	if err := s.requestRundown(); err != nil {
 		w.report(err)
 	}
+
+	// The startup filename snapshot, before a single read is enabled. Reads on
+	// handles that predate this session cannot be named from the session's own
+	// stream until it stops, so they are named here instead - from a second,
+	// short-lived logger whose teardown enumerates every open file.
+	//
+	// Any identity whose handle closed or was deleted while the snapshot was
+	// being taken is discarded rather than merged: the main session has been
+	// watching lifetime events throughout, and a name that was already stale when
+	// it arrived is exactly how a read of one file gets attributed to another.
+	if names, err := snapshotOpenFiles(); err != nil {
+		w.snapshotFailed.Store(true)
+		w.report(fmt.Errorf("startup filename snapshot unavailable, reads on handles opened before now may be unnamed until monitoring stops: %w", err))
+	} else {
+		w.mergeSnapshot(names)
+	}
+
+	if err := s.enableReads(); err != nil {
+		w.running.Store(false)
+		active.Store(nil)
+		_ = s.Stop()
+		<-consumerDone
+		w.session = nil
+		return err
+	}
+	w.initialised.Store(true)
 	go w.housekeeping(consumerDone)
 	return nil
+}
+
+// mergeSnapshot folds the startup names in, skipping any identity the main
+// session saw close or be deleted while the snapshot was being collected.
+func (w *Watcher) mergeSnapshot(names map[uint64]string) {
+	w.rmu.Lock()
+	defer w.rmu.Unlock()
+	kept := 0
+	for key, name := range names {
+		if w.retiredDuringInit[key] {
+			w.snapshotStale.Add(1)
+			continue
+		}
+		if _, already := w.byKeyCur[key]; already {
+			// The live stream already named it, and the live stream is newer.
+			continue
+		}
+		w.byRunCur[key] = name
+		kept++
+	}
+	w.snapshotNames.Store(uint64(kept))
+	w.retiredDuringInit = nil
 }
 
 // Stop tears down the session and waits for the consumer to leave ProcessTrace.
@@ -561,6 +629,9 @@ func (w *Watcher) forget(cur, prev *map[uint64]string, id uint64) {
 	w.rmu.Lock()
 	delete(*cur, id)
 	delete(*prev, id)
+	if w.retiredDuringInit != nil {
+		w.retiredDuringInit[id] = true
+	}
 	w.rmu.Unlock()
 }
 
