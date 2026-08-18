@@ -133,11 +133,20 @@ func (b *BoundConfig) AttachedRoots() []etw.BoundRoot {
 	return roots
 }
 
+// dosVolumeName turns the recorded volume GUID path into the DOS device name
+// QueryDosDevice takes: "\?\Volume{...}\" becomes "Volume{...}". Separated
+// out so it can be tested, because getting it wrong is silent - the lookup
+// simply finds nothing, every root is dropped as unbound, and monitoring
+// refuses to start with no clue as to why. Which is exactly what happened.
+func dosVolumeName(guid string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(guid, `\\?\`), `\`)
+}
+
 // deviceForVolumeGUID turns the volume GUID the binder recorded into the device
 // name the provider uses in its events. The GUID is what the folder was bound
 // to, so this cannot drift the way a drive letter can.
 func deviceForVolumeGUID(guid string) (string, bool) {
-	trimmed := strings.TrimSuffix(strings.TrimPrefix(guid, `\?\`), `\`)
+	trimmed := dosVolumeName(guid)
 	if trimmed == "" {
 		return "", false
 	}

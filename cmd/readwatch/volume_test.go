@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"unsafe"
 )
 
 // The flag words are the ones this host reports, captured in
@@ -152,4 +154,69 @@ func TestOwnerFacingRewritesTheInternalPath(t *testing.T) {
 	if ownerFacing(nil, guid, `D:\x`) != nil {
 		t.Error("nil must stay nil")
 	}
+}
+
+// readUnbufferedFile reads a file in a way that cannot be served from cache, so
+// a service-level test measures the watcher rather than the page cache.
+func readUnbufferedFile(path string) error {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	const fileFlagNoBuffering = 0x20000000
+	const sectorAlign = 4096
+	h, err := syscall.CreateFile(p, syscall.GENERIC_READ,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE, nil,
+		syscall.OPEN_EXISTING, fileFlagNoBuffering, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.CloseHandle(h)
+	raw := make([]byte, 2*sectorAlign)
+	off := (sectorAlign - int(uintptr(unsafe.Pointer(&raw[0]))%uintptr(sectorAlign))) % sectorAlign
+	buf := raw[off : off+sectorAlign]
+	for i := 0; i < 8; i++ {
+		if _, err := syscall.Seek(h, int64(i)*3*sectorAlign, 0); err != nil {
+			return err
+		}
+		var n uint32
+		if err := syscall.ReadFile(h, buf, &n, nil); err != nil && err != syscall.ERROR_HANDLE_EOF {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestDOSVolumeNameStripsTheGUIDPathForm(t *testing.T) {
+	// Getting this wrong is silent: the device lookup finds nothing, every root
+	// is dropped as unbound, and monitoring refuses to start with no clue why.
+	// That is exactly what happened, and only a service-level test caught it.
+	cases := map[string]string{
+		`\\?\Volume{6ee44c6e-0974-4cb8-bf7d-24806a0930fc}\`: `Volume{6ee44c6e-0974-4cb8-bf7d-24806a0930fc}`,
+		`\\?\Volume{6ee44c6e-0974-4cb8-bf7d-24806a0930fc}`:  `Volume{6ee44c6e-0974-4cb8-bf7d-24806a0930fc}`,
+		`Volume{6ee44c6e-0974-4cb8-bf7d-24806a0930fc}`:      `Volume{6ee44c6e-0974-4cb8-bf7d-24806a0930fc}`,
+		``: ``,
+	}
+	for in, want := range cases {
+		if got := dosVolumeName(in); got != want {
+			t.Errorf("dosVolumeName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDeviceForVolumeGUIDResolvesARealVolume(t *testing.T) {
+	// End to end against this machine: the GUID the binder records must resolve
+	// to the device name the provider uses, or no folder can ever be watched.
+	guid, _, _, err := volumeGUIDPath(`C:\`)
+	if err != nil {
+		t.Skipf("cannot resolve C: %v", err)
+	}
+	device, ok := deviceForVolumeGUID(guid)
+	if !ok {
+		t.Fatalf("the volume GUID %q recorded for C: resolved to no device", guid)
+	}
+	if !strings.HasPrefix(strings.ToLower(device), `\device\`) {
+		t.Fatalf("device = %q, want a Device name", device)
+	}
+	t.Logf("%s -> %s", guid, device)
 }
