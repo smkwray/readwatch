@@ -40,8 +40,11 @@ because those filesystems have no security descriptors for an audit entry to liv
 most USB sticks ship.
 
 **Event tracing.** It runs an Event Tracing for Windows session on the kernel's file provider. This
-writes nothing to your drives and starts instantly on any of them, including exFAT and encrypted
-volumes. The provider cannot be filtered by folder, so ReadWatch sees the whole machine's file
+writes nothing to your drives and works on any of them, including exFAT and encrypted volumes.
+Before it starts watching it spends about a second building a list of the files already open on this
+PC — without that, Windows will not tell it the name of a file whose handle was already open, and
+those reads would go unattributed for as long as monitoring ran. Names it cannot establish are
+recorded as gaps and never guessed. The provider cannot be filtered by folder, so ReadWatch sees the whole machine's file
 activity and discards what you did not ask for — which costs a little CPU continuously, whether you
 watch one folder or twenty. It does not report a read made purely through a memory mapping, and it
 cannot report folder listings, so that setting is unavailable while it is running and ReadWatch says

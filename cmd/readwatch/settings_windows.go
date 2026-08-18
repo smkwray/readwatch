@@ -311,7 +311,8 @@ func mechanismHintText(m settings.Mechanism) string {
 		return "Writes nothing to the drives and starts instantly on any of them, including exFAT " +
 			"and encrypted volumes. Watches the whole machine's file activity and discards the " +
 			"rest, which costs a little CPU all the time. Does not see a read made purely through " +
-			"a memory mapping, and cannot report folder listings."
+			"a memory mapping, and cannot report folder listings. Before it starts watching it " +
+			"builds a list of the files already open on this PC, which takes about a second."
 	}
 	return "Uses markers when every watched folder can take one, and event tracing otherwise — " +
 		"so a folder on a USB stick is watched rather than refused."
