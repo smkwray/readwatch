@@ -39,6 +39,24 @@ type Counters struct {
 	Published uint64 // of those, inside a watched folder and handed on
 }
 
+const windowsToUnixEpoch100ns int64 = 116444736000000000
+
+// eventTime converts the FILETIME-form timestamp ProcessTrace places in
+// EVENT_HEADER.TimeStamp. The consumer does not set
+// PROCESS_TRACE_MODE_RAW_TIMESTAMP, so this is 100ns ticks since 1601 rather
+// than raw QPC counts.
+//
+// This is the time the read happened. Stamping time.Now() in the callback
+// instead recorded when the event was *delivered*, which for anything the
+// provider buffers - and for everything the teardown rundown carries - is a
+// different and later moment.
+func eventTime(ticks int64) time.Time {
+	if ticks <= windowsToUnixEpoch100ns {
+		return time.Time{}
+	}
+	return time.Unix(0, (ticks-windowsToUnixEpoch100ns)*100).UTC()
+}
+
 const (
 	// nameMapMax bounds each generation of the name maps. A service runs for
 	// hours, not the twelve seconds a probe runs, so names must be retired or the
@@ -55,6 +73,10 @@ const (
 	// naming path rather than a fallback: on a qualification run 3,893 of 4,965
 	// resolved reads were named by a sweep, not at completion.
 	sweepInterval = 2 * time.Second
+	// drainTimeout bounds the wait for ProcessTrace to return at teardown.
+	// Microsoft documents that it can take seconds and may still be delivering
+	// queued events, so this is generous rather than tight.
+	drainTimeout = 30 * time.Second
 	// The size bound is checked on every sweep rather than on a slow timer of its
 	// own. A minute is a long time at this event rate: the maps could take on
 	// millions of entries between checks, which is not a bound in any useful
@@ -78,10 +100,11 @@ type pendingRead struct {
 // context that survives the round trip, so the active watcher is found through a
 // package-level pointer.
 type Watcher struct {
-	mu      sync.Mutex
-	session *session
-	stop    chan struct{}
-	done    chan struct{}
+	mu           sync.Mutex
+	session      *session
+	stop         chan struct{}
+	done         chan struct{}
+	consumerDone chan struct{}
 
 	// keep names the paths whose reads are wanted. Everything else on the machine
 	// is decoded and discarded: this provider cannot be filtered by path, so the
@@ -110,6 +133,8 @@ type Watcher struct {
 	sessionLost, lostBufs uint32
 	lostKnown             bool
 	running               atomic.Bool
+	drainTimedOut         atomic.Bool
+	retired               atomic.Uint64
 }
 
 // errAlreadyActive guards the one-per-process rule. ETW's callback is a C
@@ -214,6 +239,7 @@ func (w *Watcher) Start() error {
 	w.running.Store(true)
 
 	consumerDone := make(chan struct{})
+	w.consumerDone = consumerDone
 	go func() {
 		defer close(consumerDone)
 		if err := s.openAndProcess(eventCallback); err != nil {
@@ -258,11 +284,24 @@ func (w *Watcher) Stop() {
 	w.sessionLost, w.lostBufs, w.lostKnown = lost, bufs, known
 	w.rmu.Unlock()
 
+	// Order matters more here than anywhere else in the package.
+	//
+	// Stopping the session is what provokes the teardown rundown, and that
+	// rundown is the only thing that names a handle opened before the session
+	// started - the whole reason unresolved reads are parked. Clearing the
+	// callback's global before stopping the session therefore threw away exactly
+	// the events the design exists to collect: onEvent discards everything while
+	// active is nil. The callback stays live until the consumer has actually left
+	// ProcessTrace.
+	//
+	// It also has to stay claimed that long. Releasing the slot while the old
+	// consumer is still delivering would let a second watcher claim it and
+	// receive the first session's events as if they were its own.
 	w.running.Store(false)
-	active.Store(nil)
 	close(stop)
 	s.Stop()
 	<-done
+	active.Store(nil)
 }
 
 // housekeeping runs the two periodic jobs: retrying reads that have no name yet,
@@ -277,12 +316,17 @@ func (w *Watcher) housekeeping(consumerDone chan struct{}) {
 			w.sweepDeferred(false)
 			w.rotateNames()
 		case <-w.stop:
-			// The stream is still being drained: the rundown a system logger emits
-			// at teardown is exactly what names the oldest handles, so the final
-			// sweep waits for the consumer to finish rather than racing it.
+			// The stream is still being drained, and the rundown a system logger
+			// emits at teardown is exactly what names the oldest handles. So the
+			// final sweep waits for the consumer to leave ProcessTrace rather than
+			// racing it. Microsoft documents that ProcessTrace can take seconds to
+			// return and may still be delivering queued events, so the wait is
+			// generous; a wait that expires is counted rather than passed over,
+			// because everything still parked at that point is a real gap.
 			select {
 			case <-consumerDone:
-			case <-time.After(5 * time.Second):
+			case <-time.After(drainTimeout):
+				w.drainTimedOut.Store(true)
 			}
 			w.sweepDeferred(true)
 			return
@@ -386,6 +430,19 @@ func (w *Watcher) lookup(obj, key uint64) (string, bool) {
 	return "", false
 }
 
+// forget retires an identity from both generations. Promotion makes a
+// single-generation delete useless: the next lookup would pull the stale name
+// straight back into the current map.
+func (w *Watcher) forget(cur, prev *map[uint64]string, id uint64) {
+	if id == 0 {
+		return
+	}
+	w.rmu.Lock()
+	delete(*cur, id)
+	delete(*prev, id)
+	w.rmu.Unlock()
+}
+
 func (w *Watcher) learn(m *map[uint64]string, id uint64, name string) {
 	if id == 0 || name == "" {
 		return
@@ -484,10 +541,16 @@ func onEvent(rec *EVENT_RECORD) uintptr {
 
 	if provider.equals(fileIoGUID) {
 		switch opcode {
-		case fileIoNameType, fileIoFileCreate, fileIoFileDelete, fileIoFileRundown:
-			obj, name, err := decodeFileIoName(payload(rec))
-			if err == nil {
+		case fileIoNameType, fileIoFileCreate, fileIoFileRundown:
+			if obj, name, err := decodeFileIoName(payload(rec)); err == nil {
 				w.learn(&w.byRunCur, obj, name)
+			}
+		case fileIoFileDelete:
+			// A delete event says this identity has stopped meaning this file. It
+			// was being fed to learn along with the create events, which taught the
+			// map a mapping at the exact moment it became false.
+			if obj, _, err := decodeFileIoName(payload(rec)); err == nil {
+				w.forget(&w.byRunCur, &w.byRunPrev, obj)
 			}
 		}
 		return 0
@@ -497,19 +560,33 @@ func onEvent(rec *EVENT_RECORD) uintptr {
 	}
 
 	switch id {
-	case evNameCreate, evNameDelete:
+	case evNameCreate:
 		if n, err := decodeName(payload(rec)); err == nil {
 			w.learn(&w.byKeyCur, n.FileKey, n.Name)
+		}
+	case evNameDelete:
+		if n, err := decodeName(payload(rec)); err == nil {
+			w.forget(&w.byKeyCur, &w.byKeyPrev, n.FileKey)
 		}
 	case evCreate:
 		if c, err := decodeCreate(payload(rec)); err == nil {
 			w.learn(&w.byObjCur, c.FileObject, c.Name)
 		}
 	case evCleanup, evClose:
-		// Deliberately not retired here. A read can complete after its handle is
-		// closed, and dropping the name at close is how those reads lose their
-		// path. Bounding is done by generation rotation instead.
-		_, _ = decodeClose(payload(rec))
+		// The file object is being freed, and the kernel reuses those addresses.
+		// Keeping the mapping meant a later object at the same address could be
+		// named as this file - a read of B reported as a read of A, which is worse
+		// than reporting nothing.
+		//
+		// Only the FileObject is retired. FileKey identifies the stream, which
+		// outlives any one handle and may still be open elsewhere; classic
+		// FileDelete is what retires that. A read already in flight keeps whatever
+		// path it copied at start, and one that never learned a name becomes a
+		// counted gap rather than a guess.
+		if c, err := decodeClose(payload(rec)); err == nil {
+			w.forget(&w.byObjCur, &w.byObjPrev, c.FileObject)
+			w.retired.Add(1)
+		}
 	case evRead:
 		r, err := decodeRead(payload(rec))
 		if err != nil {
@@ -521,7 +598,7 @@ func onEvent(rec *EVENT_RECORD) uintptr {
 			fileKey:    r.FileKey,
 			pid:        rec.EventHeader.ProcessId,
 			tid:        r.IssuingThreadID,
-			at:         time.Now().UTC(),
+			at:         eventTime(rec.EventHeader.TimeStamp),
 		}
 		if name, ok := w.lookup(r.FileObject, r.FileKey); ok {
 			p.path = name
