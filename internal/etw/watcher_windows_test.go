@@ -515,3 +515,40 @@ func TestTheLiveStreamOutranksTheStartupSnapshot(t *testing.T) {
 		t.Fatalf("the snapshot overwrote a newer live name with %q", name)
 	}
 }
+
+func TestACreateReusingAnIRPQuarantinesThePendingRead(t *testing.T) {
+	// The kernel reuses IRP addresses. If a create takes the address a read is
+	// still waiting on, that read's completion is never coming, and the next
+	// OperationEnd for the address belongs to the create — so publishing the read
+	// would give it another operation's status and byte count. Expiry alone only
+	// bounds how long the wrong answer stays possible.
+	w := newTestWatcher(t, []string{`C:\Watched`}, func(r Read) {
+		t.Errorf("a read completed by another operation's outcome was published: %+v", r)
+	})
+	const irp = 0xA11CE
+	w.pend(irp, pendingRead{fileKey: 1, pid: 7, at: time.Now().UTC()})
+	w.quarantine(irp)
+
+	if _, ok := w.takePending(irp); ok {
+		t.Fatal("the read was still waiting to be completed by the create's OperationEnd")
+	}
+	if w.collisions.Load() != 1 {
+		t.Errorf("the quarantine was not counted; a dropped read is a real gap")
+	}
+	// An IRP nothing is waiting on is not an event worth counting.
+	w.quarantine(0xBEEF)
+	if w.collisions.Load() != 1 {
+		t.Error("quarantining an unknown IRP counted as a loss")
+	}
+}
+
+func TestTheFenceTimeoutIsReported(t *testing.T) {
+	// If the consumer cannot be shown to have caught up, a stale name may have
+	// slipped into the snapshot. That has to be visible rather than assumed away.
+	w := New(nil, 0, nil, nil)
+	w.initState()
+	w.fenceTimedOut.Store(true)
+	if !w.Counters().FenceTimedOut {
+		t.Fatal("a fence that timed out was not reported")
+	}
+}

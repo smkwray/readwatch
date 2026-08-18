@@ -344,6 +344,7 @@ func (s *session) openAndProcess(callback uintptr, token unsafe.Pointer) error {
 		LoggerName:       syscall.StringToUTF16Ptr(SessionName),
 		ProcessTraceMode: PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD,
 		EventCallback:    callback,
+		BufferCallback:   bufferCallback,
 		Context:          token,
 	}
 	r, _, _ := procOpenTraceW.Call(uintptr(unsafe.Pointer(&logfile)))
@@ -364,6 +365,23 @@ func (s *session) openAndProcess(callback uintptr, token unsafe.Pointer) error {
 	s.mu.Unlock()
 	if rc != ERROR_SUCCESS && rc != ERROR_CTX_CLOSE_PENDING {
 		return fmt.Errorf("ProcessTrace: %w", syscall.Errno(rc))
+	}
+	return nil
+}
+
+// flush pushes whatever is sitting in the session's buffers out to the consumer,
+// so a barrier can be waited on rather than guessed at. It is only half of one:
+// what the consumer has actually processed is what the buffer callback reports.
+func (s *session) flush() error {
+	buf, _ := propertiesBuffer(SessionName)
+	writeLoggerName(buf, uint32(unsafe.Sizeof(EVENT_TRACE_PROPERTIES{})), SessionName)
+	r, _, _ := procControlTraceW.Call(
+		uintptr(s.handle), 0,
+		uintptr(unsafe.Pointer(&buf[0])),
+		EVENT_TRACE_CONTROL_FLUSH,
+	)
+	if r != ERROR_SUCCESS {
+		return fmt.Errorf("ControlTrace(flush %s): %w", SessionName, syscall.Errno(r))
 	}
 	return nil
 }
