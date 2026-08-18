@@ -315,3 +315,70 @@ func TestPromotionAppliesToFileObjectNamesToo(t *testing.T) {
 		t.Fatal("a FileObject name used between rotations was still dropped")
 	}
 }
+
+func TestADeletedIdentityIsRetiredNotLearned(t *testing.T) {
+	// A delete event says this identity has stopped meaning this file. It used to
+	// be fed to learn alongside the create events, teaching the map a mapping at
+	// the exact moment it became false.
+	w := newTestWatcher(t, nil, nil)
+	const key = 0xDEAD01
+	w.learn(&w.byKeyCur, key, `\Device\HarddiskVolume3\gone.txt`)
+	if _, ok := w.lookup(0, key); !ok {
+		t.Fatal("setup: the name was not learned")
+	}
+	w.forget(&w.byKeyCur, &w.byKeyPrev, key)
+	if name, ok := w.lookup(0, key); ok {
+		t.Fatalf("a deleted identity still resolves to %q", name)
+	}
+}
+
+func TestRetirementClearsBothGenerations(t *testing.T) {
+	// Promotion makes a single-generation delete useless: the next lookup would
+	// pull the stale name straight back into the current map.
+	w := newTestWatcher(t, nil, nil)
+	const obj = 0xBEEF02
+	w.learn(&w.byObjCur, obj, `\Device\HarddiskVolume3\closing.txt`)
+	w.rotate() // the name is now only in prev
+	w.forget(&w.byObjCur, &w.byObjPrev, obj)
+	if name, ok := w.lookup(obj, 0); ok {
+		t.Fatalf("a retired name came back from the previous generation as %q", name)
+	}
+}
+
+func TestAReusedFileObjectCannotInheritTheOldName(t *testing.T) {
+	// The kernel reuses FILE_OBJECT addresses. Reporting a read of B as a read of
+	// A is worse than reporting nothing, so the close has to retire the mapping.
+	var got []Read
+	w := newTestWatcher(t, []string{`C:\Watched`}, func(r Read) { got = append(got, r) })
+	const obj = 0xABBA03
+
+	w.learn(&w.byObjCur, obj, `\Device\HarddiskVolume3\Watched\first.txt`)
+	w.forget(&w.byObjCur, &w.byObjPrev, obj) // Cleanup/Close frees the object
+
+	// The same address now belongs to a different file that nothing has named.
+	w.park(pendingRead{fileObject: obj, pid: 11, bytes: 8})
+	w.sweepDeferred(true)
+
+	for _, r := range got {
+		if r.Path == `C:\Watched\first.txt` {
+			t.Fatalf("a read of a reused file object was attributed to the closed file: %+v", r)
+		}
+	}
+	if w.neverNamed.Load() != 1 {
+		t.Fatalf("the unnameable read should be a counted gap, neverNamed=%d", w.neverNamed.Load())
+	}
+}
+
+func TestEventTimeUsesTheProviderTimestamp(t *testing.T) {
+	// The read's own time, not the moment the callback happened to run.
+	want := time.Date(2026, time.August, 17, 23, 24, 26, 751630900, time.UTC)
+	ticks := windowsToUnixEpoch100ns + want.UnixNano()/100
+	if got := eventTime(ticks); !got.Equal(want) {
+		t.Fatalf("eventTime(%d) = %s, want %s", ticks, got, want)
+	}
+	// A nonsense timestamp yields the zero time, which the pipeline replaces with
+	// now rather than reporting a read from 1601.
+	if got := eventTime(0); !got.IsZero() {
+		t.Fatalf("eventTime(0) = %s, want the zero time", got)
+	}
+}

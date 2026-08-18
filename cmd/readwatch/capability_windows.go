@@ -290,6 +290,15 @@ func bindOnLockedThread(pipe HANDLE, ownerSID string, public settings.PublicConf
 	upgradeErr := withPrivilege("SeSecurityPrivilege", func() error {
 		// Backwards, because a folder that fails here leaves the slice.
 		for i := len(out.Folders) - 1; i >= 0; i-- {
+			// Event tracing needs only the owner-opened, pinned directory handle.
+			// A volume-only identity cannot be upgraded to a SACL handle and must
+			// not be: there is no identity to reopen by, and marker mode never
+			// admits such a folder in the first place. Without this the folder was
+			// admitted by the leaf check and then dropped here, which is why the
+			// exFAT stick still did not work after the mechanism was fixed.
+			if out.Folders[i].Identity.VolumeOnly() {
+				continue
+			}
 			secure, err := openByIdentity(out.Folders[i].Identity)
 			if err == nil {
 				out.Folders[i].Security = secure
@@ -1105,11 +1114,14 @@ func markerCapableFolder(path string) (capable, known bool) {
 	case DRIVE_NO_ROOT_DIR, DRIVE_REMOTE:
 		return false, false
 	}
-	fs, err := volumeFileSystem(root)
+	// The same flag-backed predicate binding uses. Deriving eligibility from the
+	// filesystem's name here and from the volume's reported flags there is the
+	// double-derivation shape that already produced one defect.
+	traits, err := volumeTraitsFor(root)
 	if err != nil {
 		return false, false
 	}
-	return strings.EqualFold(fs, "NTFS") || strings.EqualFold(fs, "ReFS"), true
+	return traits.MarkerCapable(), true
 }
 
 // markerCapability reports, for each watched folder, whether it can carry a
