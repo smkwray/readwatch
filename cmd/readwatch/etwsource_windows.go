@@ -115,6 +115,13 @@ func (s *etwSource) Losses() map[string]uint64 {
 	add("reads whose completion never arrived", c.Expired)
 	add("operations sharing a reused identifier", c.Collisions)
 	add("reads beyond one file's share of the naming queue", c.Crowded)
+	add("filenames the bounded map could not admit", c.NamesRejected)
+	if c.FenceTimedOut {
+		add("startup filename snapshot merged without confirming the stream had caught up", 1)
+	}
+	if c.SnapshotFailed {
+		add("no startup filename snapshot; files already open may be unnamed until monitoring stops", 1)
+	}
 	add("watched folders whose volume could not be resolved", c.UnboundRoots)
 	if c.DrainTimeout {
 		add("teardown stopped waiting for the trace to finish", 1)

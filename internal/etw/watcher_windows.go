@@ -55,7 +55,10 @@ type Counters struct {
 	SnapshotNames  uint64
 	SnapshotStale  uint64
 	SnapshotFailed bool
-	DrainTimeout   bool // teardown gave up waiting for the consumer
+	// FenceTimedOut says the consumer could not be shown to have caught up before
+	// the snapshot was merged, so a stale name may have slipped through.
+	FenceTimedOut bool
+	DrainTimeout  bool // teardown gave up waiting for the consumer
 }
 
 const windowsToUnixEpoch100ns int64 = 116444736000000000
@@ -116,6 +119,9 @@ const (
 	// lost must not sit there until some later operation's completion consumes
 	// it and publishes this read with that operation's status and byte count.
 	pendingMaxAge = 60 * time.Second
+	// fenceTimeout bounds the wait for the consumer to catch up before the
+	// startup snapshot is merged.
+	fenceTimeout = 10 * time.Second
 	// drainTimeout bounds the wait for ProcessTrace to return at teardown.
 	// Microsoft documents that it can take seconds and may still be delivering
 	// queued events, so this is generous rather than tight.
@@ -194,6 +200,8 @@ type Watcher struct {
 	expired        atomic.Uint64
 	crowded        atomic.Uint64
 	namesRejected  atomic.Uint64
+	buffersSeen    atomic.Uint64
+	fenceTimedOut  atomic.Bool
 	snapshotNames  atomic.Uint64
 	snapshotStale  atomic.Uint64
 	snapshotFailed atomic.Bool
@@ -220,9 +228,10 @@ var errAlreadyActive = errors.New("an ETW watcher is already running in this pro
 // still delivering let one session's records enter a later watcher as if they
 // were its own.
 var (
-	consumers     sync.Map // token -> *Watcher
-	nextConsumer  atomic.Uint64
-	eventCallback = syscall.NewCallback(onEvent)
+	consumers      sync.Map // token -> *Watcher
+	nextConsumer   atomic.Uint64
+	eventCallback  = syscall.NewCallback(onEvent)
+	bufferCallback = syscall.NewCallback(onBuffer)
 	// active only enforces the one-session-at-a-time rule; it is never used to
 	// route a record.
 	active atomic.Pointer[Watcher]
@@ -373,6 +382,7 @@ func (w *Watcher) Counters() Counters {
 		SnapshotNames:  w.snapshotNames.Load(),
 		SnapshotStale:  w.snapshotStale.Load(),
 		SnapshotFailed: w.snapshotFailed.Load(),
+		FenceTimedOut:  w.fenceTimedOut.Load(),
 		DrainTimeout:   w.drainTimedOut.Load(),
 	}
 }
@@ -459,6 +469,15 @@ func (w *Watcher) Start() error {
 		w.snapshotFailed.Store(true)
 		w.report(fmt.Errorf("startup filename snapshot unavailable, reads on handles opened before now may be unnamed until monitoring stops: %w", err))
 	} else {
+		// Wait for the main consumer to have delivered everything buffered up to
+		// this point before merging. Without that barrier a close or delete that
+		// happened during collection could still be sitting in a buffer, and the
+		// snapshot's now-stale name would be merged ahead of the retirement that
+		// invalidates it.
+		if !w.awaitConsumerWatermark(s, fenceTimeout) {
+			w.fenceTimedOut.Store(true)
+			w.report(fmt.Errorf("the startup filename snapshot could not be reconciled within %s; names that went stale during collection may not have been excluded", fenceTimeout))
+		}
 		w.mergeSnapshot(names)
 	}
 
@@ -796,6 +815,21 @@ func (w *Watcher) expirePending() {
 	}
 }
 
+// quarantine drops a pending read whose IRP has been claimed by another
+// operation, and counts it. An unresolved read is a gap in the record; a read
+// completed by somebody else's outcome is worse than no read at all.
+func (w *Watcher) quarantine(irp uint64) {
+	if irp == 0 {
+		return
+	}
+	w.rmu.Lock()
+	if _, ok := w.pending[irp]; ok {
+		delete(w.pending, irp)
+		w.collisions.Add(1)
+	}
+	w.rmu.Unlock()
+}
+
 func (w *Watcher) takePending(irp uint64) (pendingRead, bool) {
 	w.rmu.Lock()
 	defer w.rmu.Unlock()
@@ -851,6 +885,44 @@ func (w *Watcher) report(err error) {
 	}
 }
 
+// onBuffer fires after a buffer's events have been delivered to onEvent. That
+// makes it the only thing in this package that can say what the *consumer* has
+// processed, as opposed to what the controller has flushed - which is the
+// difference the startup fence turns on.
+func onBuffer(logfile *EVENT_TRACE_LOGFILEW) uintptr {
+	if logfile == nil || logfile.Context == nil {
+		return 1
+	}
+	if v, ok := consumers.Load(uintptr(logfile.Context)); ok {
+		v.(*Watcher).buffersSeen.Add(1)
+	}
+	return 1 // keep processing
+}
+
+// awaitConsumerWatermark returns once the consumer has finished delivering at
+// least one buffer that began after this was called.
+//
+// A controller flush only says the events left the session. Merging the startup
+// snapshot at that point could still race a close or delete that was buffered
+// and not yet delivered, and that is exactly the sequence - close, key reused,
+// stale name merged - that attributes a read of one file to another.
+func (w *Watcher) awaitConsumerWatermark(s *session, timeout time.Duration) bool {
+	before := w.buffersSeen.Load()
+	if err := s.flush(); err != nil {
+		w.report(err)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		// Two buffers, not one: the first may have been in flight before the
+		// flush, so only the second is certainly after it.
+		if w.buffersSeen.Load() >= before+2 {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
 // onEvent is ETW's callback. It runs on ETW's own thread, so it copies what it
 // needs out of the record and does no blocking work.
 func onEvent(rec *EVENT_RECORD) uintptr {
@@ -902,9 +974,18 @@ func onEvent(rec *EVENT_RECORD) uintptr {
 			w.forget(&w.byKeyCur, &w.byKeyPrev, n.FileKey)
 		}
 	case evCreate:
-		if c, err := decodeCreate(payload(rec)); err == nil {
-			w.learn(&w.byObjCur, c.FileObject, c.Name)
+		c, err := decodeCreate(payload(rec))
+		if err != nil {
+			return 0
 		}
+		w.learn(&w.byObjCur, c.FileObject, c.Name)
+		// A create carrying an IRP that a read is still waiting on means the
+		// kernel has reused that address: the read's own completion is never
+		// coming, and the next OperationEnd for this IRP belongs to the create.
+		// Left in place, that read would be published with the create's status
+		// and byte count. Expiry alone does not fix this - it only bounds how
+		// long the wrong answer stays possible.
+		w.quarantine(c.Irp)
 	case evCleanup, evClose:
 		// The file object is being freed, and the kernel reuses those addresses.
 		// Keeping the mapping meant a later object at the same address could be
