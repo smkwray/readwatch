@@ -120,3 +120,53 @@ func TestPendingFilterLeavesARenameOfOurPathAlone(t *testing.T) {
 		t.Fatalf("kept %q, want the pair intact", kept)
 	}
 }
+
+func TestSplitMultiSZKeepsATrailingEmptyEntry(t *testing.T) {
+	// The defect this pins: a list ending in somebody else's delete order came
+	// back one element short, and rewriting it would have left their source with
+	// no destination - a malformed pending operation in a machine-wide value.
+	var buf []uint16
+	for _, s := range []string{`ours`, ``, `edge`, ``} {
+		buf = append(buf, syscall.StringToUTF16(s)...)
+	}
+	buf = append(buf, 0)
+
+	got := splitMultiSZ(buf)
+	want := []string{`ours`, ``, `edge`, ``}
+	if len(got) != len(want) {
+		t.Fatalf("got %d entries %q, want %d %q", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestOurDeleteInEveryPositionIsRemoved(t *testing.T) {
+	// First, middle and last. The last position is the one that was broken.
+	ours := `C:\Program Files\ReadWatch\ReadWatch.exe`
+	cases := map[string][]string{
+		"first":  {`*1\??\` + ours, ``, `\??\C:\Other\x`, ``},
+		"middle": {`\??\C:\A\x`, ``, `*1\??\` + ours, ``, `\??\C:\B\y`, ``},
+		"last":   {`\??\C:\Other\x`, ``, `*1\??\` + ours, ``},
+	}
+	for pos, existing := range cases {
+		before := len(existing)
+		kept, removed := filterPending(existing, []string{ours})
+		if removed != 1 {
+			t.Errorf("%s: removed %d, want 1", pos, removed)
+		}
+		if len(kept) != before-2 {
+			t.Errorf("%s: kept %d entries %q, want %d", pos, len(kept), kept, before-2)
+		}
+		if len(kept)%2 != 0 {
+			t.Errorf("%s: kept an odd number of entries %q - a pair was broken", pos, kept)
+		}
+		for _, k := range kept {
+			if strings.Contains(strings.ToLower(k), "readwatch") {
+				t.Errorf("%s: our own entry survived as %q", pos, k)
+			}
+		}
+	}
+}

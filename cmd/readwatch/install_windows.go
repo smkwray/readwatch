@@ -659,6 +659,14 @@ func cancelPendingDeletion(paths ...string) error {
 		return nil
 	}
 
+	// Pairs, always. An odd count means the value is not the shape this code
+	// understands, and rewriting it on a guess would damage whatever it really
+	// is. Leave it alone and let the caller carry on: a stale delete order is a
+	// far smaller problem than a corrupted machine-wide list.
+	if len(existing)%2 != 0 {
+		return nil
+	}
+
 	wanted := make([]string, 0, len(paths))
 	for _, p := range paths {
 		wanted = append(wanted, strings.ToLower(filepath.Clean(p)))
@@ -696,6 +704,21 @@ func cancelPendingDeletion(paths ...string) error {
 	}
 	if err := regWriteMultiSZ(HKEY_LOCAL_MACHINE, key, value, kept); err != nil {
 		return fmt.Errorf("cancel the pending deletion left by a previous uninstall: %w", err)
+	}
+	// Read it back. This value belongs to the whole machine, so "the write
+	// returned success" is not the same statement as "the list is what it should
+	// be", and the difference is other software's pending operations.
+	after, err := regReadMultiSZ(HKEY_LOCAL_MACHINE, key, value)
+	if err != nil {
+		return fmt.Errorf("confirm the pending-deletion list after rewriting it: %w", err)
+	}
+	if len(after) != len(kept) {
+		return fmt.Errorf("the pending-deletion list has %d entries after rewriting, expected %d", len(after), len(kept))
+	}
+	for i := range kept {
+		if !strings.EqualFold(after[i], kept[i]) {
+			return fmt.Errorf("the pending-deletion list did not survive rewriting at entry %d", i)
+		}
 	}
 	return nil
 }
