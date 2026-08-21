@@ -288,6 +288,16 @@ func saclStateFromDescriptor(sd uintptr, sddl string) (saclState, error) {
 //     unprotected. All three contain no ACEs and remain open to inheritance.
 //
 // A protected null SACL remains distinct from an absent or valid empty SACL.
+// describeSACL renders a state for a message the owner has to act on. An empty
+// SDDL means the object has no SACL at all, which reads as nothing unless it is
+// spelled out.
+func describeSACL(s saclState) string {
+	if s.sddl == "" {
+		return "no auditing rules at all"
+	}
+	return s.sddl
+}
+
 func equivalentSACL(left, right saclState) bool {
 	if left.protected != right.protected {
 		return false

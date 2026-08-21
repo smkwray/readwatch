@@ -228,7 +228,13 @@ func removeAuditRule(cfg *settings.Config, key string, snapshot settings.AuditSn
 			return fmt.Errorf("%s: %w", snapshot.Path, err)
 		}
 		if !equivalentSACL(verify, original) {
-			return fmt.Errorf("%s: the auditing rules did not return to what ReadWatch found", snapshot.Path)
+			// Say what differed. "Did not return to what ReadWatch found" is true
+			// and useless: it does not say what was found, what is there now, or
+			// which of the two to trust, and this is the one failure where the
+			// owner has to decide what to do about their own machine.
+			return fmt.Errorf("%s: the auditing rules did not return to what ReadWatch found. "+
+				"It recorded %q and the folder now has %q; ReadWatch has stopped tracking this folder "+
+				"rather than change it further", snapshot.Path, snapshot.Original, describeSACL(verify))
 		}
 	case equivalentSACL(current, original):
 		// Already back where it started. This also accepts a valid empty or null

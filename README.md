@@ -4,37 +4,38 @@
   <p>See which programs are reading the files in a folder you care about.</p>
 </div>
 
-**What it does, and what it does not.** ReadWatch records file reads under folders you choose. How
-much it can tell you depends on which of two Windows mechanisms it is using, and it will tell you
-which one is running:
+ReadWatch records file reads under folders you choose. Windows offers two ways to do that and they
+do not tell you the same things, so ReadWatch picks one and names it in the window.
 
 | | Audit markers | Event tracing |
 | --- | --- | --- |
 | Which program read the file | yes | yes |
-| Which user account | yes | **no** — the column is blank |
-| Folder listings | yes, if you enable it | **no** — the setting is unavailable |
-| Reads through a memory mapping | yes | **no** |
-| Works on exFAT or FAT | **no** | yes |
-| What it costs | marks every file in the watched folders when monitoring starts | watches the whole machine's file activity and discards the rest |
+| Which user account | yes | no |
+| Folder listings | yes, if you turn it on | no |
+| Reads through a memory mapping | yes | no |
+| exFAT and FAT drives | cannot be used | yes |
+| What it costs | marks the files already in the folder when monitoring starts | watches the whole machine's file activity and discards the rest |
 
-**ReadWatch is not a complete audit log and not a security boundary.** Neither mechanism captures
-everything, and it should not be the only evidence that a particular person opened a particular
-file.
+Files created after monitoring starts are watched either way. A marker is inherited by files added
+later, and tracing does not care when a file appeared.
 
-**One mechanism runs at a time, for every watched folder.** ReadWatch picks it, and a single folder
-that cannot take a marker — an exFAT USB stick, say — puts *all* your folders on event tracing,
-including the NTFS ones. That is why adding one folder can change what the others report.
+Neither mechanism captures everything, so ReadWatch is not a complete audit log and not a security
+boundary. Do not treat it as the only evidence that a particular person opened a particular file.
+
+One mechanism runs at a time, across every watched folder. A single folder that cannot take a
+marker—an exFAT USB stick, say—puts all your folders on event tracing, including the NTFS ones. That
+is why adding one folder changes what the others report.
 
 > ### Before you install
 >
-> The downloadable build is **not code-signed**, so Windows cannot verify who published it, and
-> **your antivirus may quarantine it**. Microsoft Defender classified an earlier build as
-> `Trojan:Win32/Bearfoos.A!ml` and deleted it. That detection has not been reviewed by Microsoft, so
-> this project does **not** claim it was a false positive.
+> There is no signed download. Windows cannot verify who published this, and your antivirus may
+> quarantine it: Microsoft Defender classified an earlier build as `Trojan:Win32/Bearfoos.A!ml` and
+> deleted it. Microsoft has not reviewed that detection, so this project does not claim it was a
+> false positive.
 >
 > Do not turn off real-time protection or add a broad antivirus exclusion in order to run this. If
 > you are not comfortable running an unsigned tool that does what this one does, build it yourself
-> from source — it needs nothing but Go.
+> from source—it needs nothing but Go.
 
 ## What you get
 
@@ -47,8 +48,8 @@ including the NTFS ones. That is why adding one folder can change what the other
   nothing hides silently.
 - **Drives that come and go.** A folder on a USB stick can be added while the drive is out; it is
   watched whenever the drive is there and reported as waiting when it isn't.
-- **Gaps are recorded, not hidden.** When reads are missed — the machine too busy, a name that
-  could not be resolved — the log gets a `GAP` line saying how many and why.
+- **Gaps are recorded, not hidden.** When reads are missed—the machine too busy, a name that
+  could not be resolved—the log gets a `GAP` line saying how many and why.
 
 ## How it works
 
@@ -56,15 +57,15 @@ Windows offers two quite different ways to find out who read a file. Neither is 
 case, so ReadWatch uses both and picks.
 
 **1. Folder audit markers.** ReadWatch asks Windows to record access to a watched folder, by adding
-an audit entry to that folder's security settings — a *SACL* — and switching on the *Audit File
+an audit entry to that folder's security settings—a *SACL*—and switching on the *Audit File
 System (success)* policy. Windows then writes a Security-log record for each matching read, and
 ReadWatch turns those into readable lines. Only your watched folders produce anything. Marking costs
 about a tenth of a millisecond per file when monitoring starts and again when it stops: instant for
 an ordinary folder, minutes for a whole drive. **exFAT and FAT have no security settings for a
 marker to live in**, which is why they cannot use this.
 
-**2. System file-I/O tracing.** ReadWatch runs a Windows kernel trace of file activity — an *ETW*
-session — and keeps only the events under your folders. Nothing is written to the drive and it works
+**2. System file-I/O tracing.** ReadWatch runs a Windows kernel trace of file activity—an *ETW*
+session—and keeps only the events under your folders. Nothing is written to the drive and it works
 on any filesystem, including exFAT and encrypted volumes. The trade is that Windows cannot filter it
 by folder, so ReadWatch sees the whole machine's file activity and discards what you did not ask
 for. That costs a little CPU continuously whether you watch one folder or twenty.
@@ -74,7 +75,7 @@ Windows will not tell it the name of a file whose handle was already open, and r
 would go unattributed for as long as monitoring ran.
 
 **3. One mechanism at a time.** ReadWatch uses markers when *every* watched folder can carry one,
-and tracing when any folder cannot. Never both — a tracing session already reports reads on folders
+and tracing when any folder cannot. Never both—a tracing session already reports reads on folders
 that could carry a marker, so running both would report the same read twice. You can force either
 from Settings; if you ask for markers and a folder makes that impossible, ReadWatch says so rather
 than silently doing the other thing. The window names the mechanism in use.
@@ -88,7 +89,7 @@ going the other way.
 A **LocalSystem service** owns everything privileged; a **non-elevated viewer** talks to it over a
 local named pipe admitting only LocalSystem and the installing account. The service is
 `SERVICE_DEMAND_START` behind a DACL granting that account start, stop, query and interrogate and
-nothing else — enough for an ordinary window to run a SYSTEM service, too little for anything on the
+nothing else—enough for an ordinary window to run a SYSTEM service, too little for anything on the
 machine to repoint it. Changing the configuration, rewriting the descriptor and deleting the service
 are withheld, including from the owner.
 
@@ -97,7 +98,7 @@ service keeps those handles: every privileged operation goes through them rather
 path a second time, so nothing can be swapped in between. Each folder is recorded by volume and file
 identity, not by name.
 
-**ReadWatch sends nothing anywhere.** There is no network code in it — no connections, no telemetry,
+**ReadWatch sends nothing anywhere.** There is no network code in it—no connections, no telemetry,
 no update check. Everything it records stays in the log file you chose.
 
 Under event tracing it does see file activity from the whole machine before discarding what is not
@@ -108,7 +109,7 @@ reach the log or the window.
 
 The time, the file path, the program's name and full image path, its process ID, and how many bytes
 were transferred. Under audit markers, also the user account and the access mask. **Under event
-tracing the user column is blank** — naming the account means opening other programs' security
+tracing the user column is blank**—naming the account means opening other programs' security
 tokens, which is more than this tool needs to name the *program*.
 
 If a program has already exited by the time ReadWatch looks it up, the process fields are left blank
@@ -134,7 +135,7 @@ Two limits worth being exact about:
 
 ## Build
 
-Go 1.23+, Windows 10 1903 / Windows 11, x64.
+Go 1.23+, x64. Built and exercised on Windows 11 with Go 1.26.
 
 ```bat
 build.cmd
@@ -143,12 +144,12 @@ build.cmd
 which is `go test ./...`, `go vet ./...`, then:
 
 ```bat
-go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.3.0" -o dist\ReadWatch.exe .\cmd\readwatch
+go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.4.0" -o dist\ReadWatch.exe .\cmd\readwatch
 ```
 
 `cmd/readwatch/rsrc_windows_amd64.syso` is checked in with the icon, version info and manifest, so
 a plain `go build` needs only Go. Regenerating it wants Python 3 + Clang:
-`python tools/make_resources.py --version 0.3.0.0`. It has not been regenerated since 0.1.0, so the
+`python tools/make_resources.py --version 0.4.0.0`. It has not been regenerated since 0.1.0, so the
 PE version resource reads `0.1.0.0` while `--version` reports the real release.
 
 ## Use
@@ -159,18 +160,18 @@ PE version resource reads `0.1.0.0` while `--version` reports the real release.
 
 Right-click any row to silence that process:
 
-- **Exclude `python.exe`** matches the *image name* — every `python.exe`, anywhere.
+- **Exclude `python.exe`** matches the *image name*—every `python.exe`, anywhere.
 - **Exclude only this exact path** matches that one binary.
 
 Prefer the exact path for anything you have several copies of; a machine typically has multiple
 `python.exe` installs, and a filename is easy to imitate, which matters for a tool whose job is
-noticing an unexpected reader. Nothing is excluded until you say so — the list lives in Settings.
+noticing an unexpected reader. Nothing is excluded until you say so—the list lives in Settings.
 
 ### Removable drives
 
 A watched folder does not have to be on a drive that is always attached. Paste the path while the
 drive is out and ReadWatch writes it down; the summary line then reads *"2 folders (1 waiting for a
-drive)"* until it turns up. Plug the drive in and ReadWatch picks the folder up on its own — it
+drive)"* until it turns up. Plug the drive in and ReadWatch picks the folder up on its own—it
 watches for volumes arriving and asks the service to look again, so there is nothing to press.
 
 A folder that ReadWatch will not watch, as opposed to one it is waiting for, is called out in the
@@ -178,14 +179,14 @@ status line with the reason: a junction, a permission you don't have, a network 
 that now refers to a different folder than the one you approved. Those need you; a waiting folder
 does not, which is why it never becomes a warning.
 
-**Press Stop before you eject.** ReadWatch holds each watched folder open on purpose — that is what
-stops it being renamed away from its own audit rule — so Safely Remove Hardware will refuse while
+**Press Stop before you eject.** ReadWatch holds each watched folder open on purpose—that is what
+stops it being renamed away from its own audit rule—so Safely Remove Hardware will refuse while
 the folder is being watched. Stop, then eject the drive the normal way.
 
 If a drive is disconnected without that, ReadWatch is built to recover rather than to break: the
 folders on other drives keep being watched. But **the audit rule stays on the disconnected disk**,
 because nothing can reach it to remove it. ReadWatch says so in the summary line, keeps the record,
-and removes the rule when that drive is next attached. It will not quietly forget it — uninstalling
+and removes the rule when that drive is next attached. It will not quietly forget it—uninstalling
 with such a rule outstanding tells you which drive to attach rather than abandoning it silently.
 
 Closing the window hides it to the tray; **Exit** quits, stops monitoring and stops the service —
@@ -214,7 +215,7 @@ path, event record ID, and access mask.
 
 Removes the service, the viewer, the Start Menu entry, the uninstall entry and everything in
 `C:\ProgramData\ReadWatch`, and withdraws every audit rule and audit-policy change ReadWatch
-applied. **Your log file is left alone** — it is yours.
+applied. **Your log file is left alone**—it is yours.
 
 The program file itself cannot delete itself while it is running, so Windows removes it and its
 folder at the next restart. ReadWatch tells you so.
@@ -225,10 +226,10 @@ drive to plug in rather than abandoning the rule silently.
 ## Good to know
 
 - **Junctions, symbolic links, mounted volumes and cloud placeholders are refused**, at any point in
-  the path — not followed. ReadWatch has to be able to prove that the folder it applies an audit rule
+  the path—not followed. ReadWatch has to be able to prove that the folder it applies an audit rule
   to is the folder you approved, and a link is exactly what can stop being that.
 - **The folder holding your log file has to exist already.** ReadWatch creates the file with your own
-  account's permissions, but not its folder. The log is never rotated or trimmed — it grows until you
+  account's permissions, but not its folder. The log is never rotated or trimmed—it grows until you
   do something about it.
 - **Cleanup is best-effort when a folder has gone.** If a watched folder is deleted, or its rules are
   changed by something else, ReadWatch says so once and stops tracking it rather than refusing to
@@ -271,4 +272,4 @@ distinguishes a replacement at the same path, and a watched folder cannot be ren
 
 ## License
 
-MIT — see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+MIT—see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
