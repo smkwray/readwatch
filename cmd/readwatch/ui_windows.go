@@ -826,7 +826,14 @@ func (u *AppUI) updateStatus() {
 		setWindowText(u.status, "○  Connecting…")
 		setWindowText(u.startBtn, "Start")
 	case state.Running:
-		setWindowText(u.status, "●  Monitoring"+waitingSuffix(state))
+		// The mechanism belongs here rather than trailing the summary: the two
+		// differ in what they cost and in what they can see, so which one is
+		// running is part of reading the window at all.
+		label := "●  Monitoring"
+		if name := mechanismLabel(state.Mechanism); name != "" {
+			label += " with " + name
+		}
+		setWindowText(u.status, label+waitingSuffix(state))
 		setWindowText(u.startBtn, "Stop")
 	default:
 		setWindowText(u.status, "○  Stopped"+waitingSuffix(state))
@@ -981,12 +988,6 @@ func (u *AppUI) updateSummary() {
 	// be discovered at uninstall.
 	if n := len(u.state.PendingRules); n > 0 {
 		text += fmt.Sprintf(" · %d audit %s awaiting %s drive", n, plural(n, "rule", "rules"), plural(n, "its", "their"))
-	}
-	// Which mechanism is running is part of what the reading means: the two
-	// differ in what they cost and in what they can see. Named in the summary so
-	// it is always visible, explained in Settings rather than here.
-	if name := mechanismLabel(u.state.Mechanism); name != "" && u.state.Running {
-		text += " · " + name
 	}
 	setWindowText(u.summary, text)
 }
@@ -1257,6 +1258,11 @@ func (u *AppUI) updateTrayTip() {
 		tip = "ReadWatch — Service unavailable"
 	} else if u.state.Running {
 		tip = "ReadWatch — Monitoring"
+		// The tray tooltip is where someone looks when the window is not open, so
+		// it names the mechanism too rather than only saying that something is on.
+		if name := mechanismLabel(u.state.Mechanism); name != "" {
+			tip += " with " + name
+		}
 	}
 	nid := NOTIFYICONDATAW{CbSize: uint32(unsafe.Sizeof(NOTIFYICONDATAW{})), HWnd: u.hwnd, UID: trayIconID, UFlags: NIF_TIP | NIF_ICON, HIcon: u.iconSmall}
 	copyUTF16(nid.SzTip[:], tip)

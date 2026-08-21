@@ -195,7 +195,7 @@ func (s *SettingsUI) createControls() {
 	s.folderPath = createControl("EDIT", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL, 0, s.hwnd, idFolderPath)
 	s.addPathBtn = createControl("BUTTON", "Add", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON, 0, s.hwnd, idAddFolderPath)
 	sendMessage(s.folderPath, EM_SETCUEBANNER, 1, uintptr(unsafe.Pointer(utf16Ptr(`Paste a folder path, e.g. D:\Renders\output`))))
-	s.foldersHint = createControl("STATIC", "A folder on a drive that is not plugged in can be added; it is watched whenever the drive is there.", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS, 0, s.hwnd, 0)
+	s.foldersHint = createControl("STATIC", "", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS, 0, s.hwnd, 0)
 
 	s.excludeLabel = createControl("STATIC", "Ignore reads by these processes", WS_CHILD|WS_VISIBLE|SS_LEFT|SS_CENTERIMAGE, 0, s.hwnd, 0)
 	s.excludeList = createControl("LISTBOX", "", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT, 0, s.hwnd, idExcludeList)
@@ -244,6 +244,7 @@ func (s *SettingsUI) createControls() {
 	}
 	sendMessage(s.mechCombo, CB_SETCURSEL, uintptr(mechanismIndex(s.cfg.Mechanism)), 0)
 	s.updateMechanismHint()
+	s.updateFoldersHint()
 	setChecked(s.includeDirs, s.cfg.IncludeDirectories)
 	setChecked(s.startLogin, s.cfg.StartAtLogin)
 	setChecked(s.openLogin, s.cfg.OpenAtLogin)
@@ -318,6 +319,42 @@ func mechanismHintText(m settings.Mechanism) string {
 	}
 	return "Uses markers when every watched folder can take one, and event tracing otherwise — " +
 		"so a folder on a USB stick is watched rather than refused."
+}
+
+// updateFoldersHint says which mechanism this set of folders will use, and names
+// the folder that decides it.
+//
+// The mechanism is chosen once for the whole session - never both at once - so
+// labelling each folder individually would be a lie. What is genuinely per-folder
+// is whether a folder can carry a marker, because a single one that cannot puts
+// the entire session on event tracing. That is the fact worth showing.
+func (s *SettingsUI) updateFoldersHint() {
+	count := int(sendMessage(s.folderList, LB_GETCOUNT, 0, 0))
+	folders := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		if item, ok := listBoxText(s.folderList, i); ok {
+			folders = append(folders, strings.TrimSpace(item))
+		}
+	}
+	if len(folders) == 0 {
+		setWindowText(s.foldersHint, "A folder on a drive that is not plugged in can be added; it is watched whenever the drive is there.")
+		return
+	}
+	var blocked []string
+	for _, f := range folders {
+		if capable, known := markerCapableFolder(f); known && !capable {
+			blocked = append(blocked, f)
+		}
+	}
+	if len(blocked) == 0 {
+		setWindowText(s.foldersHint, "All of these can carry audit markers, so only they will produce events.")
+		return
+	}
+	first := blocked[0]
+	if len(blocked) > 1 {
+		first = fmt.Sprintf("%s and %d more", first, len(blocked)-1)
+	}
+	setWindowText(s.foldersHint, "Event tracing will be used for all folders: "+first+" cannot carry an audit marker.")
 }
 
 func (s *SettingsUI) updateMechanismHint() {
@@ -786,10 +823,13 @@ func settingsWindowProc(hwnd uintptr, msg uint32, wParam uintptr, lParam unsafe.
 			switch id {
 			case idAddFolder:
 				s.addFolder()
+				s.updateFoldersHint()
 			case idRemoveFolder:
 				s.removeFolder()
+				s.updateFoldersHint()
 			case idAddFolderPath:
 				s.addTypedFolder()
+				s.updateFoldersHint()
 			case idAddExclude:
 				addToList(s.excludeList, s.excludeText, windowText(s.excludeText))
 			case idRemoveExclude:
