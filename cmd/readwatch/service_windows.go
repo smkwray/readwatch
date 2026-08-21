@@ -195,7 +195,15 @@ func (e *ServiceEngine) RefreshFromClient(pipe HANDLE) error {
 	return e.applyBound(pipe, public, false)
 }
 
-func (e *ServiceEngine) Shutdown() {
+// Shutdown stops everything and says whether the cleanup actually succeeded.
+//
+// It used to swallow the error, and the service then reported exit code 0
+// regardless - so a stop that failed to withdraw an audit rule, restore the
+// audit policy or tear down a trace session was indistinguishable from a clean
+// one, in the Service Control Manager and in the event log. That is precisely
+// the state the first non-negotiable is about, and it was the state hardest to
+// find out about.
+func (e *ServiceEngine) Shutdown() error {
 	e.shuttingDown.Store(true)
 	e.mu.Lock()
 	e.ready = false
@@ -212,10 +220,12 @@ func (e *ServiceEngine) Shutdown() {
 	// owner's words - "exit should stop the monitoring as well". Nothing here
 	// affects a service that died while the viewer stayed open; that path still
 	// resumes on reconnect, because the owner never said to stop.
-	if err := e.stopMonitoringLocked(true, true); err != nil {
+	err := e.stopMonitoringLocked(true, true)
+	if err != nil {
 		writeServiceDiagnostic(err)
 	}
 	e.opMu.Unlock()
+	return err
 }
 
 func (e *ServiceEngine) rejectIfStopping() error {
@@ -399,7 +409,14 @@ func serviceMain(_ uint32, _ uintptr) uintptr {
 	setServiceStatus(SERVICE_RUNNING, 0, SERVICE_ACCEPT_STOP|SERVICE_ACCEPT_SHUTDOWN|SERVICE_ACCEPT_PRESHUTDOWN, 0)
 	<-serviceStopCh
 	setServiceStatus(SERVICE_STOP_PENDING, 0, 0, 10_000)
-	engine.Shutdown()
+	if err := engine.Shutdown(); err != nil {
+		// Stopped, but not cleanly. Windows has a field for exactly this, and
+		// using it is the difference between a stop the owner can trust and one
+		// that merely looks like it worked. The detail is already in the
+		// diagnostic log; this is what makes anyone go and read it.
+		setServiceStoppedWithError(serviceExitCleanupFailed)
+		return 0
+	}
 	setServiceStatus(SERVICE_STOPPED, 0, 0, 0)
 	return 0
 }
@@ -422,6 +439,28 @@ func requestServiceStop() {
 			close(serviceStopCh)
 		}
 	})
+}
+
+// serviceExitCleanupFailed is reported when the service stopped but could not
+// withdraw everything it owned. Any non-zero value would do; a fixed one makes
+// it searchable.
+const serviceExitCleanupFailed = 1
+
+// setServiceStoppedWithError reports a stop that did not clean up. Windows
+// carries a service's own code in ServiceSpecificExitCode, and only reads it
+// when Win32ExitCode is ERROR_SERVICE_SPECIFIC_ERROR - so both have to be set,
+// or the failure is reported as success.
+func setServiceStoppedWithError(code uint32) {
+	if serviceStatusHandle == 0 {
+		return
+	}
+	status := SERVICE_STATUS{
+		ServiceType:             SERVICE_WIN32_OWN_PROCESS,
+		CurrentState:            SERVICE_STOPPED,
+		Win32ExitCode:           ERROR_SERVICE_SPECIFIC_ERROR,
+		ServiceSpecificExitCode: code,
+	}
+	procSetServiceStatus.Call(uintptr(serviceStatusHandle), uintptr(unsafe.Pointer(&status)))
 }
 
 func setServiceStatus(state, win32Exit, accepted, waitHint uint32) {

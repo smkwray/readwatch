@@ -683,14 +683,16 @@ const (
 	TokenElevation          = 20
 	SE_PRIVILEGE_ENABLED    = 0x00000002
 
-	ERROR_SUCCESS             = 0
-	ERROR_FILE_NOT_FOUND      = 2
-	ERROR_PATH_NOT_FOUND      = 3
-	ERROR_ACCESS_DENIED       = 5
-	ERROR_INVALID_HANDLE      = 6
-	ERROR_BROKEN_PIPE         = 109
-	ERROR_INSUFFICIENT_BUFFER = 122
-	ERROR_ALREADY_EXISTS      = 183
+	ERROR_SUCCESS        = 0
+	ERROR_FILE_NOT_FOUND = 2
+	// Set as Win32ExitCode when the service reports a code of its own.
+	ERROR_SERVICE_SPECIFIC_ERROR = 1066
+	ERROR_PATH_NOT_FOUND         = 3
+	ERROR_ACCESS_DENIED          = 5
+	ERROR_INVALID_HANDLE         = 6
+	ERROR_BROKEN_PIPE            = 109
+	ERROR_INSUFFICIENT_BUFFER    = 122
+	ERROR_ALREADY_EXISTS         = 183
 	// RegisterClassEx reports a duplicate class as 1410, NOT 183. Guarding on
 	// ERROR_ALREADY_EXISTS meant reopening Settings failed with
 	// "RegisterClassEx(settings): Class already exists."

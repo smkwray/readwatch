@@ -64,9 +64,15 @@ func regReadMultiSZ(root uintptr, subkey, name string) ([]string, error) {
 	return splitMultiSZ(buf), nil
 }
 
-// splitMultiSZ turns the wide double-null-terminated form into strings. Empty
-// entries are significant here: a pending rename with no destination means
-// "delete", so they are kept rather than skipped.
+// splitMultiSZ turns the wide form into strings.
+//
+// Every string is followed by a null and the list by one more, so decoding is:
+// emit at each null, then drop the last emission, which is the terminator. The
+// earlier version stopped at the first null pair instead, and that silently lost
+// a **trailing empty entry** - which in PendingFileRenameOperations is the second
+// half of a delete order. A list ending in somebody else's delete came back one
+// element short, and rewriting it would have left their source with no
+// destination: a malformed pending operation in a machine-wide value.
 func splitMultiSZ(buf []uint16) []string {
 	var out []string
 	start := 0
@@ -74,18 +80,12 @@ func splitMultiSZ(buf []uint16) []string {
 		if buf[i] != 0 {
 			continue
 		}
-		if i == start {
-			// The terminating empty string ends the list, unless a real empty
-			// entry precedes more data.
-			if i+1 >= len(buf) || buf[i+1] == 0 {
-				break
-			}
-			out = append(out, "")
-			start = i + 1
-			continue
-		}
 		out = append(out, syscall.UTF16ToString(buf[start:i]))
 		start = i + 1
+	}
+	if n := len(out); n > 0 {
+		// The final emission is the list terminator, not an entry.
+		out = out[:n-1]
 	}
 	return out
 }
