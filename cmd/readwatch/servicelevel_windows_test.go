@@ -306,3 +306,60 @@ func truncateForLog(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
+
+// TestServiceLevelMarkersCatchFilesCreatedAfterStart answers a question the
+// README could only assert: audit markers are described as marking the files in
+// a watched folder when monitoring starts, which sounds like a snapshot. If it
+// were one, a file created afterwards would never be reported - which would make
+// the mechanism close to useless for a folder that is being written to.
+//
+// The audit entry is applied inheritable, so Windows should give it to new files
+// as they are created. This proves it rather than trusting the flag.
+func TestServiceLevelMarkersCatchFilesCreatedAfterStart(t *testing.T) {
+	h := newServiceHarness(t)
+
+	dir := `C:\ReadWatch-Test`
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Skipf("cannot use %s: %v", dir, err)
+	}
+	logPath := filepath.Join(t.TempDir(), "inherit.log")
+
+	cfg := h.original
+	cfg.Folders = []string{dir}
+	cfg.LogPath = logPath
+	cfg.Mechanism = settings.MechanismMarkers
+	cfg.Enabled = true
+	if err := h.do(protocol.CmdApply, &cfg, true); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if err := h.do(protocol.CmdStart, nil, false); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	s := h.awaitState(func(s protocol.State) bool { return s.Running }, 90*time.Second, "start with markers")
+	if s.Mechanism != string(settings.MechanismMarkers) {
+		t.Skipf("this run selected %q, not markers; nothing to prove here", s.Mechanism)
+	}
+
+	// Created strictly after monitoring began.
+	target := filepath.Join(dir, "created-after-start.txt")
+	if err := os.WriteFile(target, make([]byte, 64*1024), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	defer os.Remove(target)
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := readUnbufferedFile(target); err != nil {
+			t.Fatalf("read target: %v", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+		for _, e := range h.eventsUnder(dir) {
+			if strings.EqualFold(e.Path, target) {
+				t.Logf("a file created after monitoring started was reported: %+v", e)
+				return
+			}
+		}
+	}
+	t.Fatalf("no read of %s was reported in 60s; a file created after start went unwatched, "+
+		"which would mean the marker is a snapshot rather than inherited", target)
+}
