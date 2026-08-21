@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-08-21
 
 **ReadWatch can now watch drives it previously refused, including exFAT USB sticks.** It has two
 ways of detecting reads and picks between them, because neither is better than the other in every
