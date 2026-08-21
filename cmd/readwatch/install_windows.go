@@ -68,6 +68,15 @@ func installApp() error {
 	if err := os.MkdirAll(p.InstallDir, 0o755); err != nil {
 		return err
 	}
+	// An earlier uninstall queues the executable and its folder for deletion at
+	// the next restart, because a running executable cannot delete itself.
+	// Installing over that without cancelling it leaves the order standing, and
+	// the next restart deletes the copy just installed - the program disappears
+	// on reboot with nothing to say why. Cancelled here, before anything is
+	// written, and reported rather than assumed.
+	if err := cancelPendingDeletion(p.InstallDir, p.Exe); err != nil {
+		return err
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -628,6 +637,67 @@ func stopInstalledService(timeout time.Duration) error {
 		time.Sleep(150 * time.Millisecond)
 	}
 	return errors.New("timed out waiting for the ReadWatch service to stop")
+}
+
+// cancelPendingDeletion removes any queued reboot-time deletion of the paths
+// this install is about to occupy.
+//
+// Windows keeps those orders in PendingFileRenameOperations as pairs: a source
+// prefixed \??\ and an empty destination meaning "delete". There is no API to
+// withdraw one, so the value is rewritten without the entries that name this
+// installation. Everything else in it belongs to other software and is copied
+// through untouched.
+func cancelPendingDeletion(paths ...string) error {
+	const key = `SYSTEM\CurrentControlSet\Control\Session Manager`
+	const value = "PendingFileRenameOperations"
+
+	existing, err := regReadMultiSZ(HKEY_LOCAL_MACHINE, key, value)
+	if err != nil || len(existing) == 0 {
+		// No pending operations at all is the ordinary case, and an unreadable
+		// value is not worth failing an install over: the risk it guards against
+		// only exists if an uninstall ran, which would have created it.
+		return nil
+	}
+
+	wanted := make([]string, 0, len(paths))
+	for _, p := range paths {
+		wanted = append(wanted, strings.ToLower(filepath.Clean(p)))
+	}
+	kept := make([]string, 0, len(existing))
+	removed := 0
+	for i := 0; i < len(existing); i++ {
+		source := existing[i]
+		var target string
+		if i+1 < len(existing) {
+			target = existing[i+1]
+		}
+		trimmed := strings.ToLower(filepath.Clean(strings.TrimPrefix(strings.TrimPrefix(source, `\??\`), `*1\??\`)))
+		mine := false
+		for _, w := range wanted {
+			if trimmed == w {
+				mine = true
+				break
+			}
+		}
+		if mine && target == "" {
+			// A delete order for one of our own paths. Drop the pair.
+			removed++
+			i++
+			continue
+		}
+		kept = append(kept, source)
+		if i+1 < len(existing) {
+			kept = append(kept, target)
+			i++
+		}
+	}
+	if removed == 0 {
+		return nil
+	}
+	if err := regWriteMultiSZ(HKEY_LOCAL_MACHINE, key, value, kept); err != nil {
+		return fmt.Errorf("cancel the pending deletion left by a previous uninstall: %w", err)
+	}
+	return nil
 }
 
 func deleteInstalledService() error {
