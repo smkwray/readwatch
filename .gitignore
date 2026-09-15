@@ -8,6 +8,7 @@ docs/
 
 # Environment
 .env
+.private-denylist
 
 # Plans
 *.plan.md
