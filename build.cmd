@@ -25,7 +25,7 @@ echo [3/3] Windows x64 release build
 set "GOOS=windows"
 set "GOARCH=amd64"
 set "CGO_ENABLED=0"
-go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=%VERSION%" -o dist\ReadWatch.exe .\cmd\readwatch
+go build -buildvcs=false -trimpath -ldflags "-s -w -H=windowsgui -X main.version=%VERSION%" -o dist\ReadWatch.exe .\cmd\readwatch
 if errorlevel 1 exit /b 1
 
 copy /y assets\ReadWatch.ico dist\ReadWatch.ico >nul
