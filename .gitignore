@@ -48,5 +48,6 @@ __pycache__/
 # pre-commit hook keeps working; never part of the public surface.
 /scripts/control_check.py
 /scripts/hygiene_check.sh
+!/scripts/privacy_gate.py
 /.githooks/
 /.claude/
