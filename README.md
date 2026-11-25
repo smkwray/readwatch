@@ -4,8 +4,9 @@
   <p>See which programs are reading the files in a folder you care about.</p>
 </div>
 
-ReadWatch records file reads under folders you choose. Windows offers two ways to do that and they
-do not tell you the same things, so ReadWatch picks one and names it in the window.
+ReadWatch is a Windows 11 utility that records which programs read files inside folders you choose. It shows each read in a live window and appends it to a log file in text, JSON Lines, or CSV format. It is a native Win32 program written in Go, with no runtime dependencies and no network code. The current release is 0.4.0, and the download is not signed (see [Before you install](#before-you-install)).
+
+Windows has two ways to report file reads, and they tell you different things. ReadWatch uses folder audit markers when every watched folder can carry one, and Event Tracing for Windows (ETW) when any folder cannot, such as a folder on an exFAT USB stick. One mechanism runs at a time for all watched folders, so adding one exFAT folder moves your NTFS folders to event tracing too. The window names the mechanism in use, and Settings lets you force either one.
 
 | | Audit markers | Event tracing |
 | --- | --- | --- |
@@ -16,183 +17,34 @@ do not tell you the same things, so ReadWatch picks one and names it in the wind
 | exFAT and FAT drives | cannot be used | yes |
 | What it costs | marks the files already in the folder when monitoring starts | watches the whole machine's file activity and discards the rest |
 
-Files created after monitoring starts are watched either way. A marker is inherited by files added
-later, and tracing does not care when a file appeared.
+Files created after monitoring starts are watched either way.
 
-Neither mechanism captures everything, so ReadWatch is not a complete audit log and not a security
-boundary. Do not treat it as the only evidence that a particular person opened a particular file.
-
-One mechanism runs at a time, across every watched folder. A single folder that cannot take a
-marker—an exFAT USB stick, say—puts all your folders on event tracing, including the NTFS ones. That
-is why adding one folder changes what the others report.
+Neither mechanism captures every read, so ReadWatch is not a complete audit log or a security boundary. Do not treat it as the only evidence that a particular person opened a particular file.
 
 > ### Before you install
 >
-> There is no signed download. Windows cannot verify who published this, and your antivirus may
-> quarantine it: Microsoft Defender classified an earlier build as `Trojan:Win32/Bearfoos.A!ml` and
-> deleted it. Microsoft has not reviewed that detection, so this project does not claim it was a
-> false positive.
+> There is no signed download. Windows cannot verify who published this, and your antivirus may quarantine it: Microsoft Defender classified an earlier build as `Trojan:Win32/Bearfoos.A!ml` and deleted it. Microsoft has not reviewed that detection, so this project does not claim it was a false positive. To report which program read a file, ReadWatch runs a kernel file-trace session, lists the files already open on the PC, and opens other processes to read their executable path, which is also what spyware does.
 >
-> Do not turn off real-time protection or add a broad antivirus exclusion in order to run this. If
-> you are not comfortable running an unsigned tool that does what this one does, build it yourself
-> from source—it needs nothing but Go.
+> Do not turn off real-time protection or add a broad antivirus exclusion in order to run this. If you are not comfortable running an unsigned tool that does these things, [build it yourself](#build-from-source); it needs nothing but Go.
 
-## What you get
+## Requirements
 
-- **Live view and a durable log.** Text, JSON Lines, or CSV, appended as events arrive.
-- **Privileged only while ReadWatch is open.** The service is demand-start: it comes up with the
-  window and stops when you exit, including when the viewer is killed rather than closed. **Stop**
-  ends monitoring and removes ReadWatch's audit rules, folder handles and log handle.
-- **Filters the noise.** Thumbnailing, indexing and antivirus can outnumber the reads you want.
-  Exclude them by process name or exact image path, with a running count of what was suppressed so
-  nothing hides silently.
-- **Drives that come and go.** A folder on a USB stick can be added while the drive is out; it is
-  watched whenever the drive is there and reported as waiting when it isn't.
-- **Gaps are recorded, not hidden.** When reads are missed—the machine too busy, a name that
-  could not be resolved—the log gets a `GAP` line saying how many and why.
-
-## How it works
-
-Windows offers two quite different ways to find out who read a file. Neither is better in every
-case, so ReadWatch uses both and picks.
-
-**1. Folder audit markers.** ReadWatch asks Windows to record access to a watched folder, by adding
-an audit entry to that folder's security settings—a *SACL*—and switching on the *Audit File
-System (success)* policy. Windows then writes a Security-log record for each matching read, and
-ReadWatch turns those into readable lines. Only your watched folders produce anything. Marking costs
-about a tenth of a millisecond per file when monitoring starts and again when it stops: instant for
-an ordinary folder, minutes for a whole drive. **exFAT and FAT have no security settings for a
-marker to live in**, which is why they cannot use this.
-
-**2. System file-I/O tracing.** ReadWatch runs a Windows kernel trace of file activity—an *ETW*
-session—and keeps only the events under your folders. Nothing is written to the drive and it works
-on any filesystem, including exFAT and encrypted volumes. The trade is that Windows cannot filter it
-by folder, so ReadWatch sees the whole machine's file activity and discards what you did not ask
-for. That costs a little CPU continuously whether you watch one folder or twenty.
-
-At startup it also spends about a second listing the files already open on the PC. Without that,
-Windows will not tell it the name of a file whose handle was already open, and reads of those files
-would go unattributed for as long as monitoring ran.
-
-**3. One mechanism at a time.** ReadWatch uses markers when *every* watched folder can carry one,
-and tracing when any folder cannot. Never both—a tracing session already reports reads on folders
-that could carry a marker, so running both would report the same read twice. You can force either
-from Settings; if you ask for markers and a folder makes that impossible, ReadWatch says so rather
-than silently doing the other thing. The window names the mechanism in use.
-
-**4. Switching.** Changing folders can change the mechanism. ReadWatch removes every marker it
-applied and hands back the audit-policy change before starting a tracing session, and the reverse
-going the other way.
-
-## Privileges and privacy
-
-A **LocalSystem service** owns everything privileged; a **non-elevated viewer** talks to it over a
-local named pipe admitting only LocalSystem and the installing account. The service is
-`SERVICE_DEMAND_START` behind a DACL granting that account start, stop, query and interrogate and
-nothing else—enough for an ordinary window to run a SYSTEM service, too little for anything on the
-machine to repoint it. Changing the configuration, rewriting the descriptor and deleting the service
-are withheld, including from the owner.
-
-Your folders and log file are opened under **your** account when you press Start or Save, and the
-service keeps those handles: every privileged operation goes through them rather than resolving the
-path a second time, so nothing can be swapped in between. Each folder is recorded by volume and file
-identity, not by name.
-
-**ReadWatch sends nothing anywhere.** There is no network code in it—no connections, no telemetry,
-no update check. Everything it records stays in the log file you chose.
-
-Under event tracing it does see file activity from the whole machine before discarding what is not
-yours. Those events are not written anywhere and not kept; only reads under your watched folders
-reach the log or the window.
-
-### What it records about a read
-
-The time, the file path, the program's name and full image path, its process ID, and how many bytes
-were transferred. Under audit markers, also the user account and the access mask. **Under event
-tracing the user column is blank**—naming the account means opening other programs' security
-tokens, which is more than this tool needs to name the *program*.
-
-If a program has already exited by the time ReadWatch looks it up, the process fields are left blank
-rather than guessed at: Windows reuses process IDs, and naming the wrong program is worse than
-naming none.
-
-### On exFAT and FAT
-
-Those filesystems record no durable identity for a folder, so a folder there is remembered by volume
-only. ReadWatch can still tell that a path now points at a **different drive**; it cannot tell that a
-folder was deleted and recreated at the same path on the same drive. That reduction is accepted only
-under tracing, which writes nothing to the volume and so has nothing it must find again to undo.
-
-Two limits worth being exact about:
-
-- **This is replacement detection, not media authentication.** ReadWatch trusts what the Windows
-  storage stack reports. The volume serial is assigned by Windows at format time, not burned into the
-  hardware, so a deliberately cloned volume is not something it can distinguish.
-- **The junction check trusts the filesystem driver.** ReadWatch refuses to follow a junction or
-  symbolic link into a watched folder. On a volume that reports it cannot hold one, that check is
-  skipped, and an object claiming otherwise there is refused rather than reconciled. A hostile
-  *kernel* driver could lie about both, but one at that level can defeat ReadWatch far more directly.
-
-## Build
-
-Go 1.23+, x64. Built and exercised on Windows 11 with Go 1.26.
-
-```bat
-build.cmd
-```
-
-which is `go test ./...`, `go vet ./...`, then:
-
-```bat
-go build -trimpath -ldflags "-s -w -H=windowsgui -X main.version=0.4.0" -o dist\ReadWatch.exe .\cmd\readwatch
-```
-
-`cmd/readwatch/rsrc_windows_amd64.syso` is checked in with the icon, version info and manifest, so
-a plain `go build` needs only Go. Regenerating it wants Python 3 + Clang:
-`python tools/make_resources.py --version 0.4.0.0`. It has not been regenerated since 0.1.0, so the
-PE version resource reads `0.1.0.0` while `--version` reports the real release.
+- Windows 11 on x64. Windows 10 is untested.
+- Administrator approval once at install and once at uninstall, never during ordinary use.
+- Local folders only. For a network share, run ReadWatch on the file server against its local path.
+- Audit markers need NTFS or ReFS. Event tracing works on any local filesystem.
 
 ## Use
 
-1. Run `ReadWatch.exe` and approve the installation prompt.
-2. **Settings** → paste a folder path (or **Browse**), pick a log file and format, **Save**.
-3. **Start**.
+1. Download `ReadWatch-v0.4.0-windows-amd64.exe` from [Releases](https://github.com/smkwray/readwatch/releases) (checksums are in `SHA256SUMS.txt`), run it, and approve the installation prompt.
+2. Open **Settings**, add a folder, pick a log file and format, and save. The folder that will hold the log file must already exist.
+3. Press **Start**.
 
-Right-click any row to silence that process:
+Antivirus, indexing, thumbnailing and backup tools read files legitimately and will appear. Right-click a row to exclude that process by image name (every `python.exe`, anywhere) or by exact path (that one binary). Prefer the exact path, since a file name is easy to imitate. The summary line counts excluded reads, and the list lives in Settings.
 
-- **Exclude `python.exe`** matches the *image name*—every `python.exe`, anywhere.
-- **Exclude only this exact path** matches that one binary.
+A watched folder can be on a drive that is not always attached. ReadWatch shows it as waiting and starts watching it when the drive is plugged in. Press **Stop** before you eject: ReadWatch holds watched folders open, so Windows will refuse to eject the drive while it is watched.
 
-Prefer the exact path for anything you have several copies of; a machine typically has multiple
-`python.exe` installs, and a filename is easy to imitate, which matters for a tool whose job is
-noticing an unexpected reader. Nothing is excluded until you say so—the list lives in Settings.
-
-### Removable drives
-
-A watched folder does not have to be on a drive that is always attached. Paste the path while the
-drive is out and ReadWatch writes it down; the summary line then reads *"2 folders (1 waiting for a
-drive)"* until it turns up. Plug the drive in and ReadWatch picks the folder up on its own—it
-watches for volumes arriving and asks the service to look again, so there is nothing to press.
-
-A folder that ReadWatch will not watch, as opposed to one it is waiting for, is called out in the
-status line with the reason: a junction, a permission you don't have, a network drive, or a path
-that now refers to a different folder than the one you approved. Those need you; a waiting folder
-does not, which is why it never becomes a warning.
-
-**Press Stop before you eject.** ReadWatch holds each watched folder open on purpose—that is what
-stops it being renamed away from its own audit rule—so Safely Remove Hardware will refuse while
-the folder is being watched. Stop, then eject the drive the normal way.
-
-If a drive is disconnected without that, ReadWatch is built to recover rather than to break: the
-folders on other drives keep being watched. But **the audit rule stays on the disconnected disk**,
-because nothing can reach it to remove it. ReadWatch says so in the summary line, keeps the record,
-and removes the rule when that drive is next attached. It will not quietly forget it—uninstalling
-with such a rule outstanding tells you which drive to attach rather than abandoning it silently.
-
-Closing the window hides it to the tray; **Exit** quits, stops monitoring and stops the service —
-opening ReadWatch again starts idle, waiting for you to press Start. **Start ReadWatch at sign-in**
-puts it in the tray on login, also idle. **Keep the window on top** is in Settings, and
-hovering a row that is too narrow for its path shows the whole thing.
+Closing the window hides it to the tray; **Exit** stops monitoring and the service. Settings can also start ReadWatch in the tray at sign-in.
 
 ## Log
 
@@ -200,76 +52,39 @@ hovering a row that is too narrow for its path shows the whole thing.
 2026-08-12 12:30:43.426 | READ | pwsh.exe | pid=32740 | HOST\user | D:\Renders\output\frame.png | exe=C:\Program Files\PowerShell\7\pwsh.exe
 ```
 
-`LIST` marks a folder-listing event when that setting is on. JSONL and CSV carry the full process
-path, event record ID, and access mask.
+Each read records the time, file path, program name and image path, process ID, and bytes transferred, plus the user account and access mask under audit markers. `LIST` marks a folder listing. A `GAP` line says how many reads were missed and why, for example because the machine was too busy. JSONL and CSV also carry the event record ID. If a program exits before ReadWatch can look it up, its process fields are left blank rather than guessed. The log is never rotated or trimmed.
 
-## Requirements
+## Privileges and privacy
 
-- **Windows 11** on x64. Developed and exercised on Windows 11 Pro 26200. Windows 10 is untested.
-- **Administrator once, at install and at uninstall.** Never during ordinary use.
-- Watches local folders. For a network share, run ReadWatch on the file server against its local
-  path.
-- Event tracing needs no particular filesystem. Audit markers need NTFS or ReFS.
+- A LocalSystem service does the privileged work, and the window runs as you without elevation. They talk over a local named pipe that only LocalSystem and the installing account can open. The service starts with the window and stops when you exit, even if the window is killed. Your account can start, stop and query it, but cannot reconfigure or delete it.
+- Under audit markers, ReadWatch adds an audit entry to the security settings (the SACL) of each watched folder and the files in it, and turns on the *Audit File System (success)* policy. **Stop** removes the entries and restores the previous policy. Under event tracing it writes nothing to the drives.
+- Folders and the log file are opened under your account when you press Start or Save, and the service works through those handles rather than looking the path up again, so nothing can be swapped in between.
+- Under event tracing, ReadWatch sees file activity from the whole machine. Events outside your folders are discarded without being written or kept.
+- ReadWatch sends nothing anywhere: no connections, telemetry, or update checks.
+
+## Known limits
+
+- Junctions, symbolic links, mounted volumes and cloud placeholders are refused anywhere in a watched path, because ReadWatch must prove the folder it marks is the one you approved. The check trusts what the filesystem driver reports.
+- On exFAT and FAT, ReadWatch can tell that a path now points at a different drive, but not that a folder was deleted and recreated on the same drive, and it cannot tell a deliberately cloned volume from the original.
+- Under event tracing, the user column is blank and reads made purely through a memory mapping are not reported. Under audit markers, event 4663 shows that an access right was used, not which bytes were read, and marking a large tree takes minutes.
+- A read issued right after the same program wrote the same file produced no event in testing.
+- If a drive is unplugged without pressing Stop, the audit rule stays on that disk until it is next attached, when ReadWatch removes it. Folders on other drives keep being watched.
+- Not tested: Windows 10, ReFS, encrypted volumes such as VeraCrypt, unplugging a watched drive, sleep and resume, a full disk, and uninstalling while audit markers are applied.
 
 ## Uninstalling
 
-Removes the service, the viewer, the Start Menu entry, the uninstall entry and everything in
-`C:\ProgramData\ReadWatch`, and withdraws every audit rule and audit-policy change ReadWatch
-applied. **Your log file is left alone**—it is yours.
+Uninstall ReadWatch from Windows Settings under Installed apps. This removes the service, the program, the Start Menu entry and `C:\ProgramData\ReadWatch`, and withdraws every audit rule and policy change ReadWatch made; your log file is kept. Windows deletes the program file at the next restart. If a watched drive is not attached, the uninstaller tells you which drive to plug in so its audit rule can be removed.
 
-The program file itself cannot delete itself while it is running, so Windows removes it and its
-folder at the next restart. ReadWatch tells you so.
+## Build from source
 
-If a watched drive is not attached, the audit rule on it cannot be withdrawn. Uninstall says which
-drive to plug in rather than abandoning the rule silently.
+Requires Go 1.23 or later.
 
-## Good to know
+```bat
+build.cmd 0.4.0
+```
 
-- **Junctions, symbolic links, mounted volumes and cloud placeholders are refused**, at any point in
-  the path—not followed. ReadWatch has to be able to prove that the folder it applies an audit rule
-  to is the folder you approved, and a link is exactly what can stop being that.
-- **The folder holding your log file has to exist already.** ReadWatch creates the file with your own
-  account's permissions, but not its folder. The log is never rotated or trimmed—it grows until you
-  do something about it.
-- **Cleanup is best-effort when a folder has gone.** If a watched folder is deleted, or its rules are
-  changed by something else, ReadWatch says so once and stops tracking it rather than refusing to
-  continue. A folder whose *drive* is merely unplugged is a different case and is kept, counted and
-  named until the drive returns.
-- **Nothing to watch is not an error.** If every configured folder is on a drive that is out,
-  monitoring stays off rather than switching the machine-wide audit policy on with no folder carrying
-  a rule. It starts by itself when a drive arrives.
-- Applying an audit entry rewrites the security descriptor of every file already in the folder —
-  reversible, but not instant on a large tree.
-- Antivirus, indexing, preview handlers and backup tools read files legitimately and will appear.
-  That is what the exclusion list is for.
-- Under audit markers, event 4663 reports an exercised access right, not which bytes were read.
-- The build is unsigned, so SmartScreen warns on first run.
-
-## What has not been qualified
-
-Stated as unqualified rather than assumed to work:
-
-- **A physical removable-drive disconnect** while ReadWatch holds the folder open. The Windows error
-  codes it turns on are measured on the development host and held in place by tests; the unplug
-  itself has not been run.
-- **Uninstall while audit markers are applied.** Uninstall from an idle service is tested and passes.
-- **Encrypted volumes such as VeraCrypt.**
-- **Memory-mapped reads.** Not reported under event tracing. How much that misses in practice has not
-  been measured against the audit-marker path.
-- **Reads served from cache**, in one narrow case: a read issued immediately after writing the same
-  file, in the same program, produced no event. A re-read through a fresh handle does. Whether the
-  narrow case generalises is not established.
-- **ReFS.** Claimed to work, never run on one.
-- Sleep, resume, and a full disk.
-
-What *is* exercised on Windows 11: install and uninstall, the demand-start lifecycle, the killed-
-viewer teardown, the service DACL boundary, applying and removing audit rules, 4663 capture, event
-tracing end to end on an exFAT stick including reads of a file opened before monitoring started, and
-switching mechanism in both directions. The path-binding rules run against the real filesystem: a
-junction is refused as a target and as an ancestor, a folder's identity survives a rename and
-distinguishes a replacement at the same path, and a watched folder cannot be renamed while held.
-`gofmt`, `go vet ./...` unsuppressed, and `go test ./...` are clean.
+This runs `go test ./...` and `go vet ./...`, then builds `dist\ReadWatch.exe` for Windows x64 with the given version. The icon, version information and manifest come from the checked-in `cmd/readwatch/rsrc_windows_amd64.syso`; regenerating it needs Python 3 and Clang (`python tools/make_resources.py --version 0.4.0.0`).
 
 ## License
 
-MIT—see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+MIT; see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
